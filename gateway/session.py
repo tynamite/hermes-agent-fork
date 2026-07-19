@@ -2016,6 +2016,23 @@ class SessionStore:
         session_key = self._generate_session_key(source)
         now = _now()
 
+        def _refresh_transport_provenance(entry: SessionEntry) -> None:
+            """Persist ownership changes between Relay and direct adapters."""
+            source_is_relay = source.delivered_via_upstream_relay is True
+            entry_has_relay_provenance = (
+                entry.origin_transport is Platform.RELAY
+                or bool(entry.relay_origin_proof)
+            )
+            if not source_is_relay and not entry_has_relay_provenance:
+                return
+            entry.origin = source
+            entry.platform = source.platform
+            entry.origin_transport = origin_transport_for_source(source)
+            entry.relay_origin_proof = relay_origin_proof_for_source(
+                session_key,
+                source,
+            )
+
         db_end_session_id = None
         db_create_kwargs = None
         existing_session_id = None
@@ -2125,6 +2142,7 @@ class SessionStore:
                     # Another thread handled this entry during our lock-free
                     # window.  Treat as healthy -- bump updated_at and save.
                     entry.updated_at = now
+                    _refresh_transport_provenance(entry)
                     _needs_save = True
                 else:
                     # Stale check clean.  Apply reset decision.
@@ -2138,17 +2156,11 @@ class SessionStore:
                         _needs_recover = True
                     else:
                         entry.updated_at = now
-                        if source.delivered_via_upstream_relay is True:
-                            # Refresh the persisted routing origin only from a
-                            # live authenticated Relay delivery.  The marker
-                            # itself remains wire/persistence-invisible; the
-                            # HMAC proof is what restart recovery retains.
-                            entry.origin = source
-                            entry.platform = source.platform
-                            entry.origin_transport = origin_transport_for_source(source)
-                            entry.relay_origin_proof = relay_origin_proof_for_source(
-                                session_key, source
-                            )
+                        # Refresh a live authenticated Relay delivery, or clear
+                        # its persisted proof when a direct adapter reclaims the
+                        # same underlying session key.  Otherwise a later
+                        # restart could resume a direct turn through Relay.
+                        _refresh_transport_provenance(entry)
                         _needs_save = True
             else:
                 if not force_new:

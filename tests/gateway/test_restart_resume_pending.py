@@ -1147,6 +1147,75 @@ def test_persisted_relay_origin_proof_rehydrates_and_detects_tampering(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_direct_reuse_clears_relay_resume_provenance(monkeypatch, tmp_path):
+    """A direct adapter reclaiming a session must also own restart resume."""
+    monkeypatch.setenv("GATEWAY_RELAY_ID", "gateway-1")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    relay_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="shared-chat",
+        chat_type="dm",
+        user_id="shared-user",
+        user_name="Relay delivery",
+        delivered_via_upstream_relay=True,
+    )
+    direct_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="shared-chat",
+        chat_type="dm",
+        user_id="shared-user",
+        user_name="Direct delivery",
+    )
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    relay_entry = store.get_or_create_session(relay_source)
+    original_session_id = relay_entry.session_id
+    assert relay_entry.origin_transport is Platform.RELAY
+    assert relay_entry.relay_origin_proof
+
+    reclaimed = store.get_or_create_session(direct_source)
+
+    assert reclaimed.session_id == original_session_id
+    assert reclaimed.origin is not None
+    assert reclaimed.origin.user_name == "Direct delivery"
+    assert reclaimed.origin.delivered_via_upstream_relay is False
+    assert reclaimed.origin_transport is None
+    assert reclaimed.relay_origin_proof is None
+
+    with store._lock:
+        reclaimed.resume_pending = True
+        reclaimed.resume_reason = "restart_interrupted"
+        reclaimed.last_resume_marked_at = datetime.now()
+        store._save()
+
+    restored_store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    restored_store._ensure_loaded()
+    restored = restored_store._entries[reclaimed.session_key]
+    trusted_source = trusted_origin_for_resume(restored)
+    assert trusted_source is not None
+    assert trusted_source.delivered_via_upstream_relay is False
+    assert trusted_source.user_name == "Direct delivery"
+
+    runner, _ = make_restart_runner()
+    direct_adapter = SimpleNamespace(handle_message=AsyncMock())
+    relay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {
+        Platform.DISCORD: direct_adapter,
+        Platform.RELAY: relay_adapter,
+    }
+    runner.session_store = restored_store
+
+    scheduled = runner._schedule_resume_pending_sessions(platform=Platform.DISCORD)
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    direct_adapter.handle_message.assert_awaited_once()
+    relay_adapter.handle_message.assert_not_awaited()
+    event = direct_adapter.handle_message.await_args.args[0]
+    assert event.source.delivered_via_upstream_relay is False
+    assert event.source.user_name == "Direct delivery"
+
+
+@pytest.mark.asyncio
 async def test_relay_reconnect_resumes_authenticated_persisted_origin(
     monkeypatch,
     tmp_path,
