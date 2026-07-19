@@ -44,6 +44,16 @@ def test_supports_draft_streaming_follows_descriptor():
     assert _adapter(supports_draft_streaming=True).supports_draft_streaming() is True
 
 
+def test_edit_capabilities_follow_descriptor():
+    disabled = _adapter(supports_edit=False)
+    assert disabled.SUPPORTS_MESSAGE_EDITING is False
+    assert disabled.REQUIRES_EDIT_FINALIZE is False
+
+    enabled = _adapter(supports_edit=True)
+    assert enabled.SUPPORTS_MESSAGE_EDITING is True
+    assert enabled.REQUIRES_EDIT_FINALIZE is True
+
+
 def test_len_fn_utf16_counts_code_units():
     a = _adapter(len_unit="utf16")
     # An astral-plane emoji is two UTF-16 code units.
@@ -117,6 +127,7 @@ class _CaptureTransport:
     def __init__(self):
         self.sent = None
         self.sent_platform = None
+        self.actions = []
         # No concrete fronted identities ⇒ _platform_is_fronted is a no-op here.
         self._identities = []
 
@@ -126,15 +137,20 @@ class _CaptureTransport:
     async def send_outbound(self, action, *, platform=None):
         self.sent = action
         self.sent_platform = platform
+        self.actions.append(action)
         return {"success": True, "message_id": "m1"}
 
 
-def _make_event(chat_id="chan-1", scope_id="scope-9"):
+def _make_event(
+    chat_id="chan-1",
+    scope_id="scope-9",
+    platform=Platform.RELAY,
+):
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource
 
     src = SessionSource(
-        platform=Platform.RELAY,
+        platform=platform,
         chat_id=chat_id,
         chat_type="channel",
         scope_id=scope_id,
@@ -193,6 +209,91 @@ async def test_send_preserves_explicit_scope_id():
     a._capture_scope(_make_event(chat_id="chan-1", scope_id="scope-9"))
     await a.send("chan-1", "hi", metadata={"scope_id": "explicit-1"})
     assert t.sent["metadata"]["scope_id"] == "explicit-1"
+
+
+@pytest.mark.asyncio
+async def test_edit_forwards_routing_metadata_and_finalize():
+    t = _CaptureTransport()
+    a = RelayAdapter(PlatformConfig(), make_desc(platform="discord"), transport=t)
+    a._capture_scope(
+        _make_event(
+            chat_id="chan-1",
+            scope_id="scope-9",
+            platform=Platform.DISCORD,
+        )
+    )
+
+    result = await a.edit_message(
+        "chan-1",
+        "opaque-message-id",
+        "complete response",
+        finalize=True,
+        metadata={"thread_id": "thread-7"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "opaque-message-id"
+    assert t.sent == {
+        "op": "edit",
+        "chat_id": "chan-1",
+        "message_id": "opaque-message-id",
+        "content": "complete response",
+        "finalize": True,
+        "metadata": {"thread_id": "thread-7", "scope_id": "scope-9"},
+    }
+    assert t.sent_platform == "discord"
+
+
+@pytest.mark.asyncio
+async def test_edit_disabled_by_descriptor_never_calls_transport():
+    t = _CaptureTransport()
+    a = RelayAdapter(
+        PlatformConfig(),
+        make_desc(platform="discord", supports_edit=False),
+        transport=t,
+    )
+
+    result = await a.edit_message("chan-1", "m1", "response")
+
+    assert result.success is False
+    assert result.error == "editing not supported"
+    assert t.sent is None
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_sends_edits_and_forced_finalize_through_relay():
+    """Relay participates in the normal send -> edit -> finalize lifecycle."""
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    t = _CaptureTransport()
+    a = RelayAdapter(PlatformConfig(), make_desc(platform="discord"), transport=t)
+    a._capture_scope(
+        _make_event(
+            chat_id="chan-1",
+            scope_id="scope-9",
+            platform=Platform.DISCORD,
+        )
+    )
+    consumer = GatewayStreamConsumer(
+        adapter=a,
+        chat_id="chan-1",
+        metadata={"thread_id": "thread-7"},
+    )
+
+    assert await consumer._send_or_edit("partial response") is True
+    assert await consumer._send_or_edit("complete response") is True
+    # Relay requires a terminal lifecycle action even though the content is
+    # identical to the last progressive edit.
+    assert await consumer._send_or_edit("complete response", finalize=True) is True
+
+    assert [action["op"] for action in t.actions] == ["send", "edit", "edit"]
+    assert t.actions[1]["finalize"] is False
+    assert t.actions[2]["finalize"] is True
+    assert t.actions[2]["message_id"] == "m1"
+    assert t.actions[2]["metadata"] == {
+        "thread_id": "thread-7",
+        "scope_id": "scope-9",
+    }
 
 
 @pytest.mark.asyncio

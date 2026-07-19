@@ -114,6 +114,16 @@ class RelayAdapter(BasePlatformAdapter):
     ) -> bool:
         return self.descriptor.supports_draft_streaming
 
+    @property
+    def SUPPORTS_MESSAGE_EDITING(self) -> bool:  # noqa: N802
+        """Reflect the connector-negotiated edit capability."""
+        return self.descriptor.supports_edit
+
+    @property
+    def REQUIRES_EDIT_FINALIZE(self) -> bool:  # noqa: N802
+        """Relay connectors observe an explicit terminal edit lifecycle."""
+        return self.descriptor.supports_edit
+
     # ── abstract methods (delegated to the transport) ────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # ``is_reconnect`` is part of the BasePlatformAdapter.connect contract:
@@ -493,6 +503,43 @@ class RelayAdapter(BasePlatformAdapter):
         return SendResult(
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
+            error=result.get("error"),
+        )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Forward an edit through the negotiated Relay action contract."""
+        if not self.descriptor.supports_edit:
+            return SendResult(success=False, error="editing not supported")
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        if not message_id:
+            return SendResult(success=False, error="message_id required")
+        result = await self._transport.send_outbound(
+            {
+                "op": "edit",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": bool(finalize),
+                "metadata": self._with_scope(chat_id, metadata),
+            },
+            platform=self._platform_by_chat.get(str(chat_id)),
+        )
+        success = bool(result.get("success"))
+        return SendResult(
+            success=success,
+            # The Relay edit result contract has no replacement message id.
+            # Preserve the caller's opaque id so an incidental connector field
+            # cannot redirect subsequent progressive edits.
+            message_id=message_id if success else None,
             error=result.get("error"),
         )
 

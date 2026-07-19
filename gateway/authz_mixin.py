@@ -77,10 +77,18 @@ class GatewayAuthorizationMixin:
         """Resolve the live adapter for an inbound ``SessionSource``."""
         if source is None:
             return None
+        platform = getattr(source, "platform", None)
+        # Relay-delivered events retain their underlying platform for stable
+        # session identity and egress routing.  The live response adapter is
+        # nevertheless registered under Platform.RELAY.  Only trust the
+        # internal marker stamped by the authenticated relay transport; it is
+        # deliberately absent from SessionSource's wire/persistence surface.
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            platform = Platform.RELAY
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
-            getattr(source, "platform", None),
+            platform,
             getattr(source, "profile", None),
         )
 

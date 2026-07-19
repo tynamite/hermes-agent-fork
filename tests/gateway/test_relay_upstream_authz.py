@@ -203,6 +203,56 @@ def test_direct_discord_event_not_authorized_by_relay_presence(monkeypatch):
     assert runner._is_user_authorized(src) is False
 
 
+def test_relay_delivered_source_resolves_relay_response_adapter():
+    """Underlying platform identity must not hide the live Relay adapter."""
+    runner, relay_adapter = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+        delivered_via_upstream_relay=True,
+    )
+    assert runner._adapter_for_source(src) is relay_adapter
+
+
+def test_direct_source_does_not_resolve_relay_response_adapter():
+    """Relay presence must not capture a direct underlying-platform event."""
+    runner, _ = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+    )
+    assert runner._adapter_for_source(src) is None
+
+
+def test_relay_delivered_source_resolves_profile_relay_adapter():
+    """A routed profile selects its own Relay adapter, never the default's."""
+    runner, default_adapter = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    profile_adapter = SimpleNamespace(send=AsyncMock())
+    runner._profile_adapters = {
+        "reviewer": {Platform.RELAY: profile_adapter},
+    }
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+        profile="reviewer",
+        delivered_via_upstream_relay=True,
+    )
+    assert runner._adapter_for_source(src) is profile_adapter
+    assert runner._adapter_for_source(src) is not default_adapter
+
+
 def test_relay_delivery_marker_is_wire_invisible():
     """delivered_via_upstream_relay is an INTERNAL trust signal, never serialized.
 
