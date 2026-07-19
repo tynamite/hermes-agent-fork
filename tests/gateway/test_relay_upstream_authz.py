@@ -232,25 +232,37 @@ def test_direct_source_does_not_resolve_relay_response_adapter():
     assert runner._adapter_for_source(src) is None
 
 
-def test_relay_delivered_source_resolves_profile_relay_adapter():
-    """A routed profile selects its own Relay adapter, never the default's."""
-    runner, default_adapter = _make_runner(
+def test_relay_delivered_profile_source_resolves_shared_relay_adapter():
+    """Multiplexed Relay ingress stays on the process-level adapter.
+
+    Secondary profiles deliberately do not start their own Relay connection;
+    the shared adapter stamps ``source.profile`` to select the agent runtime.
+    Direct adapters for that profile must remain profile-scoped.
+    """
+    runner, shared_relay_adapter = _make_runner(
         platform=Platform.RELAY,
         authorization_is_upstream=True,
     )
-    profile_adapter = SimpleNamespace(send=AsyncMock())
+    profile_discord_adapter = SimpleNamespace(send=AsyncMock())
     runner._profile_adapters = {
-        "reviewer": {Platform.RELAY: profile_adapter},
+        "reviewer": {Platform.DISCORD: profile_discord_adapter},
     }
-    src = SessionSource(
+    relay_source = SessionSource(
         platform=Platform.DISCORD,
         chat_id="456",
         chat_type="channel",
         profile="reviewer",
         delivered_via_upstream_relay=True,
     )
-    assert runner._adapter_for_source(src) is profile_adapter
-    assert runner._adapter_for_source(src) is not default_adapter
+    direct_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+        profile="reviewer",
+    )
+
+    assert runner._adapter_for_source(relay_source) is shared_relay_adapter
+    assert runner._adapter_for_source(direct_source) is profile_discord_adapter
 
 
 def test_relay_delivery_marker_is_wire_invisible():

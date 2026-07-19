@@ -145,7 +145,11 @@ class LifecycleProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
             reply_to=reply_to,
             metadata=metadata,
         )
-        if "first-stage" in content or "segment-first" in content:
+        if (
+            "first-stage" in content
+            or "segment-first" in content
+            or "first command" in content
+        ):
             type(self).progress_sent.set()
         if content == "Checkpoint reached.":
             type(self).commentary_sent.set()
@@ -294,9 +298,11 @@ class DelayedProgressAgent:
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         self.tool_progress_callback("tool.started", "terminal", "first command", {})
-        time.sleep(0.45)
+        assert LifecycleProgressCaptureAdapter.progress_sent.wait(timeout=2.0)
         self.tool_progress_callback("tool.started", "terminal", "second command", {})
-        time.sleep(0.1)
+        # Keep the worker alive while the progress sender consumes the second
+        # line into its throttled buffer and then observes generation invalidation.
+        time.sleep(2.0)
         return {
             "final_response": "done",
             "messages": [],
@@ -1399,7 +1405,10 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_drops_tool_progress_after_generation_invalidation(monkeypatch, tmp_path):
+async def test_run_agent_finalizes_visible_progress_after_generation_invalidation(
+    monkeypatch,
+    tmp_path,
+):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -1416,7 +1425,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal tool metadata
 
-    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    adapter = LifecycleProgressCaptureAdapter(platform=Platform.DISCORD)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -1431,17 +1440,26 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     session_key = "agent:main:discord:dm:dm-1"
     runner._session_run_generation[session_key] = 1
 
-    original_send = adapter.send
     invalidated = {"done": False}
+    original_send_typing = adapter.send_typing
 
-    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
-        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
-        if "first command" in content and not invalidated["done"]:
+    async def send_typing_and_invalidate(chat_id, metadata=None):
+        await original_send_typing(chat_id, metadata=metadata)
+        if (
+            LifecycleProgressCaptureAdapter.progress_sent.is_set()
+            and not invalidated["done"]
+        ):
             invalidated["done"] = True
-            runner._invalidate_session_run_generation(session_key, reason="test_stop")
-        return result
+            async def invalidate_during_edit_throttle():
+                await asyncio.sleep(0.05)
+                runner._invalidate_session_run_generation(
+                    session_key,
+                    reason="test_stop",
+                )
 
-    adapter.send = send_and_invalidate
+            asyncio.create_task(invalidate_during_edit_throttle())
+
+    adapter.send_typing = send_typing_and_invalidate
 
     result = await runner._run_agent(
         message="hello",
@@ -1458,6 +1476,19 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     assert result["final_response"] == "done"
     assert 'first command' in all_progress_text
     assert 'second command' not in all_progress_text
+    assert adapter.edits == [
+        {
+            "chat_id": "dm-1",
+            "message_id": "progress-1",
+            "content": next(
+                call["content"]
+                for call in adapter.sent
+                if "first command" in call["content"]
+            ),
+            "finalize": True,
+            "metadata": {"non_conversational": True},
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -19434,6 +19434,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
+            rendered_progress_text = None  # Last content actually visible in that bubble
+            progress_message_finalized = False
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
@@ -19484,6 +19486,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 *,
                 finalize: bool = False,
             ):
+                nonlocal rendered_progress_text, progress_message_finalized
                 kwargs = {
                     "chat_id": source.chat_id,
                     "message_id": message_id,
@@ -19493,7 +19496,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     kwargs["finalize"] = finalize
                 if _edit_accepts_metadata:
                     kwargs["metadata"] = _progress_metadata
-                return await adapter.edit_message(**kwargs)
+                result = await adapter.edit_message(**kwargs)
+                if (
+                    getattr(result, "success", False)
+                    and message_id == progress_msg_id
+                ):
+                    rendered_progress_text = content
+                    progress_message_finalized = bool(finalize)
+                return result
 
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)
@@ -19522,6 +19532,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cleanup_msg_ids.append(str(result.message_id))
 
             async def _send_progress_text(text: str):
+                nonlocal rendered_progress_text, progress_message_finalized
                 result = await adapter.send(
                     chat_id=source.chat_id,
                     content=text,
@@ -19529,6 +19540,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=_progress_metadata,
                 )
                 _track_progress_result(result)
+                if (
+                    getattr(result, "success", False)
+                    and getattr(result, "message_id", None)
+                ):
+                    rendered_progress_text = text
+                    progress_message_finalized = False
                 return result
 
             async def _roll_progress_overflow_if_needed() -> bool:
@@ -19573,11 +19590,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             async def _finalize_current_progress_message() -> None:
                 """Best-effort close of the current editable progress bubble."""
-                if not (can_edit and progress_lines and progress_msg_id):
+                if not (
+                    can_edit
+                    and progress_lines
+                    and progress_msg_id
+                    and not progress_message_finalized
+                ):
                     return
                 try:
                     await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines and progress_msg_id:
+                    if (
+                        can_edit
+                        and progress_lines
+                        and progress_msg_id
+                        and not progress_message_finalized
+                    ):
                         await _edit_progress_message(
                             progress_msg_id,
                             _progress_text(progress_lines),
@@ -19586,9 +19613,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+            async def _finalize_visible_progress_message() -> None:
+                """Close only content already shown before a stale-run drain."""
+                if not (
+                    can_edit
+                    and progress_msg_id
+                    and rendered_progress_text is not None
+                    and not progress_message_finalized
+                ):
+                    return
+                try:
+                    await _edit_progress_message(
+                        progress_msg_id,
+                        rendered_progress_text,
+                        finalize=True,
+                    )
+                except Exception:
+                    pass
+
             while True:
                 try:
                     if not _run_still_current():
+                        await _finalize_visible_progress_message()
                         while not progress_queue.empty():
                             try:
                                 progress_queue.get_nowait()
@@ -19632,6 +19678,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _finalize_current_progress_message()
                         progress_msg_id = None
                         progress_lines = []
+                        rendered_progress_text = None
+                        progress_message_finalized = False
                         last_progress_msg[0] = None
                         repeat_count[0] = 0
                         continue
@@ -19660,6 +19708,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     if not _run_still_current():
+                        await _finalize_visible_progress_message()
                         return
 
                     if can_edit and progress_msg_id is not None:
@@ -19721,6 +19770,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
+                            rendered_progress_text = full_text if can_edit else msg
+                            progress_message_finalized = False
                             if _cleanup_progress:
                                 _cleanup_msg_ids.append(str(result.message_id))
 
@@ -19734,6 +19785,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except queue.Empty:
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
+                    if not _run_still_current():
+                        while not progress_queue.empty():
+                            try:
+                                progress_queue.get_nowait()
+                            except Exception:
+                                break
+                        await _finalize_visible_progress_message()
+                        return
                     # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
@@ -19750,6 +19809,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 await _finalize_current_progress_message()
                                 progress_msg_id = None
                                 progress_lines = []
+                                rendered_progress_text = None
+                                progress_message_finalized = False
                                 last_progress_msg[0] = None
                                 repeat_count[0] = 0
                             else:
