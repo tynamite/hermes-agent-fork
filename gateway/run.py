@@ -19437,21 +19437,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _raw_progress_limit - (64 if _raw_progress_limit > 128 else 0),
             )
 
-            # Detect whether the adapter's edit_message accepts metadata so
-            # overflow edits preserve Telegram topic/thread routing (#27487).
+            # Detect optional edit_message kwargs once so progress edits keep
+            # routing metadata and remain explicitly non-terminal.  Response
+            # streaming owns the terminal finalize action; grouped tool
+            # progress may continue to update after any individual edit.
             _edit_accepts_metadata = False
-            if _progress_metadata:
-                try:
-                    _edit_params = inspect.signature(adapter.edit_message).parameters
+            _edit_accepts_finalize = False
+            try:
+                _edit_params = inspect.signature(adapter.edit_message).parameters
+                _edit_has_kwargs = any(
+                    param.kind is inspect.Parameter.VAR_KEYWORD
+                    for param in _edit_params.values()
+                )
+                if _progress_metadata:
                     _edit_accepts_metadata = (
                         "metadata" in _edit_params
-                        or any(
-                            param.kind is inspect.Parameter.VAR_KEYWORD
-                            for param in _edit_params.values()
-                        )
+                        or _edit_has_kwargs
                     )
-                except (TypeError, ValueError):
-                    _edit_accepts_metadata = False
+                _edit_accepts_finalize = (
+                    "finalize" in _edit_params
+                    or _edit_has_kwargs
+                )
+            except (TypeError, ValueError):
+                pass
 
             async def _edit_progress_message(message_id: str, content: str):
                 kwargs = {
@@ -19459,8 +19467,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "message_id": message_id,
                     "content": content,
                 }
-                if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
-                    kwargs["finalize"] = True
+                if _edit_accepts_finalize:
+                    kwargs["finalize"] = False
                 if _edit_accepts_metadata:
                     kwargs["metadata"] = _progress_metadata
                 return await adapter.edit_message(**kwargs)
