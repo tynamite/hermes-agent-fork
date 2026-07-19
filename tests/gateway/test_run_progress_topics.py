@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -63,6 +64,7 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
     """Adapter with a tiny platform limit to exercise progress rollover."""
 
     MAX_MESSAGE_LENGTH = 180
+    REQUIRES_EDIT_FINALIZE = True
 
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(platform=platform)
@@ -87,7 +89,9 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         )
         return SendResult(success=True, message_id=self._mint_id())
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
         if len(content) > self.MAX_MESSAGE_LENGTH:
             self.oversized_edits.append(content)
         self.edits.append(
@@ -95,6 +99,8 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
+                "finalize": finalize,
+                "metadata": metadata,
             }
         )
         return SendResult(success=True, message_id=message_id)
@@ -114,6 +120,52 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
             }
         )
         return SendResult(success=True, message_id=message_id)
+
+
+class LifecycleProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    """Synchronize progress lifecycle tests with adapter-visible events."""
+
+    REQUIRES_EDIT_FINALIZE = True
+    progress_sent = threading.Event()
+    live_edit_seen = threading.Event()
+    commentary_sent = threading.Event()
+    segment_closed = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        type(self).progress_sent.clear()
+        type(self).live_edit_seen.clear()
+        type(self).commentary_sent.clear()
+        type(self).segment_closed.clear()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if "first-stage" in content or "segment-first" in content:
+            type(self).progress_sent.set()
+        if content == "Checkpoint reached.":
+            type(self).commentary_sent.set()
+        return result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        result = await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+        if "third-stage" in content and not finalize:
+            type(self).live_edit_seen.set()
+        if "segment-first" in content and finalize:
+            type(self).segment_closed.set()
+        return result
 
 
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -139,6 +191,54 @@ class FakeAgent:
             time.sleep(0.35)
             cb("tool.started", "browser_navigate", "https://example.com", {})
             time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class LiveThenFinalProgressAgent:
+    """Emit one live progress edit, then return so the bubble must close."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", "first-stage", {})
+        assert LifecycleProgressCaptureAdapter.progress_sent.wait(timeout=2.0)
+        cb("tool.started", "terminal", "second-stage", {})
+        # Let the edit throttle expire, then enqueue a fresh event that drives
+        # the accumulated progress through the ordinary (non-terminal) path.
+        time.sleep(2.0)
+        cb("tool.started", "terminal", "third-stage", {})
+        assert LifecycleProgressCaptureAdapter.live_edit_seen.wait(timeout=2.0)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class SegmentedProgressAgent:
+    """Place commentary after progress so the first bubble must be closed."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        assert self.interim_assistant_callback is not None
+        self.tool_progress_callback("tool.started", "terminal", "segment-first", {})
+        assert LifecycleProgressCaptureAdapter.progress_sent.wait(timeout=2.0)
+        self.interim_assistant_callback("Checkpoint reached.", already_streamed=False)
+        assert LifecycleProgressCaptureAdapter.commentary_sent.wait(timeout=2.0)
+        assert LifecycleProgressCaptureAdapter.segment_closed.wait(timeout=2.0)
         return {
             "final_response": "done",
             "messages": [],
@@ -357,8 +457,8 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_run_agent_progress_edits_are_not_terminal(monkeypatch, tmp_path):
-    """Response-finalize adapters must keep grouped tool progress open."""
+async def test_run_agent_progress_finalizes_only_when_closed(monkeypatch, tmp_path):
+    """Live grouped progress stays open, then turn completion closes it."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -366,11 +466,10 @@ async def test_run_agent_progress_edits_are_not_terminal(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = FakeAgent
+    fake_run_agent.AIAgent = LiveThenFinalProgressAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = MetadataEditProgressCaptureAdapter()
-    adapter.REQUIRES_EDIT_FINALIZE = True
+    adapter = LifecycleProgressCaptureAdapter()
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -387,13 +486,42 @@ async def test_run_agent_progress_edits_are_not_terminal(monkeypatch, tmp_path):
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-progress-non-terminal",
+        session_id="sess-progress-edit-lifecycle",
         session_key="agent:main:telegram:group:-1001:17585",
     )
 
     assert result["final_response"] == "done"
     assert adapter.edits
-    assert all(call["finalize"] is False for call in adapter.edits)
+    finalize_flags = [call["finalize"] for call in adapter.edits]
+    assert finalize_flags[:-1]
+    assert all(flag is False for flag in finalize_flags[:-1])
+    assert finalize_flags[-1] is True
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_finalizes_at_content_segment_boundary(monkeypatch, tmp_path):
+    """A commentary bubble closes the tool-progress bubble immediately above it."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SegmentedProgressAgent,
+        session_id="sess-progress-segment-lifecycle",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+            }
+        },
+        adapter_cls=LifecycleProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert LifecycleProgressCaptureAdapter.segment_closed.is_set()
+    segment_edits = [
+        call for call in adapter.edits if "segment-first" in call["content"]
+    ]
+    assert segment_edits
+    assert segment_edits[-1]["finalize"] is True
 
 
 @pytest.mark.asyncio
@@ -865,6 +993,8 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert len(adapter.sent) >= 2, "expected a fresh progress bubble after the first filled"
     assert adapter.oversized_sends == []
     assert adapter.oversized_edits == []
+    assert adapter.edits
+    assert all(call["finalize"] is True for call in adapter.edits)
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
 

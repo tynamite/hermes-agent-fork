@@ -19455,9 +19455,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             # Detect optional edit_message kwargs once so progress edits keep
-            # routing metadata and remain explicitly non-terminal.  Response
-            # streaming owns the terminal finalize action; grouped tool
-            # progress may continue to update after any individual edit.
+            # routing metadata.  Ordinary grouped-progress updates remain
+            # non-terminal, while rollover/reset/turn completion explicitly
+            # close the lifecycle of the progress bubble they stop editing.
             _edit_accepts_metadata = False
             _edit_accepts_finalize = False
             try:
@@ -19478,14 +19478,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except (TypeError, ValueError):
                 pass
 
-            async def _edit_progress_message(message_id: str, content: str):
+            async def _edit_progress_message(
+                message_id: str,
+                content: str,
+                *,
+                finalize: bool = False,
+            ):
                 kwargs = {
                     "chat_id": source.chat_id,
                     "message_id": message_id,
                     "content": content,
                 }
                 if _edit_accepts_finalize:
-                    kwargs["finalize"] = False
+                    kwargs["finalize"] = finalize
                 if _edit_accepts_metadata:
                     kwargs["metadata"] = _progress_metadata
                 return await adapter.edit_message(**kwargs)
@@ -19541,7 +19546,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 first_text = _progress_text(groups[0])
                 if progress_msg_id is not None:
-                    result = await _edit_progress_message(progress_msg_id, first_text)
+                    result = await _edit_progress_message(
+                        progress_msg_id,
+                        first_text,
+                        finalize=True,
+                    )
                     if not result.success:
                         can_edit = False
                         # Fall back to the existing non-edit behavior below.
@@ -19561,6 +19570,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # replaying the full historical transcript into new messages.
                 progress_lines = groups[-1]
                 return True
+
+            async def _finalize_current_progress_message() -> None:
+                """Best-effort close of the current editable progress bubble."""
+                if not (can_edit and progress_lines and progress_msg_id):
+                    return
+                try:
+                    await _roll_progress_overflow_if_needed()
+                    if can_edit and progress_lines and progress_msg_id:
+                        await _edit_progress_message(
+                            progress_msg_id,
+                            _progress_text(progress_lines),
+                            finalize=True,
+                        )
+                except Exception:
+                    pass
 
             while True:
                 try:
@@ -19605,6 +19629,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
+                        await _finalize_current_progress_message()
                         progress_msg_id = None
                         progress_lines = []
                         last_progress_msg[0] = None
@@ -19722,13 +19747,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
                                 # one for any tool lines that arrived after.
-                                await _roll_progress_overflow_if_needed()
-                                if can_edit and progress_lines and progress_msg_id:
-                                    _pending_text = _progress_text(progress_lines)
-                                    try:
-                                        await _edit_progress_message(progress_msg_id, _pending_text)
-                                    except Exception:
-                                        pass
+                                await _finalize_current_progress_message()
                                 progress_msg_id = None
                                 progress_lines = []
                                 last_progress_msg[0] = None
@@ -19739,14 +19758,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = _progress_text(progress_lines)
-                        try:
-                            await _edit_progress_message(progress_msg_id, full_text)
-                        except Exception:
-                            pass
+                    await _finalize_current_progress_message()
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
