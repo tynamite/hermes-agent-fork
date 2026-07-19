@@ -236,8 +236,12 @@ class RelayAdapter(BasePlatformAdapter):
 
     async def _on_inbound(self, event) -> None:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
-        self._capture_scope(event)
         await self.handle_message(event)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Capture Relay egress routing for live and restored inbound events."""
+        self._capture_scope(event)
+        await super().handle_message(event)
 
     def _capture_scope(self, event) -> None:
         """Remember a chat_id's egress discriminator from an inbound event so our

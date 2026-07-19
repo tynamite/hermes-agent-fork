@@ -1919,6 +1919,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    trusted_origin_for_resume,
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.turn_lease import SessionTurnLeaseRegistry
@@ -7085,11 +7086,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
+
+        resolved_candidates = []
+        for entry in candidates:
+            candidate_source = trusted_origin_for_resume(entry)
+            if candidate_source is None:
+                continue
+            candidate_platform = (
+                Platform.RELAY
+                if candidate_source.delivered_via_upstream_relay is True
+                else candidate_source.platform
+            )
+            if platform is None or candidate_platform == platform:
+                resolved_candidates.append((entry, candidate_source))
 
         # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
         # boot when there are restart-interrupted sessions to resume — a clean
@@ -7101,7 +7114,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
         # this catches every other SIGTERM source (e.g. a raw `terminal(
         # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
+        if resolved_candidates:
             try:
                 from gateway import restart_loop_guard as _rlg
 
@@ -7113,7 +7126,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = datetime.now()
         scheduled = 0
-        for entry in candidates:
+        for entry, source in resolved_candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
@@ -7123,7 +7136,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if entry.session_key in self._running_agents:
                 continue
 
-            source = entry.origin
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -19407,7 +19419,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Skip tool progress for platforms that don't support message
             # editing (e.g. iMessage/BlueBubbles) — each progress update
             # would become a separate message bubble, which is noisy.
-            if type(adapter).edit_message is BasePlatformAdapter.edit_message:
+            if (
+                getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True) is False
+                or type(adapter).edit_message is BasePlatformAdapter.edit_message
+            ):
                 while not progress_queue.empty():
                     try:
                         progress_queue.get_nowait()

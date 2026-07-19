@@ -1005,6 +1005,27 @@ async def test_run_agent_bluebubbles_uses_commentary_send_path_for_quick_replies
 
 
 @pytest.mark.asyncio
+async def test_run_agent_non_editing_override_suppresses_tool_progress(monkeypatch, tmp_path):
+    """A capability-disabled edit override must not degrade into message spam."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-relay-no-edit-progress",
+        config_data={"display": {"tool_progress": "all"}},
+        platform=Platform.RELAY,
+        chat_id="relay-chat",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=NonEditingProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
 async def test_run_agent_previewed_final_marks_already_sent(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,

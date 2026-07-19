@@ -212,6 +212,24 @@ async def test_send_preserves_explicit_scope_id():
 
 
 @pytest.mark.asyncio
+async def test_handle_message_restores_egress_routing_before_dispatch():
+    """Synthetic restart events rebuild Relay's in-memory routing cache."""
+    t = _CaptureTransport()
+    a = RelayAdapter(PlatformConfig(), make_desc(platform="discord"), transport=t)
+    event = _make_event(
+        chat_id="chan-1",
+        scope_id="scope-9",
+        platform=Platform.DISCORD,
+    )
+
+    await a.handle_message(event)
+    await a.send("chan-1", "resumed response")
+
+    assert t.sent_platform == "discord"
+    assert t.sent["metadata"]["scope_id"] == "scope-9"
+
+
+@pytest.mark.asyncio
 async def test_edit_forwards_routing_metadata_and_finalize():
     t = _CaptureTransport()
     a = RelayAdapter(PlatformConfig(), make_desc(platform="discord"), transport=t)

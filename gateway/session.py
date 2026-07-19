@@ -10,6 +10,7 @@ Handles:
 
 import asyncio
 import hashlib
+import hmac
 import logging
 import os
 import json
@@ -17,7 +18,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -751,6 +752,15 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Authenticated persistence proof that ``origin`` was observed over the
+    # per-instance Relay connection.  Kept at the end for positional backward
+    # compatibility with older SessionEntry constructors.  The live
+    # SessionSource trust marker is never serialized; this HMAC lets restart
+    # recovery recreate it only when the stored origin is unchanged and the
+    # current gateway still holds the same Relay secret.
+    origin_transport: Optional[Platform] = None
+    relay_origin_proof: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -788,6 +798,10 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+        if self.relay_origin_proof:
+            result["relay_origin_proof"] = self.relay_origin_proof
+        if self.origin_transport:
+            result["origin_transport"] = self.origin_transport.value
         return result
     
     @classmethod
@@ -802,6 +816,17 @@ class SessionEntry:
                 platform = Platform(data["platform"])
             except ValueError as e:
                 logger.debug("Unknown platform value %r: %s", data["platform"], e)
+
+        origin_transport = None
+        if data.get("origin_transport"):
+            try:
+                origin_transport = Platform(data["origin_transport"])
+            except ValueError as e:
+                logger.debug(
+                    "Unknown origin transport %r: %s",
+                    data["origin_transport"],
+                    e,
+                )
 
         last_resume_marked_at = None
         _lrma = data.get("last_resume_marked_at")
@@ -836,6 +861,12 @@ class SessionEntry:
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
             origin=origin,
+            origin_transport=origin_transport,
+            relay_origin_proof=(
+                str(data["relay_origin_proof"])
+                if data.get("relay_origin_proof")
+                else None
+            ),
             display_name=data.get("display_name"),
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
@@ -858,6 +889,82 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             model_override=sanitize_model_override(data.get("model_override")),
         )
+
+
+def _relay_origin_signature(
+    session_key: str,
+    source: SessionSource,
+    secret: str,
+) -> str:
+    """Bind a persisted session origin to this gateway's Relay credential."""
+    payload = json.dumps(
+        {
+            "version": 1,
+            "session_key": session_key,
+            "origin": source.to_dict(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def relay_origin_proof_for_source(
+    session_key: str,
+    source: SessionSource,
+) -> Optional[str]:
+    """Create a persistence proof only for a live authenticated Relay source."""
+    if source.delivered_via_upstream_relay is not True:
+        return None
+    from gateway.relay import relay_connection_auth
+
+    _gateway_id, secret = relay_connection_auth()
+    if not secret:
+        return None
+    return _relay_origin_signature(session_key, source, secret)
+
+
+def origin_transport_for_source(source: SessionSource) -> Optional[Platform]:
+    """Return persistable routing provenance for an authenticated source."""
+    if source.delivered_via_upstream_relay is True:
+        return Platform.RELAY
+    return None
+
+
+def trusted_origin_for_resume(entry: SessionEntry) -> Optional[SessionSource]:
+    """Restore Relay provenance for restart recovery after HMAC verification.
+
+    Direct-platform origins are returned unchanged.  A persisted Relay proof
+    restores the internal delivery marker only when it matches the current
+    per-gateway Relay secret and the exact serialized session origin.
+    """
+    source = entry.origin
+    if source is None:
+        return None
+    if entry.origin_transport is not Platform.RELAY:
+        return source
+
+    proof = entry.relay_origin_proof
+    if not proof:
+        logger.warning(
+            "gateway.session: refusing unsigned Relay origin for %s",
+            entry.session_key,
+        )
+        return None
+
+    from gateway.relay import relay_connection_auth
+
+    _gateway_id, secret = relay_connection_auth()
+    if not secret:
+        return None
+    expected = _relay_origin_signature(entry.session_key, source, secret)
+    if not hmac.compare_digest(proof, expected):
+        logger.warning(
+            "gateway.session: refusing invalid Relay origin proof for %s",
+            entry.session_key,
+        )
+        return None
+    return replace(source, delivered_via_upstream_relay=True)
 
 
 def is_shared_multi_user_session(
@@ -1441,6 +1548,8 @@ class SessionStore:
             created_at=created_at,
             updated_at=now,
             origin=source,
+            origin_transport=origin_transport_for_source(source),
+            relay_origin_proof=relay_origin_proof_for_source(session_key, source),
             display_name=source.chat_name,
             platform=source.platform,
             chat_type=source.chat_type,
@@ -2029,6 +2138,17 @@ class SessionStore:
                         _needs_recover = True
                     else:
                         entry.updated_at = now
+                        if source.delivered_via_upstream_relay is True:
+                            # Refresh the persisted routing origin only from a
+                            # live authenticated Relay delivery.  The marker
+                            # itself remains wire/persistence-invisible; the
+                            # HMAC proof is what restart recovery retains.
+                            entry.origin = source
+                            entry.platform = source.platform
+                            entry.origin_transport = origin_transport_for_source(source)
+                            entry.relay_origin_proof = relay_origin_proof_for_source(
+                                session_key, source
+                            )
                         _needs_save = True
             else:
                 if not force_new:
@@ -2058,6 +2178,8 @@ class SessionStore:
                 created_at=now,
                 updated_at=now,
                 origin=source,
+                origin_transport=origin_transport_for_source(source),
+                relay_origin_proof=relay_origin_proof_for_source(session_key, source),
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
@@ -2354,6 +2476,8 @@ class SessionStore:
                 created_at=now,
                 updated_at=now,
                 origin=old_entry.origin,
+                origin_transport=old_entry.origin_transport,
+                relay_origin_proof=old_entry.relay_origin_proof,
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
@@ -2434,6 +2558,8 @@ class SessionStore:
                 created_at=now,
                 updated_at=now,
                 origin=old_entry.origin,
+                origin_transport=old_entry.origin_transport,
+                relay_origin_proof=old_entry.relay_origin_proof,
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
