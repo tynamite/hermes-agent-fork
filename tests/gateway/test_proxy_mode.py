@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform, StreamingConfig
+from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
+from gateway.relay.adapter import RelayAdapter
+from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -279,6 +281,70 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_non_edit_relay_skips_proxy_stream_preview(self, monkeypatch):
+        """A non-edit Relay connector receives only the eventual final reply."""
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner.config.streaming = StreamingConfig(
+            enabled=True,
+            transport="edit",
+            edit_interval=0,
+            buffer_threshold=1,
+        )
+
+        transport = MagicMock()
+        transport._identities = []
+        transport.send_outbound = AsyncMock(
+            return_value={"success": True, "message_id": "preview-1"}
+        )
+        descriptor = CapabilityDescriptor(
+            contract_version=CONTRACT_VERSION,
+            platform="discord",
+            label="Discord",
+            max_message_length=4096,
+            supports_draft_streaming=False,
+            supports_edit=False,
+            supports_threads=False,
+            markdown_dialect="plain",
+            len_unit="chars",
+            emoji="",
+            platform_hint="",
+            pii_safe=False,
+        )
+        runner.adapters[Platform.RELAY] = RelayAdapter(
+            PlatformConfig(),
+            descriptor,
+            transport=transport,
+        )
+        source = _make_source(Platform.DISCORD)
+        source.delivered_via_upstream_relay = True
+
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+                'data: {"choices":[{"delta":{"content":" world"}}]}\n\n',
+                "data: [DONE]\n\n",
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="hi",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="relay-proxy-session",
+                    )
+
+        assert result["final_response"] == "Hello world"
+        assert result["response_previewed"] is False
+        transport.send_outbound.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_handles_http_error(self, monkeypatch):
