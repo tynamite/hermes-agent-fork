@@ -1919,6 +1919,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    trusted_origin_for_resume,
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.turn_lease import SessionTurnLeaseRegistry
@@ -7085,11 +7086,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
+
+        resolved_candidates = []
+        for entry in candidates:
+            candidate_source = trusted_origin_for_resume(entry)
+            if candidate_source is None:
+                continue
+            candidate_platform = (
+                Platform.RELAY
+                if candidate_source.delivered_via_upstream_relay is True
+                else candidate_source.platform
+            )
+            if platform is None or candidate_platform == platform:
+                resolved_candidates.append((entry, candidate_source))
 
         # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
         # boot when there are restart-interrupted sessions to resume — a clean
@@ -7101,7 +7114,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
         # this catches every other SIGTERM source (e.g. a raw `terminal(
         # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
+        if resolved_candidates:
             try:
                 from gateway import restart_loop_guard as _rlg
 
@@ -7113,7 +7126,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = datetime.now()
         scheduled = 0
-        for entry in candidates:
+        for entry, source in resolved_candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
@@ -7123,7 +7136,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if entry.session_key in self._running_agents:
                 continue
 
-            source = entry.origin
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -8241,7 +8253,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ends the prior session in SQLite and reopens the CLI session under
         # the new key. The CLI's transcript becomes the active one for the
         # gateway from this moment on.
-        switched = await self.async_session_store.switch_session(session_key, cli_session_id)
+        switched = await self.async_session_store.switch_session(
+            session_key,
+            cli_session_id,
+            source=dest_source,
+        )
         if switched is None:
             raise RuntimeError(
                 f"could not switch session key {session_key} → {cli_session_id}"
@@ -11954,7 +11970,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             prior_session_id = session_entry.session_id
-            switched = await self.async_session_store.switch_session(session_key, pinned_session_id)
+            switched = await self.async_session_store.switch_session(
+                session_key,
+                pinned_session_id,
+                source=source,
+            )
             if switched is not None:
                 session_entry = switched
                 logger.info(
@@ -12004,7 +12024,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # lane session is ended cleanly. Mutating session_entry in
                     # place here created a split-brain state where the JSON
                     # index pointed at one id but code downstream used another.
-                    switched = await self.async_session_store.switch_session(session_key, bound_session_id)
+                    switched = await self.async_session_store.switch_session(
+                        session_key,
+                        bound_session_id,
+                        source=source,
+                    )
                     if switched is not None:
                         session_entry = switched
                 # If the stored binding pointed at a parent, rewrite it to the
@@ -13197,7 +13221,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
                 )
-                new_entry = await self.async_session_store.reset_session(session_key)
+                new_entry = await self.async_session_store.reset_session(
+                    session_key,
+                    source=source,
+                )
                 self._evict_cached_agent(session_key)
                 # Conversation boundary: one funnel call clears every
                 # conversation-scoped per-session dict (#58403 and siblings).
@@ -18478,7 +18505,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ) -> None:
                             _adapter.pause_typing_for_chat(_chat_id)
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                    _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
+                    if not _adapter_supports_edit:
+                        raise RuntimeError("skip streaming for non-editable platform")
+                    _effective_cursor = _scfg.cursor
                     _buffer_only = False
                     if source.platform == Platform.MATRIX:
                         _effective_cursor = ""
@@ -19008,10 +19037,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-        # True when the previously enqueued progress line was a terminal
-        # fenced code block — consecutive terminal calls then drop the
-        # repeated "💻 terminal" header and render back-to-back blocks.
+        # Track whether the previous line was a terminal fenced block so
+        # consecutive commands can share one header within a content segment.
         last_was_terminal_block = [False]
+        progress_resets_pending = [0]
+        progress_reset_lock = threading.Lock()
+
+        def _queue_progress_reset() -> None:
+            """Publish a content boundary before its FIFO marker is consumed."""
+            if progress_queue is None:
+                return
+            with progress_reset_lock:
+                # Producer-side dedup must cross the boundary at the same point
+                # as the FIFO.  Waiting for the consumer to reach this marker
+                # can misclassify an identical post-content event as a repeat
+                # of the progress bubble above the content.
+                last_tool[0] = None
+                last_progress_msg[0] = None
+                repeat_count[0] = 0
+                last_was_terminal_block[0] = False
+                progress_resets_pending[0] += 1
+                progress_queue.put(("__reset__",))
+
+        def _progress_reset_is_pending() -> bool:
+            with progress_reset_lock:
+                return progress_resets_pending[0] > 0
+
+        def _consume_progress_reset() -> None:
+            with progress_reset_lock:
+                progress_resets_pending[0] = max(
+                    0, progress_resets_pending[0] - 1
+                )
+
+        def _is_progress_reset(raw: object) -> bool:
+            return (
+                isinstance(raw, tuple)
+                and len(raw) >= 1
+                and raw[0] == "__reset__"
+            )
 
         # ── Discord voice "verbal ack before tool calls" ────────────────
         # When the bot is in a voice channel with the continuous mixer
@@ -19185,11 +19248,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-            # "new" mode: only report when tool changes
-            if progress_mode == "new" and tool_name == last_tool[0]:
-                return
-            last_tool[0] = tool_name
-
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
@@ -19222,13 +19280,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 from agent.display import get_tool_preview_max_len
                 _cmd_full = args["command"].rstrip()
-                # Consecutive terminal calls: drop the repeated
-                # "💻 terminal" header so back-to-back commands render as
-                # adjacent code blocks under a single header.
-                _block_header = (
-                    "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
-                )
-                _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
+                _code_block_full = f"```\n{_cmd_full}\n```"
                 # Single-line, capped preview for non-verbose modes.
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
@@ -19239,16 +19291,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_short = _cmd_short[:_cap - 3] + "..."
                 elif _multiline:
                     _cmd_short = _cmd_short + " ..."
-                _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+                _code_block_short = f"```\n{_cmd_short}\n```"
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
+            _is_terminal_block = False
             if progress_mode == "verbose":
                 if _code_block_full is not None:
-                    last_was_terminal_block[0] = True
-                    progress_queue.put(_code_block_full)
-                    return
-                last_was_terminal_block[0] = False
-                if args:
+                    msg = _code_block_full
+                    _is_terminal_block = True
+                elif args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
                     args_str = json.dumps(args, ensure_ascii=False, default=str)
@@ -19262,59 +19313,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 else:
                     msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
-                return
-            
-            # "all" / "new" modes: short preview, respects tool_preview_length
-            # config (defaults to 40 chars when unset to keep gateway messages
-            # compact — unlike CLI spinners, these persist as permanent messages).
-            # Terminal commands on markdown platforms get a single-line capped
-            # fenced block (built above) instead of the truncated preview.
-            if _code_block_short is not None:
-                msg = _code_block_short
-                last_was_terminal_block[0] = True
-            elif preview:
-                from agent.display import (
-                    get_tool_preview_max_len,
-                    get_tool_verb,
-                    tool_verb_connector,
-                    verb_drops_preview,
-                )
-                _pl = get_tool_preview_max_len()
-                _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
-                # Friendly labels: render a human-phrased line for built-in
-                # tools ("🔍 Searching the web for ...") by prefixing the verb
-                # onto the preview the callback already computed (so the
-                # command/url/query is preserved).  Custom/plugin/MCP tools
-                # have no verb and fall back to the raw "tool_name: ..." form.
-                _verb = get_tool_verb(tool_name)
-                if _verb:
-                    if verb_drops_preview(tool_name):
-                        msg = f"{emoji} {_verb}"
-                    else:
-                        msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
-                else:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
-                last_was_terminal_block[0] = False
             else:
-                msg = f"{emoji} {tool_name}..."
-                last_was_terminal_block[0] = False
-            
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
-                repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
-                progress_queue.put(("__dedup__", msg, repeat_count[0]))
-                return
-            last_progress_msg[0] = msg
-            repeat_count[0] = 0
-            
-            progress_queue.put(msg)
+                # "all" / "new" modes: short preview, respects
+                # tool_preview_length (defaults to 40 chars when unset).
+                if _code_block_short is not None:
+                    msg = _code_block_short
+                    _is_terminal_block = True
+                elif preview:
+                    from agent.display import (
+                        get_tool_preview_max_len,
+                        get_tool_verb,
+                        tool_verb_connector,
+                        verb_drops_preview,
+                    )
+                    _pl = get_tool_preview_max_len()
+                    _cap = _pl if _pl > 0 else 40
+                    if len(preview) > _cap:
+                        preview = preview[:_cap - 3] + "..."
+                    # Friendly labels: render a human-phrased line for
+                    # built-in tools while preserving the callback preview.
+                    _verb = get_tool_verb(tool_name)
+                    if _verb:
+                        if verb_drops_preview(tool_name):
+                            msg = f"{emoji} {_verb}"
+                        else:
+                            msg = (
+                                f"{emoji} {_verb}"
+                                f"{tool_verb_connector(tool_name)}{preview}"
+                            )
+                    else:
+                        msg = f"{emoji} {tool_name}: \"{preview}\""
+                else:
+                    msg = f"{emoji} {tool_name}..."
+
+            # All producer-side segment state and the FIFO insertion share a
+            # lock with _queue_progress_reset.  A tool event therefore lands
+            # wholly above or wholly below a content boundary.
+            with progress_reset_lock:
+                # "new" mode: only report when the tool changes within the
+                # current content segment.
+                if progress_mode == "new" and tool_name == last_tool[0]:
+                    return
+                last_tool[0] = tool_name
+
+                if _is_terminal_block:
+                    # Consecutive terminal calls share one header, but the
+                    # producer-side content reset restores it for a new bubble.
+                    _block_header = (
+                        ""
+                        if last_was_terminal_block[0]
+                        else f"{emoji} {tool_name}\n"
+                    )
+                    msg = f"{_block_header}{msg}"
+                    last_was_terminal_block[0] = True
+                else:
+                    last_was_terminal_block[0] = False
+
+                # Dedup non-verbose consecutive messages within this segment.
+                if progress_mode != "verbose" and msg == last_progress_msg[0]:
+                    repeat_count[0] += 1
+                    progress_queue.put(("__dedup__", msg, repeat_count[0]))
+                    return
+                if progress_mode != "verbose":
+                    last_progress_msg[0] = msg
+                    repeat_count[0] = 0
+
+                progress_queue.put(msg)
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
@@ -19407,7 +19471,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Skip tool progress for platforms that don't support message
             # editing (e.g. iMessage/BlueBubbles) — each progress update
             # would become a separate message bubble, which is noisy.
-            if type(adapter).edit_message is BasePlatformAdapter.edit_message:
+            if (
+                getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True) is False
+                or type(adapter).edit_message is BasePlatformAdapter.edit_message
+            ):
                 while not progress_queue.empty():
                     try:
                         progress_queue.get_nowait()
@@ -19417,6 +19484,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
+            rendered_progress_text = None  # Last content actually visible in that bubble
+            progress_message_finalized = False
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
@@ -19437,46 +19506,116 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _raw_progress_limit - (64 if _raw_progress_limit > 128 else 0),
             )
 
-            # Detect whether the adapter's edit_message accepts metadata so
-            # overflow edits preserve Telegram topic/thread routing (#27487).
+            # Detect optional edit_message kwargs once so progress edits keep
+            # routing metadata.  Ordinary grouped-progress updates remain
+            # non-terminal, while rollover/reset/turn completion explicitly
+            # close the lifecycle of the progress bubble they stop editing.
             _edit_accepts_metadata = False
-            if _progress_metadata:
-                try:
-                    _edit_params = inspect.signature(adapter.edit_message).parameters
+            _edit_accepts_finalize = False
+            try:
+                _edit_params = inspect.signature(adapter.edit_message).parameters
+                _edit_has_kwargs = any(
+                    param.kind is inspect.Parameter.VAR_KEYWORD
+                    for param in _edit_params.values()
+                )
+                if _progress_metadata:
                     _edit_accepts_metadata = (
                         "metadata" in _edit_params
-                        or any(
-                            param.kind is inspect.Parameter.VAR_KEYWORD
-                            for param in _edit_params.values()
-                        )
+                        or _edit_has_kwargs
                     )
-                except (TypeError, ValueError):
-                    _edit_accepts_metadata = False
+                _edit_accepts_finalize = (
+                    "finalize" in _edit_params
+                    or _edit_has_kwargs
+                )
+            except (TypeError, ValueError):
+                pass
 
-            async def _edit_progress_message(message_id: str, content: str):
+            async def _edit_progress_message(
+                message_id: str,
+                content: str,
+                *,
+                finalize: bool = False,
+            ):
+                nonlocal rendered_progress_text, progress_message_finalized
                 kwargs = {
                     "chat_id": source.chat_id,
                     "message_id": message_id,
                     "content": content,
                 }
-                if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
-                    kwargs["finalize"] = True
+                if _edit_accepts_finalize:
+                    kwargs["finalize"] = finalize
                 if _edit_accepts_metadata:
                     kwargs["metadata"] = _progress_metadata
-                return await adapter.edit_message(**kwargs)
+                result = await adapter.edit_message(**kwargs)
+                if (
+                    getattr(result, "success", False)
+                    and message_id == progress_msg_id
+                ):
+                    rendered_progress_text = content
+                    progress_message_finalized = bool(finalize)
+                return result
 
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)
+
+            def _split_progress_line(line: object) -> list[str]:
+                """Split one line into chunks measured in platform length units."""
+                remaining = str(line)
+                if _progress_len_fn(remaining) <= _PROGRESS_TEXT_LIMIT:
+                    return [remaining]
+
+                chunks: list[str] = []
+                while remaining:
+                    if _progress_len_fn(remaining) <= _PROGRESS_TEXT_LIMIT:
+                        chunks.append(remaining)
+                        break
+
+                    # Find the longest codepoint prefix that fits the adapter's
+                    # length unit (for example Telegram's UTF-16 code units).
+                    low, high = 1, len(remaining)
+                    split_at = 1
+                    while low <= high:
+                        midpoint = (low + high) // 2
+                        if (
+                            _progress_len_fn(remaining[:midpoint])
+                            <= _PROGRESS_TEXT_LIMIT
+                        ):
+                            split_at = midpoint
+                            low = midpoint + 1
+                        else:
+                            high = midpoint - 1
+
+                    # Prefer a nearby newline without discarding it.  A single
+                    # codepoint may itself exceed a pathological tiny test
+                    # limit; split_at=1 still guarantees forward progress.
+                    newline_at = remaining.rfind("\n", 0, split_at + 1)
+                    if newline_at >= max(1, split_at // 2):
+                        split_at = newline_at + 1
+                    chunks.append(remaining[:split_at])
+                    remaining = remaining[split_at:]
+                return chunks
 
             def _split_progress_groups(lines: list) -> list[list]:
                 """Partition progress lines into platform-sized editable bubbles."""
                 groups: list[list] = []
                 current: list = []
                 for line in lines:
-                    candidate = current + [line]
-                    if current and _progress_len_fn(_progress_text(candidate)) > _PROGRESS_TEXT_LIMIT:
+                    fragments = _split_progress_line(line)
+                    if len(fragments) > 1:
+                        if current:
+                            groups.append(current)
+                        groups.extend([[fragment] for fragment in fragments[:-1]])
+                        current = [fragments[-1]]
+                        continue
+
+                    candidate = current + fragments
+                    if (
+                        current
+                        and _progress_len_fn(_progress_text(candidate))
+                        > _PROGRESS_TEXT_LIMIT
+                    ):
                         groups.append(current)
-                        current = [line]
+                        current = fragments
                     else:
                         current = candidate
                 if current:
@@ -19492,6 +19631,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cleanup_msg_ids.append(str(result.message_id))
 
             async def _send_progress_text(text: str):
+                nonlocal rendered_progress_text, progress_message_finalized
                 result = await adapter.send(
                     chat_id=source.chat_id,
                     content=text,
@@ -19499,7 +19639,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=_progress_metadata,
                 )
                 _track_progress_result(result)
+                if (
+                    getattr(result, "success", False)
+                    and getattr(result, "message_id", None)
+                ):
+                    rendered_progress_text = text
+                    progress_message_finalized = False
                 return result
+
+            async def _send_progress_fallback_groups(groups: list[list]) -> None:
+                """Best-effort send every unsent group after editing fails closed."""
+                for group in groups:
+                    if _progress_reset_is_pending():
+                        return
+                    try:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=_progress_text(group),
+                            reply_to=_progress_reply_to,
+                            metadata=_progress_metadata,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Progress fallback send failed: %s",
+                            adapter.name,
+                            exc,
+                        )
+                        continue
+                    _track_progress_result(result)
+                    if _progress_reset_is_pending():
+                        return
+
+            async def _disable_progress_edits_and_send_groups(
+                groups: list[list],
+            ) -> None:
+                """Fail closed without leaving buffered progress behind."""
+                nonlocal progress_msg_id, progress_lines, can_edit
+                nonlocal rendered_progress_text, progress_message_finalized
+                if _progress_reset_is_pending():
+                    return
+                can_edit = False
+                await _send_progress_fallback_groups(groups)
+                progress_msg_id = None
+                progress_lines = []
+                rendered_progress_text = None
+                progress_message_finalized = False
 
             async def _roll_progress_overflow_if_needed() -> bool:
                 """Start fresh editable progress bubbles before a bubble exceeds limit.
@@ -19508,7 +19692,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 caller should skip the normal send/edit path for this tick.
                 """
                 nonlocal progress_msg_id, progress_lines, can_edit
-                if not progress_lines or not can_edit:
+                nonlocal rendered_progress_text, progress_message_finalized
+                if (
+                    not progress_lines
+                    or not can_edit
+                    or _progress_reset_is_pending()
+                ):
                     return False
                 groups = _split_progress_groups(progress_lines)
                 if len(groups) <= 1:
@@ -19516,20 +19705,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 first_text = _progress_text(groups[0])
                 if progress_msg_id is not None:
-                    result = await _edit_progress_message(progress_msg_id, first_text)
+                    result = await _edit_progress_message(
+                        progress_msg_id,
+                        first_text,
+                        finalize=True,
+                    )
+                    if _progress_reset_is_pending():
+                        return True
                     if not result.success:
-                        can_edit = False
-                        # Fall back to the existing non-edit behavior below.
-                        return False
+                        full_text = _progress_text(progress_lines)
+                        if rendered_progress_text and full_text.startswith(
+                            f"{rendered_progress_text}\n"
+                        ):
+                            pending_text = full_text[len(rendered_progress_text) + 1 :]
+                            pending_groups = [
+                                [fragment]
+                                for fragment in _split_progress_line(pending_text)
+                            ]
+                        elif full_text == rendered_progress_text:
+                            pending_groups = []
+                        else:
+                            # The visible text is not a clean prefix.  Re-send
+                            # the groups rather than risk dropping an update.
+                            pending_groups = groups
+                        await _disable_progress_edits_and_send_groups(pending_groups)
+                        return True
                 else:
                     result = await _send_progress_text(first_text)
-                    if result.success and result.message_id:
-                        progress_msg_id = result.message_id
+                    if _progress_reset_is_pending():
+                        return True
+                    if not getattr(result, "success", False):
+                        await _disable_progress_edits_and_send_groups(groups)
+                        return True
+                    if not getattr(result, "message_id", None):
+                        # The connector delivered this group but did not return
+                        # an editable ID.  Fail closed without re-sending it.
+                        await _disable_progress_edits_and_send_groups(groups[1:])
+                        return True
+                    progress_msg_id = result.message_id
 
-                for group in groups[1:]:
+                for group_index, group in enumerate(groups[1:], start=1):
+                    if _progress_reset_is_pending():
+                        return True
+                    if (
+                        progress_msg_id is not None
+                        and rendered_progress_text is not None
+                        and not progress_message_finalized
+                    ):
+                        result = await _edit_progress_message(
+                            progress_msg_id,
+                            rendered_progress_text,
+                            finalize=True,
+                        )
+                        if _progress_reset_is_pending():
+                            return True
+                        if not result.success:
+                            await _disable_progress_edits_and_send_groups(
+                                groups[group_index:]
+                            )
+                            return True
+                    if _progress_reset_is_pending():
+                        return True
                     result = await _send_progress_text(_progress_text(group))
-                    if result.success and result.message_id:
-                        progress_msg_id = result.message_id
+                    if _progress_reset_is_pending():
+                        return True
+                    if not getattr(result, "success", False):
+                        await _disable_progress_edits_and_send_groups(
+                            groups[group_index:]
+                        )
+                        return True
+                    if not getattr(result, "message_id", None):
+                        # This group is already visible but cannot be edited;
+                        # send only the groups that have not been attempted.
+                        await _disable_progress_edits_and_send_groups(
+                            groups[group_index + 1 :]
+                        )
+                        return True
+                    progress_msg_id = result.message_id
 
                 # The newest continuation is now the only mutable bubble.  Keep
                 # just its lines so subsequent edits update it instead of
@@ -19537,9 +19789,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 progress_lines = groups[-1]
                 return True
 
+            async def _finalize_current_progress_message() -> None:
+                """Best-effort close of the current editable progress bubble."""
+                if not (
+                    can_edit
+                    and progress_lines
+                    and progress_msg_id
+                    and not progress_message_finalized
+                ):
+                    return
+                try:
+                    await _roll_progress_overflow_if_needed()
+                    if (
+                        can_edit
+                        and progress_lines
+                        and progress_msg_id
+                        and not progress_message_finalized
+                    ):
+                        await _edit_progress_message(
+                            progress_msg_id,
+                            _progress_text(progress_lines),
+                            finalize=True,
+                        )
+                except Exception:
+                    pass
+
+            async def _finalize_visible_progress_message() -> None:
+                """Close only content already shown before a stale-run drain."""
+                if not (
+                    can_edit
+                    and progress_msg_id
+                    and rendered_progress_text is not None
+                    and not progress_message_finalized
+                ):
+                    return
+                try:
+                    await _edit_progress_message(
+                        progress_msg_id,
+                        rendered_progress_text,
+                        finalize=True,
+                    )
+                except Exception:
+                    pass
+
             while True:
                 try:
                     if not _run_still_current():
+                        await _finalize_visible_progress_message()
                         while not progress_queue.empty():
                             try:
                                 progress_queue.get_nowait()
@@ -19548,6 +19844,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return
 
                     raw = progress_queue.get_nowait()
+                    _raw_is_reset = _is_progress_reset(raw)
+                    if not _raw_is_reset and _progress_reset_is_pending():
+                        # A content bubble is already visible and its reset
+                        # marker is later in this FIFO.  Drop every older item
+                        # instead of rendering it below the newer content.
+                        continue
+                    if _raw_is_reset:
+                        # Content bubble just landed on the platform — close off
+                        # the current tool-progress bubble so the next tool
+                        # starts a fresh bubble below the content. Without this,
+                        # tool lines keep editing the ORIGINAL progress message
+                        # above the new content, making the chat appear out of
+                        # order. Mirrors GatewayStreamConsumer.on_segment_break
+                        # on the content side. (Issue: tool + content
+                        # linearization regression after PR #7885.)
+                        # The content bubble is already visible.  Close only
+                        # progress that appeared above it; buffered pre-content
+                        # lines must not be emitted below the newer content.
+                        _consume_progress_reset()
+                        await _finalize_visible_progress_message()
+                        progress_msg_id = None
+                        progress_lines = []
+                        rendered_progress_text = None
+                        progress_message_finalized = False
+                        continue
 
                     # Drain silently when interrupted: events queued in the
                     # window between tool parse and interrupt processing
@@ -19571,20 +19892,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
-                    elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
-                        # Content bubble just landed on the platform — close off
-                        # the current tool-progress bubble so the next tool
-                        # starts a fresh bubble below the content. Without this,
-                        # tool lines keep editing the ORIGINAL progress message
-                        # above the new content, making the chat appear out of
-                        # order. Mirrors GatewayStreamConsumer.on_segment_break
-                        # on the content side. (Issue: tool + content
-                        # linearization regression after PR #7885.)
-                        progress_msg_id = None
-                        progress_lines = []
-                        last_progress_msg[0] = None
-                        repeat_count[0] = 0
-                        continue
                     else:
                         msg = raw
                         progress_lines.append(msg)
@@ -19602,14 +19909,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # instead of reacting to 429s.)
                     _now = time.monotonic()
                     _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                    if _remaining > 0:
+                    if can_edit and progress_msg_id is not None and _remaining > 0:
                         # Wait out the throttle interval, then loop back to
                         # drain any additional queued messages before sending
                         # a single batched edit.
                         await asyncio.sleep(_remaining)
                         continue
 
+                    if _progress_reset_is_pending():
+                        # The boundary may have landed while an edit was
+                        # throttled.  Its FIFO marker will clear this buffer.
+                        continue
+
                     if not _run_still_current():
+                        await _finalize_visible_progress_message()
                         return
 
                     if can_edit and progress_msg_id is not None:
@@ -19671,8 +19984,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
+                            rendered_progress_text = full_text if can_edit else msg
+                            progress_message_finalized = False
                             if _cleanup_progress:
                                 _cleanup_msg_ids.append(str(result.message_id))
+                        elif getattr(result, "success", False) and can_edit:
+                            # Successful delivery without an editable ID is a
+                            # valid platform result.  Do not replay the same
+                            # accumulated text on the next progress update.
+                            can_edit = False
+                            progress_lines = []
+                            progress_msg_id = None
+                            rendered_progress_text = None
+                            progress_message_finalized = False
 
                     _last_edit_ts = time.monotonic()
 
@@ -19684,44 +20008,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except queue.Empty:
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
+                    if not _run_still_current():
+                        while not progress_queue.empty():
+                            try:
+                                progress_queue.get_nowait()
+                            except Exception:
+                                break
+                        await _finalize_visible_progress_message()
+                        return
                     # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            _raw_is_reset = _is_progress_reset(raw)
+                            if _raw_is_reset:
+                                _consume_progress_reset()
+                                # Content-bubble marker during drain: close off
+                                # the current progress bubble and start a fresh
+                                # one for any tool lines that arrived after.
+                                # The content bubble is already visible.  Do
+                                # not roll buffered pre-content progress into
+                                # fresh messages below it during cancellation.
+                                await _finalize_visible_progress_message()
+                                progress_msg_id = None
+                                progress_lines = []
+                                rendered_progress_text = None
+                                progress_message_finalized = False
+                            elif _progress_reset_is_pending():
+                                # This item predates a content marker that is
+                                # still later in the FIFO; discard it silently.
+                                continue
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                     await _roll_progress_overflow_if_needed()
-                            elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
-                                # Content-bubble marker during drain: close off
-                                # the current progress bubble and start a fresh
-                                # one for any tool lines that arrived after.
-                                await _roll_progress_overflow_if_needed()
-                                if can_edit and progress_lines and progress_msg_id:
-                                    _pending_text = _progress_text(progress_lines)
-                                    try:
-                                        await _edit_progress_message(progress_msg_id, _pending_text)
-                                    except Exception:
-                                        pass
-                                progress_msg_id = None
-                                progress_lines = []
-                                last_progress_msg[0] = None
-                                repeat_count[0] = 0
                             else:
                                 progress_lines.append(raw)
                                 await _roll_progress_overflow_if_needed()
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = _progress_text(progress_lines)
-                        try:
-                            await _edit_progress_message(progress_msg_id, full_text)
-                        except Exception:
-                            pass
+                    await _finalize_current_progress_message()
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -19971,7 +20299,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             config=_consumer_cfg,
                             metadata=_status_thread_metadata,
                             on_new_message=(
-                                (lambda: progress_queue.put(("__reset__",)))
+                                _queue_progress_reset
                                 if progress_queue is not None
                                 else None
                             ),

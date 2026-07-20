@@ -203,6 +203,68 @@ def test_direct_discord_event_not_authorized_by_relay_presence(monkeypatch):
     assert runner._is_user_authorized(src) is False
 
 
+def test_relay_delivered_source_resolves_relay_response_adapter():
+    """Underlying platform identity must not hide the live Relay adapter."""
+    runner, relay_adapter = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+        delivered_via_upstream_relay=True,
+    )
+    assert runner._adapter_for_source(src) is relay_adapter
+
+
+def test_direct_source_does_not_resolve_relay_response_adapter():
+    """Relay presence must not capture a direct underlying-platform event."""
+    runner, _ = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+    )
+    assert runner._adapter_for_source(src) is None
+
+
+def test_relay_delivered_profile_source_resolves_shared_relay_adapter():
+    """Multiplexed Relay ingress stays on the process-level adapter.
+
+    Secondary profiles deliberately do not start their own Relay connection;
+    the shared adapter stamps ``source.profile`` to select the agent runtime.
+    Direct adapters for that profile must remain profile-scoped.
+    """
+    runner, shared_relay_adapter = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    profile_discord_adapter = SimpleNamespace(send=AsyncMock())
+    runner._profile_adapters = {
+        "reviewer": {Platform.DISCORD: profile_discord_adapter},
+    }
+    relay_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+        profile="reviewer",
+        delivered_via_upstream_relay=True,
+    )
+    direct_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_type="channel",
+        profile="reviewer",
+    )
+
+    assert runner._adapter_for_source(relay_source) is shared_relay_adapter
+    assert runner._adapter_for_source(direct_source) is profile_discord_adapter
+
+
 def test_relay_delivery_marker_is_wire_invisible():
     """delivered_via_upstream_relay is an INTERNAL trust signal, never serialized.
 

@@ -28,6 +28,7 @@ PRs #9850, #9934, #7536):
 import asyncio
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -43,7 +44,13 @@ from gateway.run import (
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    relay_origin_proof_for_source,
+    trusted_origin_for_resume,
+)
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -1098,6 +1105,283 @@ async def test_startup_auto_resume_includes_crash_recovery():
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
+
+
+def test_persisted_relay_origin_proof_rehydrates_and_detects_tampering(monkeypatch):
+    """Persistence restores Relay trust only with the current secret and origin."""
+    monkeypatch.setenv("GATEWAY_RELAY_ID", "gateway-1")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="relay-chat",
+        chat_type="dm",
+        user_id="relay-user",
+        delivered_via_upstream_relay=True,
+    )
+    entry = SessionEntry(
+        session_key="agent:main:discord:dm:relay-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        origin_transport=Platform.RELAY,
+        relay_origin_proof=relay_origin_proof_for_source(
+            "agent:main:discord:dm:relay-chat", source
+        ),
+    )
+
+    restored = SessionEntry.from_dict(entry.to_dict())
+    assert restored.origin is not None
+    assert restored.origin.delivered_via_upstream_relay is False
+    assert trusted_origin_for_resume(restored).delivered_via_upstream_relay is True
+
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "rotated-secret")
+    assert trusted_origin_for_resume(restored) is None
+
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    restored.origin.chat_id = "tampered-chat"
+    assert trusted_origin_for_resume(restored) is None
+
+    restored.relay_origin_proof = None
+    assert trusted_origin_for_resume(restored) is None
+
+
+def test_platform_relay_origin_requires_signed_resume_provenance(
+    monkeypatch,
+    tmp_path,
+):
+    """A Relay-platform origin must never bypass restart proof validation."""
+    monkeypatch.setenv("GATEWAY_RELAY_ID", "gateway-1")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    source = SessionSource(
+        platform=Platform.RELAY,
+        chat_id="interaction-chat",
+        chat_type="channel",
+        user_id="interaction-user",
+        delivered_via_upstream_relay=True,
+    )
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = store.get_or_create_session(source)
+
+    assert entry.origin_transport is Platform.RELAY
+    assert entry.relay_origin_proof
+
+    restored = SessionEntry.from_dict(entry.to_dict())
+    trusted_source = trusted_origin_for_resume(restored)
+    assert trusted_source is not None
+    assert trusted_source.platform is Platform.RELAY
+    assert trusted_source.delivered_via_upstream_relay is True
+
+    # A persistable platform value alone must neither mint authenticated
+    # provenance nor resume through Relay without a proof.
+    unsigned_source = SessionSource(
+        platform=Platform.RELAY,
+        chat_id="unsigned-interaction-chat",
+        chat_type="channel",
+        user_id="interaction-user",
+    )
+    unsigned_store = SessionStore(
+        sessions_dir=tmp_path / "unsigned",
+        config=GatewayConfig(),
+    )
+    unsigned_entry = unsigned_store.get_or_create_session(unsigned_source)
+    assert unsigned_entry.origin_transport is None
+    assert unsigned_entry.relay_origin_proof is None
+    unsigned_restored = SessionEntry.from_dict(unsigned_entry.to_dict())
+    assert trusted_origin_for_resume(unsigned_restored) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_reuse_clears_relay_resume_provenance(monkeypatch, tmp_path):
+    """A direct adapter reclaiming a session must also own restart resume."""
+    monkeypatch.setenv("GATEWAY_RELAY_ID", "gateway-1")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    relay_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="shared-chat",
+        chat_type="dm",
+        user_id="shared-user",
+        user_name="Relay delivery",
+        delivered_via_upstream_relay=True,
+    )
+    direct_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="shared-chat",
+        chat_type="dm",
+        user_id="shared-user",
+        user_name="Direct delivery",
+    )
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    relay_entry = store.get_or_create_session(relay_source)
+    original_session_id = relay_entry.session_id
+    assert relay_entry.origin_transport is Platform.RELAY
+    assert relay_entry.relay_origin_proof
+
+    reclaimed = store.get_or_create_session(direct_source)
+
+    assert reclaimed.session_id == original_session_id
+    assert reclaimed.origin is not None
+    assert reclaimed.origin.user_name == "Direct delivery"
+    assert reclaimed.origin.delivered_via_upstream_relay is False
+    assert reclaimed.origin_transport is None
+    assert reclaimed.relay_origin_proof is None
+
+    with store._lock:
+        reclaimed.resume_pending = True
+        reclaimed.resume_reason = "restart_interrupted"
+        reclaimed.last_resume_marked_at = datetime.now()
+        store._save()
+
+    restored_store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    restored_store._ensure_loaded()
+    restored = restored_store._entries[reclaimed.session_key]
+    trusted_source = trusted_origin_for_resume(restored)
+    assert trusted_source is not None
+    assert trusted_source.delivered_via_upstream_relay is False
+    assert trusted_source.user_name == "Direct delivery"
+
+    runner, _ = make_restart_runner()
+    direct_adapter = SimpleNamespace(handle_message=AsyncMock())
+    relay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {
+        Platform.DISCORD: direct_adapter,
+        Platform.RELAY: relay_adapter,
+    }
+    runner.session_store = restored_store
+
+    scheduled = runner._schedule_resume_pending_sessions(platform=Platform.DISCORD)
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    direct_adapter.handle_message.assert_awaited_once()
+    relay_adapter.handle_message.assert_not_awaited()
+    event = direct_adapter.handle_message.await_args.args[0]
+    assert event.source.delivered_via_upstream_relay is False
+    assert event.source.user_name == "Direct delivery"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["reset", "switch"])
+async def test_direct_session_boundary_clears_relay_resume_provenance(
+    monkeypatch,
+    tmp_path,
+    boundary,
+):
+    """Direct /new and /resume ownership survives persistence and restart."""
+    monkeypatch.setenv("GATEWAY_RELAY_ID", "gateway-1")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    relay_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="boundary-chat",
+        chat_type="dm",
+        user_id="boundary-user",
+        user_name="Relay delivery",
+        delivered_via_upstream_relay=True,
+    )
+    direct_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="boundary-chat",
+        chat_type="dm",
+        user_id="boundary-user",
+        user_name="Direct boundary",
+    )
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    relay_entry = store.get_or_create_session(relay_source)
+    assert relay_entry.origin_transport is Platform.RELAY
+    assert relay_entry.relay_origin_proof
+
+    if boundary == "reset":
+        direct_entry = store.reset_session(
+            relay_entry.session_key,
+            source=direct_source,
+        )
+    else:
+        direct_entry = store.switch_session(
+            relay_entry.session_key,
+            "direct-target-session",
+            source=direct_source,
+        )
+
+    assert direct_entry is not None
+    assert direct_entry.origin is not None
+    assert direct_entry.origin.user_name == "Direct boundary"
+    assert direct_entry.origin_transport is None
+    assert direct_entry.relay_origin_proof is None
+
+    with store._lock:
+        direct_entry.resume_pending = True
+        direct_entry.resume_reason = "restart_interrupted"
+        direct_entry.last_resume_marked_at = datetime.now()
+        store._save()
+
+    restored_store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    restored_store._ensure_loaded()
+    restored = restored_store._entries[relay_entry.session_key]
+    trusted_source = trusted_origin_for_resume(restored)
+    assert trusted_source is not None
+    assert trusted_source.delivered_via_upstream_relay is False
+    assert trusted_source.user_name == "Direct boundary"
+
+    runner, _ = make_restart_runner()
+    direct_adapter = SimpleNamespace(handle_message=AsyncMock())
+    relay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {
+        Platform.DISCORD: direct_adapter,
+        Platform.RELAY: relay_adapter,
+    }
+    runner.session_store = restored_store
+
+    scheduled = runner._schedule_resume_pending_sessions(platform=Platform.DISCORD)
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    direct_adapter.handle_message.assert_awaited_once()
+    relay_adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_relay_reconnect_resumes_authenticated_persisted_origin(
+    monkeypatch,
+    tmp_path,
+):
+    """A signed persisted Relay session resumes through Relay after restart."""
+    monkeypatch.setenv("GATEWAY_RELAY_ID", "gateway-1")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="relay-chat",
+        chat_type="dm",
+        user_id="relay-user",
+        delivered_via_upstream_relay=True,
+    )
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = store.get_or_create_session(source)
+    with store._lock:
+        entry.resume_pending = True
+        entry.resume_reason = "restart_interrupted"
+        entry.last_resume_marked_at = datetime.now()
+        store._save()
+
+    restored_store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    runner, _ = make_restart_runner()
+    relay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.RELAY: relay_adapter}
+    runner.session_store = restored_store
+    from gateway.run import GatewayRunner
+
+    runner._is_user_authorized = GatewayRunner._is_user_authorized.__get__(
+        runner,
+        GatewayRunner,
+    )
+
+    scheduled = runner._schedule_resume_pending_sessions(platform=Platform.RELAY)
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    relay_adapter.handle_message.assert_awaited_once()
+    event = relay_adapter.handle_message.await_args.args[0]
+    assert event.source.platform is Platform.DISCORD
+    assert event.source.delivered_via_upstream_relay is True
 
 
 @pytest.mark.asyncio

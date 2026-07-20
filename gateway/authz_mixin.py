@@ -58,9 +58,15 @@ class GatewayAuthorizationMixin:
         ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
         When a stamped profile has its own adapter registry entry, the default
         profile's same-platform adapter must not be consulted as a fallback.
+        Relay is the exception: multiplex mode owns one process-level Relay
+        connection, and connector-stamped profiles select agent runtimes rather
+        than separate transport adapters.
         """
         if not platform:
             return None
+        adapters = getattr(self, "adapters", None) or {}
+        if platform is Platform.RELAY:
+            return adapters.get(platform)
         profile_name = (profile or "").strip() or None
         if profile_name and profile_name != "default":
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
@@ -70,17 +76,24 @@ class GatewayAuthorizationMixin:
             # (e.g. its adapter failed to connect) must NOT fall back to the
             # default profile's adapter — that sends replies out the wrong bot.
             return None
-        adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)
 
     def _adapter_for_source(self, source: Optional[SessionSource]):
         """Resolve the live adapter for an inbound ``SessionSource``."""
         if source is None:
             return None
+        platform = getattr(source, "platform", None)
+        # Relay-delivered events retain their underlying platform for stable
+        # session identity and egress routing.  The live response adapter is
+        # nevertheless registered under Platform.RELAY.  Only trust the
+        # internal marker stamped by the authenticated relay transport; it is
+        # deliberately absent from SessionSource's wire/persistence surface.
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            platform = Platform.RELAY
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
-            getattr(source, "platform", None),
+            platform,
             getattr(source, "profile", None),
         )
 

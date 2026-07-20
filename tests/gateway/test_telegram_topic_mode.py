@@ -104,7 +104,7 @@ def _make_runner(session_db=None):
     # Default switch_session impl: returns a SessionEntry carrying the target
     # session_id. Mirrors SessionStore.switch_session semantics for tests that
     # exercise Telegram topic binding rebinds without a real store.
-    def _switch_session(session_key, target_session_id):
+    def _switch_session(session_key, target_session_id, *, source=None):
         return SessionEntry(
             session_key=session_key,
             session_id=target_session_id,
@@ -112,7 +112,7 @@ def _make_runner(session_db=None):
             updated_at=datetime.now(),
             platform=Platform.TELEGRAM,
             chat_type="dm",
-            origin=None,
+            origin=source,
         )
     runner.session_store.switch_session = MagicMock(side_effect=_switch_session)
     runner._running_agents = {}
@@ -347,11 +347,15 @@ async def test_group_new_keeps_existing_reset_semantics_when_dm_topic_mode_enabl
         "hermes_cli.tips.get_random_tip", lambda: "pinned tip for test"
     )
 
-    result = await runner._handle_message(_make_group_event("/new", thread_id="555"))
+    event = _make_group_event("/new", thread_id="555")
+    result = await runner._handle_message(event)
 
     assert "Started a new Hermes session in this topic" not in result
     assert "parallel work" not in result
-    runner.session_store.reset_session.assert_called_once_with(group_key)
+    runner.session_store.reset_session.assert_called_once_with(
+        group_key,
+        source=event.source,
+    )
 
 
 @pytest.mark.asyncio
@@ -388,12 +392,16 @@ async def test_new_inside_telegram_topic_resets_current_topic_with_parallel_tip(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
     )
 
-    result = await runner._handle_message(_make_event("/new", thread_id="17585"))
+    event = _make_event("/new", thread_id="17585")
+    result = await runner._handle_message(event)
 
     assert "Started a new Hermes session in this topic" in result
     assert "parallel work" in result
     assert "All Messages" in result
-    runner.session_store.reset_session.assert_called_once_with(topic_key)
+    runner.session_store.reset_session.assert_called_once_with(
+        topic_key,
+        source=event.source,
+    )
 
 
 @pytest.mark.asyncio
@@ -502,7 +510,7 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     # requested; capture the requested id for assertion.
     switched_to: dict = {}
 
-    def fake_switch(_key, new_session_id):
+    def fake_switch(_key, new_session_id, *, source=None):
         switched_to["id"] = new_session_id
         return SessionEntry(
             session_key=topic_key,
@@ -511,7 +519,7 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
             updated_at=datetime.now(),
             platform=Platform.TELEGRAM,
             chat_type="dm",
-            origin=topic_source,
+            origin=source or topic_source,
         )
 
     runner.session_store.switch_session = MagicMock(side_effect=fake_switch)
@@ -843,7 +851,10 @@ async def test_handoff_to_telegram_dm_topic_uses_dm_lane_not_generic_thread(tmp_
 
     expected_source = _make_source(thread_id="17585")
     expected_key = build_session_key(expected_source)
-    runner.session_store.switch_session.assert_called_once_with(expected_key, "cli-session")
+    runner.session_store.switch_session.assert_called_once()
+    switch_call = runner.session_store.switch_session.call_args
+    assert switch_call.args == (expected_key, "cli-session")
+    assert switch_call.kwargs["source"] is captured["source"]
     assert captured["source"].chat_type == "dm"
     assert captured["source"].user_id == "208214988"
     assert captured["source"].thread_id == "17585"

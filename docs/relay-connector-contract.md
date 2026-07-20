@@ -390,13 +390,17 @@ The gateway calls the transport with action dicts. Source of truth:
 | `op` | Fields | Result |
 | --- | --- | --- |
 | `send` | `chat_id`, `content`, `reply_to?`, `metadata?` | `{success: bool, message_id?, error?}` |
-| `edit` | `chat_id`, `message_id`, `content`, `metadata?` | `{success: bool, error?}` |
+| `edit` | `chat_id`, `message_id`, `content`, `finalize`, `metadata?` | `{success: bool, error?}` |
 | `typing` | `chat_id` | `{success: bool}` |
 | `follow_up` | `session_key`, `kind`, `content`, `metadata?` | `{success: bool, message_id?, error?}` |
 
 `get_chat_info(chat_id)` is a separate proxied call returning at least
 `{name, type}`. Media actions follow the same envelope shape (deferred to a
 later contract revision; additive).
+
+`edit.finalize` is `false` for progressive updates and `true` for the terminal
+edit. Connectors that advertise `supports_edit` must accept the terminal action
+even when its content is identical to the last progressive update.
 
 **`follow_up` (A2 capability action).** Some inbound payloads carry a credential
 that acts on the **shared** bot identity (e.g. a Discord interaction follow-up
