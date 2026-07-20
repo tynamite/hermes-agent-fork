@@ -78,8 +78,14 @@ def _make_runner():
 async def test_reset_fires_finalize_hook(mock_invoke_hook):
     """/new must fire on_session_finalize with the OLD session id."""
     runner = _make_runner()
+    event = _make_event("/new")
 
-    await runner._handle_reset_command(_make_event("/new"))
+    await runner._handle_reset_command(event)
+
+    runner.session_store.reset_session.assert_called_once_with(
+        build_session_key(event.source),
+        source=event.source,
+    )
 
     assert any(
         c.args == ("on_session_finalize",)

@@ -931,6 +931,28 @@ def origin_transport_for_source(source: SessionSource) -> Optional[Platform]:
     return None
 
 
+def _refresh_transport_provenance(
+    entry: SessionEntry,
+    session_key: str,
+    source: SessionSource,
+) -> None:
+    """Persist an ownership transition between Relay and direct adapters."""
+    source_is_relay = source.delivered_via_upstream_relay is True
+    entry_has_relay_provenance = (
+        entry.origin_transport is Platform.RELAY
+        or bool(entry.relay_origin_proof)
+    )
+    if not source_is_relay and not entry_has_relay_provenance:
+        return
+    entry.origin = source
+    entry.platform = source.platform
+    entry.origin_transport = origin_transport_for_source(source)
+    entry.relay_origin_proof = relay_origin_proof_for_source(
+        session_key,
+        source,
+    )
+
+
 def trusted_origin_for_resume(entry: SessionEntry) -> Optional[SessionSource]:
     """Restore Relay provenance for restart recovery after HMAC verification.
 
@@ -2016,23 +2038,6 @@ class SessionStore:
         session_key = self._generate_session_key(source)
         now = _now()
 
-        def _refresh_transport_provenance(entry: SessionEntry) -> None:
-            """Persist ownership changes between Relay and direct adapters."""
-            source_is_relay = source.delivered_via_upstream_relay is True
-            entry_has_relay_provenance = (
-                entry.origin_transport is Platform.RELAY
-                or bool(entry.relay_origin_proof)
-            )
-            if not source_is_relay and not entry_has_relay_provenance:
-                return
-            entry.origin = source
-            entry.platform = source.platform
-            entry.origin_transport = origin_transport_for_source(source)
-            entry.relay_origin_proof = relay_origin_proof_for_source(
-                session_key,
-                source,
-            )
-
         db_end_session_id = None
         db_create_kwargs = None
         existing_session_id = None
@@ -2142,7 +2147,7 @@ class SessionStore:
                     # Another thread handled this entry during our lock-free
                     # window.  Treat as healthy -- bump updated_at and save.
                     entry.updated_at = now
-                    _refresh_transport_provenance(entry)
+                    _refresh_transport_provenance(entry, session_key, source)
                     _needs_save = True
                 else:
                     # Stale check clean.  Apply reset decision.
@@ -2160,7 +2165,7 @@ class SessionStore:
                         # its persisted proof when a direct adapter reclaims the
                         # same underlying session key.  Otherwise a later
                         # restart could resume a direct turn through Relay.
-                        _refresh_transport_provenance(entry)
+                        _refresh_transport_provenance(entry, session_key, source)
                         _needs_save = True
             else:
                 if not force_new:
@@ -2464,7 +2469,13 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
         db_create_kwargs = None
@@ -2495,18 +2506,21 @@ class SessionStore:
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
             )
+            if source is not None:
+                _refresh_transport_provenance(new_entry, session_key, source)
 
             self._entries[session_key] = new_entry
             self._save()
+            new_origin = new_entry.origin
             db_create_kwargs = {
                 "session_id": session_id,
-                "source": old_entry.platform.value if old_entry.platform else "unknown",
-                "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "source": new_entry.platform.value if new_entry.platform else "unknown",
+                "user_id": new_origin.user_id if new_origin else None,
                 "session_key": session_key,
-                "chat_id": old_entry.origin.chat_id if old_entry.origin else None,
-                "chat_type": old_entry.origin.chat_type if old_entry.origin else None,
-                "thread_id": old_entry.origin.thread_id if old_entry.origin else None,
-                "profile_name": old_entry.origin.profile if old_entry.origin else None,
+                "chat_id": new_origin.chat_id if new_origin else None,
+                "chat_type": new_origin.chat_type if new_origin else None,
+                "thread_id": new_origin.thread_id if new_origin else None,
+                "profile_name": new_origin.profile if new_origin else None,
             }
 
         if self._db and db_end_session_id:
@@ -2529,7 +2543,7 @@ class SessionStore:
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
-                    old_entry.origin,
+                    new_entry.origin if new_entry else None,
                     display_name=new_entry.display_name if new_entry else None,
                 )
             except Exception as e:
@@ -2537,7 +2551,13 @@ class SessionStore:
 
         return new_entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(
+        self,
+        session_key: str,
+        target_session_id: str,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
         Used by ``/resume`` to restore a previously-named session.
@@ -2559,6 +2579,13 @@ class SessionStore:
 
             # Don't switch if already on that session
             if old_entry.session_id == target_session_id:
+                if source is not None:
+                    _refresh_transport_provenance(
+                        old_entry,
+                        session_key,
+                        source,
+                    )
+                    self._save()
                 return old_entry
 
             db_end_session_id = old_entry.session_id
@@ -2576,6 +2603,8 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
             )
+            if source is not None:
+                _refresh_transport_provenance(new_entry, session_key, source)
 
             self._entries[session_key] = new_entry
             self._save()

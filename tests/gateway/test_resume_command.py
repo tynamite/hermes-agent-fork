@@ -134,6 +134,7 @@ class TestHandleResumeCommand:
         runner.session_store.switch_session.assert_called_once()
         call_args = runner.session_store.switch_session.call_args
         assert call_args[0][1] == "sess_001"
+        assert call_args.kwargs["source"] is event.source
         db.close()
 
     @pytest.mark.asyncio

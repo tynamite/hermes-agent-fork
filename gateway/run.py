@@ -8253,7 +8253,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ends the prior session in SQLite and reopens the CLI session under
         # the new key. The CLI's transcript becomes the active one for the
         # gateway from this moment on.
-        switched = await self.async_session_store.switch_session(session_key, cli_session_id)
+        switched = await self.async_session_store.switch_session(
+            session_key,
+            cli_session_id,
+            source=dest_source,
+        )
         if switched is None:
             raise RuntimeError(
                 f"could not switch session key {session_key} → {cli_session_id}"
@@ -11966,7 +11970,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             prior_session_id = session_entry.session_id
-            switched = await self.async_session_store.switch_session(session_key, pinned_session_id)
+            switched = await self.async_session_store.switch_session(
+                session_key,
+                pinned_session_id,
+                source=source,
+            )
             if switched is not None:
                 session_entry = switched
                 logger.info(
@@ -12016,7 +12024,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # lane session is ended cleanly. Mutating session_entry in
                     # place here created a split-brain state where the JSON
                     # index pointed at one id but code downstream used another.
-                    switched = await self.async_session_store.switch_session(session_key, bound_session_id)
+                    switched = await self.async_session_store.switch_session(
+                        session_key,
+                        bound_session_id,
+                        source=source,
+                    )
                     if switched is not None:
                         session_entry = switched
                 # If the stored binding pointed at a parent, rewrite it to the
@@ -13209,7 +13221,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
                 )
-                new_entry = await self.async_session_store.reset_session(session_key)
+                new_entry = await self.async_session_store.reset_session(
+                    session_key,
+                    source=source,
+                )
                 self._evict_cached_agent(session_key)
                 # Conversation boundary: one funnel call clears every
                 # conversation-scoped per-session dict (#58403 and siblings).
@@ -19578,6 +19593,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         progress_msg_id = result.message_id
 
                 for group in groups[1:]:
+                    if (
+                        progress_msg_id is not None
+                        and rendered_progress_text is not None
+                        and not progress_message_finalized
+                    ):
+                        result = await _edit_progress_message(
+                            progress_msg_id,
+                            rendered_progress_text,
+                            finalize=True,
+                        )
+                        if not result.success:
+                            can_edit = False
+                            return False
                     result = await _send_progress_text(_progress_text(group))
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id

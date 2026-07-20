@@ -106,6 +106,40 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class DeferredLimitProgressAdapter(SmallLimitProgressAdapter):
+    """Force one overflow pass to emit multiple continuation bubbles."""
+
+    enforce_limit = threading.Event()
+    first_sent = threading.Event()
+    split_sent = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        type(self).enforce_limit.clear()
+        type(self).first_sent.clear()
+        type(self).split_sent.clear()
+        self.sent_message_ids = []
+
+    def message_len_fn(self, text: str) -> int:
+        # Hold several processed lines in one buffer, then expose the adapter's
+        # real encoded-length budget so a single split yields 3+ bubbles.
+        return len(text) if type(self).enforce_limit.is_set() else 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        self.sent_message_ids.append(result.message_id)
+        if "deferred-one" in content:
+            type(self).first_sent.set()
+        if "deferred-three" in content:
+            type(self).split_sent.set()
+        return result
+
+
 class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
     async def edit_message(
         self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
@@ -328,6 +362,34 @@ class ManyProgressLinesAgent:
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
         time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class DeferredLimitProgressAgent:
+    """Accumulate lines, then make one rollover produce several bubbles."""
+
+    _PAD = "x" * 70
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", f"deferred-one-{self._PAD}", {})
+        assert DeferredLimitProgressAdapter.first_sent.wait(timeout=2.0)
+        cb("tool.started", "terminal", f"deferred-two-{self._PAD}", {})
+        # The sender consumes line two into its throttled buffer before the
+        # third callback turns real length accounting on.
+        time.sleep(0.45)
+        DeferredLimitProgressAdapter.enforce_limit.set()
+        cb("tool.started", "terminal", f"deferred-three-{self._PAD}", {})
+        assert DeferredLimitProgressAdapter.split_sent.wait(timeout=3.0)
         return {
             "final_response": "done",
             "messages": [],
@@ -1003,6 +1065,37 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert all(call["finalize"] is True for call in adapter.edits)
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_finalizes_every_multi_group_rollover_bubble(
+    monkeypatch,
+    tmp_path,
+):
+    """Every continuation abandoned by one split receives a terminal edit."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DeferredLimitProgressAgent,
+        session_id="sess-progress-multi-rollover",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+                "tool_preview_length": 90,
+            }
+        },
+        adapter_cls=DeferredLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent_message_ids) >= 3
+    finalized_ids = {
+        call["message_id"]
+        for call in adapter.edits
+        if call["finalize"] is True
+    }
+    assert set(adapter.sent_message_ids).issubset(finalized_ids)
 
 
 @pytest.mark.asyncio
