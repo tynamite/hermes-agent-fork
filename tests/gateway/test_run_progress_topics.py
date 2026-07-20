@@ -140,6 +140,53 @@ class DeferredLimitProgressAdapter(SmallLimitProgressAdapter):
         return result
 
 
+class FailingContinuationProgressAdapter(DeferredLimitProgressAdapter):
+    """Fail one rollover continuation and detect edits to closed bubbles."""
+
+    continuation_failed = threading.Event()
+    post_failure_sent = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        type(self).continuation_failed.clear()
+        type(self).post_failure_sent.clear()
+        self.failed_sends = []
+        self.finalized_message_ids = set()
+        self.edits_after_finalize = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if "deferred-three" in content:
+            self.failed_sends.append(content)
+            type(self).continuation_failed.set()
+            return SendResult(success=False, error="forced continuation failure")
+
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if "after-failure" in content:
+            type(self).post_failure_sent.set()
+        return result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        if message_id in self.finalized_message_ids:
+            self.edits_after_finalize.append(message_id)
+        result = await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+        if result.success and finalize:
+            self.finalized_message_ids.add(message_id)
+        return result
+
+
 class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
     async def edit_message(
         self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
@@ -390,6 +437,37 @@ class DeferredLimitProgressAgent:
         DeferredLimitProgressAdapter.enforce_limit.set()
         cb("tool.started", "terminal", f"deferred-three-{self._PAD}", {})
         assert DeferredLimitProgressAdapter.split_sent.wait(timeout=3.0)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class FailedContinuationProgressAgent:
+    """Keep emitting progress after a rollover continuation send fails."""
+
+    _PAD = "x" * 70
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", f"deferred-one-{self._PAD}", {})
+        assert FailingContinuationProgressAdapter.first_sent.wait(timeout=2.0)
+        cb("tool.started", "terminal", f"deferred-two-{self._PAD}", {})
+        time.sleep(0.45)
+        FailingContinuationProgressAdapter.enforce_limit.set()
+        cb("tool.started", "terminal", f"deferred-three-{self._PAD}", {})
+        assert FailingContinuationProgressAdapter.continuation_failed.wait(timeout=3.0)
+        # Let the normal progress throttle expire so the post-failure event
+        # exercises the non-edit fallback instead of being batched away.
+        time.sleep(2.1)
+        cb("tool.started", "terminal", f"after-failure-{self._PAD}", {})
+        assert FailingContinuationProgressAdapter.post_failure_sent.wait(timeout=4.0)
         return {
             "final_response": "done",
             "messages": [],
@@ -1096,6 +1174,33 @@ async def test_run_agent_finalizes_every_multi_group_rollover_bubble(
         if call["finalize"] is True
     }
     assert set(adapter.sent_message_ids).issubset(finalized_ids)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_disables_edits_after_rollover_continuation_send_failure(
+    monkeypatch,
+    tmp_path,
+):
+    """A failed continuation must not leave a closed message as the edit target."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FailedContinuationProgressAgent,
+        session_id="sess-progress-rollover-send-failure",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+                "tool_preview_length": 90,
+            }
+        },
+        adapter_cls=FailingContinuationProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.failed_sends
+    assert FailingContinuationProgressAdapter.post_failure_sent.is_set()
+    assert adapter.edits_after_finalize == []
 
 
 @pytest.mark.asyncio

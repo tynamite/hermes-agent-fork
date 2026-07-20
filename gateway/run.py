@@ -19589,8 +19589,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return False
                 else:
                     result = await _send_progress_text(first_text)
-                    if result.success and result.message_id:
-                        progress_msg_id = result.message_id
+                    if not (
+                        getattr(result, "success", False)
+                        and getattr(result, "message_id", None)
+                    ):
+                        can_edit = False
+                        return False
+                    progress_msg_id = result.message_id
 
                 for group in groups[1:]:
                     if (
@@ -19607,8 +19612,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             can_edit = False
                             return False
                     result = await _send_progress_text(_progress_text(group))
-                    if result.success and result.message_id:
-                        progress_msg_id = result.message_id
+                    if not (
+                        getattr(result, "success", False)
+                        and getattr(result, "message_id", None)
+                    ):
+                        can_edit = False
+                        return False
+                    progress_msg_id = result.message_id
 
                 # The newest continuation is now the only mutable bubble.  Keep
                 # just its lines so subsequent edits update it instead of
