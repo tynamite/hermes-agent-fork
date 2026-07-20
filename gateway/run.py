@@ -19523,15 +19523,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)
 
+            def _split_progress_line(line: object) -> list[str]:
+                """Split one line into chunks measured in platform length units."""
+                remaining = str(line)
+                if _progress_len_fn(remaining) <= _PROGRESS_TEXT_LIMIT:
+                    return [remaining]
+
+                chunks: list[str] = []
+                while remaining:
+                    if _progress_len_fn(remaining) <= _PROGRESS_TEXT_LIMIT:
+                        chunks.append(remaining)
+                        break
+
+                    # Find the longest codepoint prefix that fits the adapter's
+                    # length unit (for example Telegram's UTF-16 code units).
+                    low, high = 1, len(remaining)
+                    split_at = 1
+                    while low <= high:
+                        midpoint = (low + high) // 2
+                        if (
+                            _progress_len_fn(remaining[:midpoint])
+                            <= _PROGRESS_TEXT_LIMIT
+                        ):
+                            split_at = midpoint
+                            low = midpoint + 1
+                        else:
+                            high = midpoint - 1
+
+                    # Prefer a nearby newline without discarding it.  A single
+                    # codepoint may itself exceed a pathological tiny test
+                    # limit; split_at=1 still guarantees forward progress.
+                    newline_at = remaining.rfind("\n", 0, split_at + 1)
+                    if newline_at >= max(1, split_at // 2):
+                        split_at = newline_at + 1
+                    chunks.append(remaining[:split_at])
+                    remaining = remaining[split_at:]
+                return chunks
+
             def _split_progress_groups(lines: list) -> list[list]:
                 """Partition progress lines into platform-sized editable bubbles."""
                 groups: list[list] = []
                 current: list = []
                 for line in lines:
-                    candidate = current + [line]
-                    if current and _progress_len_fn(_progress_text(candidate)) > _PROGRESS_TEXT_LIMIT:
+                    fragments = _split_progress_line(line)
+                    if len(fragments) > 1:
+                        if current:
+                            groups.append(current)
+                        groups.extend([[fragment] for fragment in fragments[:-1]])
+                        current = [fragments[-1]]
+                        continue
+
+                    candidate = current + fragments
+                    if (
+                        current
+                        and _progress_len_fn(_progress_text(candidate))
+                        > _PROGRESS_TEXT_LIMIT
+                    ):
                         groups.append(current)
-                        current = [line]
+                        current = fragments
                     else:
                         current = candidate
                 if current:
@@ -19563,6 +19612,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     progress_message_finalized = False
                 return result
 
+            async def _send_progress_fallback_groups(groups: list[list]) -> None:
+                """Best-effort send every unsent group after editing fails closed."""
+                for group in groups:
+                    try:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=_progress_text(group),
+                            reply_to=_progress_reply_to,
+                            metadata=_progress_metadata,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Progress fallback send failed: %s",
+                            adapter.name,
+                            exc,
+                        )
+                        continue
+                    _track_progress_result(result)
+
+            async def _disable_progress_edits_and_send_groups(
+                groups: list[list],
+            ) -> None:
+                """Fail closed without leaving buffered progress behind."""
+                nonlocal progress_msg_id, progress_lines, can_edit
+                nonlocal rendered_progress_text, progress_message_finalized
+                can_edit = False
+                await _send_progress_fallback_groups(groups)
+                progress_msg_id = None
+                progress_lines = []
+                rendered_progress_text = None
+                progress_message_finalized = False
+
             async def _roll_progress_overflow_if_needed() -> bool:
                 """Start fresh editable progress bubbles before a bubble exceeds limit.
 
@@ -19570,6 +19651,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 caller should skip the normal send/edit path for this tick.
                 """
                 nonlocal progress_msg_id, progress_lines, can_edit
+                nonlocal rendered_progress_text, progress_message_finalized
                 if not progress_lines or not can_edit:
                     return False
                 groups = _split_progress_groups(progress_lines)
@@ -19584,20 +19666,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         finalize=True,
                     )
                     if not result.success:
-                        can_edit = False
-                        # Fall back to the existing non-edit behavior below.
-                        return False
+                        full_text = _progress_text(progress_lines)
+                        if rendered_progress_text and full_text.startswith(
+                            f"{rendered_progress_text}\n"
+                        ):
+                            pending_text = full_text[len(rendered_progress_text) + 1 :]
+                            pending_groups = [
+                                [fragment]
+                                for fragment in _split_progress_line(pending_text)
+                            ]
+                        elif full_text == rendered_progress_text:
+                            pending_groups = []
+                        else:
+                            # The visible text is not a clean prefix.  Re-send
+                            # the groups rather than risk dropping an update.
+                            pending_groups = groups
+                        await _disable_progress_edits_and_send_groups(pending_groups)
+                        return True
                 else:
                     result = await _send_progress_text(first_text)
                     if not (
                         getattr(result, "success", False)
                         and getattr(result, "message_id", None)
                     ):
-                        can_edit = False
-                        return False
+                        await _disable_progress_edits_and_send_groups(groups)
+                        return True
                     progress_msg_id = result.message_id
 
-                for group in groups[1:]:
+                for group_index, group in enumerate(groups[1:], start=1):
                     if (
                         progress_msg_id is not None
                         and rendered_progress_text is not None
@@ -19609,15 +19705,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             finalize=True,
                         )
                         if not result.success:
-                            can_edit = False
-                            return False
+                            await _disable_progress_edits_and_send_groups(
+                                groups[group_index:]
+                            )
+                            return True
                     result = await _send_progress_text(_progress_text(group))
                     if not (
                         getattr(result, "success", False)
                         and getattr(result, "message_id", None)
                     ):
-                        can_edit = False
-                        return False
+                        await _disable_progress_edits_and_send_groups(
+                            groups[group_index:]
+                        )
+                        return True
                     progress_msg_id = result.message_id
 
                 # The newest continuation is now the only mutable bubble.  Keep
@@ -19713,7 +19813,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
-                        await _finalize_current_progress_message()
+                        # The content bubble is already visible.  Close only
+                        # progress that appeared above it; buffered pre-content
+                        # lines must not be emitted below the newer content.
+                        await _finalize_visible_progress_message()
                         progress_msg_id = None
                         progress_lines = []
                         rendered_progress_text = None
@@ -19738,7 +19841,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # instead of reacting to 429s.)
                     _now = time.monotonic()
                     _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                    if _remaining > 0:
+                    if can_edit and _remaining > 0:
                         # Wait out the throttle interval, then loop back to
                         # drain any additional queued messages before sending
                         # a single batched edit.
@@ -19844,7 +19947,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
                                 # one for any tool lines that arrived after.
-                                await _finalize_current_progress_message()
+                                # The content bubble is already visible.  Do
+                                # not roll buffered pre-content progress into
+                                # fresh messages below it during cancellation.
+                                await _finalize_visible_progress_message()
                                 progress_msg_id = None
                                 progress_lines = []
                                 rendered_progress_text = None

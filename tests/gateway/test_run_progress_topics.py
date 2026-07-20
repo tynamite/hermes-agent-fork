@@ -187,6 +187,112 @@ class FailingContinuationProgressAdapter(DeferredLimitProgressAdapter):
         return result
 
 
+class DeferredSegmentProgressAdapter(SmallLimitProgressAdapter):
+    """Expose the real length limit only after commentary is delivered."""
+
+    first_sent = threading.Event()
+    buffer_ready = threading.Event()
+    commentary_sent = threading.Event()
+    segment_closed = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        type(self).first_sent.clear()
+        type(self).buffer_ready.clear()
+        type(self).commentary_sent.clear()
+        type(self).segment_closed.clear()
+        self.delivery_order = []
+
+    def message_len_fn(self, text: str) -> int:
+        if "segment-third" in text and not type(self).commentary_sent.is_set():
+            type(self).buffer_ready.set()
+        return len(text) if type(self).commentary_sent.is_set() else 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if content == "Checkpoint reached.":
+            self.delivery_order.append("commentary")
+            type(self).commentary_sent.set()
+        else:
+            self.delivery_order.append("progress")
+            if "segment-first" in content:
+                type(self).first_sent.set()
+        return result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        result = await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+        if finalize:
+            type(self).segment_closed.set()
+        return result
+
+
+class RecoveringContinuationProgressAdapter(DeferredLimitProgressAdapter):
+    """Fail one split send and track the final visible progress transcript."""
+
+    buffered_visible = threading.Event()
+    continuation_failed = threading.Event()
+    fourth_sent = threading.Event()
+    fifth_sent = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        type(self).buffered_visible.clear()
+        type(self).continuation_failed.clear()
+        type(self).fourth_sent.clear()
+        type(self).fifth_sent.clear()
+        self._failed_once = False
+        self.visible_messages = {}
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if "deferred-two" in content and not self._failed_once:
+            self._failed_once = True
+            type(self).continuation_failed.set()
+            return SendResult(success=False, error="forced continuation failure")
+
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if result.success and result.message_id:
+            self.visible_messages[result.message_id] = content
+        if "deferred-four" in content:
+            type(self).fourth_sent.set()
+        if "deferred-five" in content:
+            type(self).fifth_sent.set()
+        return result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        result = await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+        if result.success:
+            self.visible_messages[message_id] = content
+        if "deferred-three" in content and not finalize:
+            type(self).buffered_visible.set()
+        return result
+
+
 class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
     async def edit_message(
         self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
@@ -468,6 +574,93 @@ class FailedContinuationProgressAgent:
         time.sleep(2.1)
         cb("tool.started", "terminal", f"after-failure-{self._PAD}", {})
         assert FailingContinuationProgressAdapter.post_failure_sent.wait(timeout=4.0)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class BufferedSegmentProgressAgent:
+    """Queue an overflowing progress segment before sending commentary."""
+
+    _PAD = "x" * 70
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        assert self.interim_assistant_callback is not None
+        self.tool_progress_callback(
+            "tool.started", "terminal", f"segment-first-{self._PAD}", {}
+        )
+        assert DeferredSegmentProgressAdapter.first_sent.wait(timeout=2.0)
+        self.tool_progress_callback(
+            "tool.started", "terminal", f"segment-second-{self._PAD}", {}
+        )
+        self.tool_progress_callback(
+            "tool.started", "terminal", f"segment-third-{self._PAD}", {}
+        )
+        assert DeferredSegmentProgressAdapter.buffer_ready.wait(timeout=3.0)
+        self.interim_assistant_callback("Checkpoint reached.", already_streamed=False)
+        assert DeferredSegmentProgressAdapter.commentary_sent.wait(timeout=2.0)
+        assert DeferredSegmentProgressAdapter.segment_closed.wait(timeout=3.0)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class OversizedSingleProgressAgent:
+    """Emit one verbose progress item larger than a platform bubble."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        self.tool_progress_callback(
+            "tool.started",
+            "custom_tool",
+            None,
+            {"payload": "z" * 500},
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class RecoveringContinuationProgressAgent:
+    """Force a split failure while later buffered groups still need delivery."""
+
+    _PAD = "x" * 70
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", f"deferred-one-{self._PAD}", {})
+        assert RecoveringContinuationProgressAdapter.first_sent.wait(timeout=2.0)
+        cb("tool.started", "terminal", f"deferred-two-{self._PAD}", {})
+        cb("tool.started", "terminal", f"deferred-three-{self._PAD}", {})
+        assert RecoveringContinuationProgressAdapter.buffered_visible.wait(timeout=3.0)
+        RecoveringContinuationProgressAdapter.enforce_limit.set()
+        cb("tool.started", "terminal", f"deferred-four-{self._PAD}", {})
+        assert RecoveringContinuationProgressAdapter.continuation_failed.wait(timeout=3.0)
+        assert RecoveringContinuationProgressAdapter.fourth_sent.wait(timeout=3.0)
+        cb("tool.started", "terminal", f"deferred-five-{self._PAD}", {})
+        assert RecoveringContinuationProgressAdapter.fifth_sent.wait(timeout=3.0)
         return {
             "final_response": "done",
             "messages": [],
@@ -1201,6 +1394,90 @@ async def test_run_agent_disables_edits_after_rollover_continuation_send_failure
     assert adapter.failed_sends
     assert FailingContinuationProgressAdapter.post_failure_sent.is_set()
     assert adapter.edits_after_finalize == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_does_not_send_buffered_progress_below_commentary(
+    monkeypatch,
+    tmp_path,
+):
+    """A content segment boundary must discard progress that is not yet visible."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BufferedSegmentProgressAgent,
+        session_id="sess-buffered-progress-segment-boundary",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+                "tool_preview_length": 90,
+            }
+        },
+        adapter_cls=DeferredSegmentProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    commentary_index = adapter.delivery_order.index("commentary")
+    assert "progress" not in adapter.delivery_order[commentary_index + 1 :]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_splits_one_oversized_progress_line(monkeypatch, tmp_path):
+    """One verbose progress item must honor the adapter's per-message limit."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        OversizedSingleProgressAgent,
+        session_id="sess-progress-single-line-overflow",
+        config_data={
+            "display": {
+                "tool_progress": "verbose",
+                "interim_assistant_messages": False,
+                "tool_preview_length": 0,
+            }
+        },
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) >= 2
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+    assert sum(call["content"].count("z") for call in adapter.sent) == 500
+
+
+@pytest.mark.asyncio
+async def test_run_agent_preserves_progress_after_split_send_failure(
+    monkeypatch,
+    tmp_path,
+):
+    """A failed split send must not discard the later buffered groups."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RecoveringContinuationProgressAgent,
+        session_id="sess-progress-split-fallback",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+                "tool_preview_length": 90,
+            }
+        },
+        adapter_cls=RecoveringContinuationProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    visible_text = "\n".join(adapter.visible_messages.values())
+    for marker in (
+        "deferred-one",
+        "deferred-two",
+        "deferred-three",
+        "deferred-four",
+        "deferred-five",
+    ):
+        assert marker in visible_text
 
 
 @pytest.mark.asyncio
