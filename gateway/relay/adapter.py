@@ -424,6 +424,9 @@ class RelayAdapter(BasePlatformAdapter):
             user_name=str(user.get("username")) if isinstance(user, dict) and user.get("username") else None,
             scope_id=str(guild_id) if guild_id else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
+            # This event was reconstructed only after arriving on the
+            # authenticated Relay transport, just like ordinary wire events.
+            delivered_via_upstream_relay=True,
         )
         return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
 

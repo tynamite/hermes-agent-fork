@@ -909,12 +909,17 @@ def _relay_origin_signature(
     return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
+def _source_is_authenticated_relay_delivery(source: SessionSource) -> bool:
+    """Return whether authenticated Relay intake stamped this live source."""
+    return source.delivered_via_upstream_relay is True
+
+
 def relay_origin_proof_for_source(
     session_key: str,
     source: SessionSource,
 ) -> Optional[str]:
     """Create a persistence proof only for a live authenticated Relay source."""
-    if source.delivered_via_upstream_relay is not True:
+    if not _source_is_authenticated_relay_delivery(source):
         return None
     from gateway.relay import relay_connection_auth
 
@@ -926,7 +931,7 @@ def relay_origin_proof_for_source(
 
 def origin_transport_for_source(source: SessionSource) -> Optional[Platform]:
     """Return persistable routing provenance for an authenticated source."""
-    if source.delivered_via_upstream_relay is True:
+    if _source_is_authenticated_relay_delivery(source):
         return Platform.RELAY
     return None
 
@@ -937,7 +942,7 @@ def _refresh_transport_provenance(
     source: SessionSource,
 ) -> None:
     """Persist an ownership transition between Relay and direct adapters."""
-    source_is_relay = source.delivered_via_upstream_relay is True
+    source_is_relay = _source_is_authenticated_relay_delivery(source)
     entry_has_relay_provenance = (
         entry.origin_transport is Platform.RELAY
         or bool(entry.relay_origin_proof)
@@ -963,7 +968,12 @@ def trusted_origin_for_resume(entry: SessionEntry) -> Optional[SessionSource]:
     source = entry.origin
     if source is None:
         return None
-    if entry.origin_transport is not Platform.RELAY:
+    requires_relay_proof = (
+        entry.origin_transport is Platform.RELAY
+        or bool(entry.relay_origin_proof)
+        or source.platform is Platform.RELAY
+    )
+    if not requires_relay_proof:
         return source
 
     proof = entry.relay_origin_proof

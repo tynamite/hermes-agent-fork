@@ -1146,6 +1146,51 @@ def test_persisted_relay_origin_proof_rehydrates_and_detects_tampering(monkeypat
     assert trusted_origin_for_resume(restored) is None
 
 
+def test_platform_relay_origin_requires_signed_resume_provenance(
+    monkeypatch,
+    tmp_path,
+):
+    """A Relay-platform origin must never bypass restart proof validation."""
+    monkeypatch.setenv("GATEWAY_RELAY_ID", "gateway-1")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+    source = SessionSource(
+        platform=Platform.RELAY,
+        chat_id="interaction-chat",
+        chat_type="channel",
+        user_id="interaction-user",
+        delivered_via_upstream_relay=True,
+    )
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = store.get_or_create_session(source)
+
+    assert entry.origin_transport is Platform.RELAY
+    assert entry.relay_origin_proof
+
+    restored = SessionEntry.from_dict(entry.to_dict())
+    trusted_source = trusted_origin_for_resume(restored)
+    assert trusted_source is not None
+    assert trusted_source.platform is Platform.RELAY
+    assert trusted_source.delivered_via_upstream_relay is True
+
+    # A persistable platform value alone must neither mint authenticated
+    # provenance nor resume through Relay without a proof.
+    unsigned_source = SessionSource(
+        platform=Platform.RELAY,
+        chat_id="unsigned-interaction-chat",
+        chat_type="channel",
+        user_id="interaction-user",
+    )
+    unsigned_store = SessionStore(
+        sessions_dir=tmp_path / "unsigned",
+        config=GatewayConfig(),
+    )
+    unsigned_entry = unsigned_store.get_or_create_session(unsigned_source)
+    assert unsigned_entry.origin_transport is None
+    assert unsigned_entry.relay_origin_proof is None
+    unsigned_restored = SessionEntry.from_dict(unsigned_entry.to_dict())
+    assert trusted_origin_for_resume(unsigned_restored) is None
+
+
 @pytest.mark.asyncio
 async def test_direct_reuse_clears_relay_resume_provenance(monkeypatch, tmp_path):
     """A direct adapter reclaiming a session must also own restart resume."""
