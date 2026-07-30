@@ -32,7 +32,14 @@ export interface StopBackendChildrenDeps extends StopBackendChildDeps {
 export interface KillableChild {
   pid?: number | null
   killed?: boolean
+  exitCode?: number | null
+  signalCode?: string | null
   kill: (signal: string) => void
+}
+
+export interface ConfirmBackendExitDeps {
+  isProcessAlive: (pid: number) => boolean
+  sleep: (delayMs: number) => Promise<void>
 }
 
 /**
@@ -79,4 +86,35 @@ export async function stopBackendChildrenAndWait(
   await Promise.all(managed.map(child => deps.waitForExit(child)))
 
   return managed.length
+}
+
+/**
+ * Confirm that a force-killed backend is no longer live.
+ *
+ * A signal being accepted is not an exit boundary. Poll both the child state
+ * and the OS PID table for a short bounded grace, returning false when exit
+ * cannot be established so callers can fail closed before mutating files.
+ */
+export async function confirmBackendExit(
+  child: KillableChild,
+  deps: ConfirmBackendExitDeps,
+  { attempts = 20, intervalMs = 50 } = {}
+): Promise<boolean> {
+  const pid = child.pid
+
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    if (child.exitCode != null || child.signalCode != null) {
+      return true
+    }
+
+    if (Number.isInteger(pid) && !deps.isProcessAlive(pid as number)) {
+      return true
+    }
+
+    if (attempt < attempts) {
+      await deps.sleep(intervalMs)
+    }
+  }
+
+  return false
 }

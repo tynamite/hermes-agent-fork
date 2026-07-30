@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { stopBackendChild, stopBackendChildrenAndWait } from './backend-child'
+import { confirmBackendExit, stopBackendChild, stopBackendChildrenAndWait } from './backend-child'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
 test('hiddenWindowsChildOptions adds windowsHide:true on Windows when unset', () => {
@@ -151,4 +151,39 @@ test('stopBackendChildrenAndWait stops and awaits every distinct managed backend
   assert.deepEqual(first.calls, ['SIGTERM'])
   assert.deepEqual(second.calls, ['SIGTERM'])
   assert.deepEqual(waited.sort((a, b) => a - b), [101, 202])
+})
+
+test('confirmBackendExit waits for the OS process to disappear', async () => {
+  const { child } = makeChild({ pid: 303 })
+  const probes = [true, true, false]
+  let sleeps = 0
+
+  const confirmed = await confirmBackendExit(
+    child,
+    {
+      isProcessAlive: () => probes.shift() ?? false,
+      sleep: async () => {
+        sleeps += 1
+      }
+    },
+    { attempts: 3, intervalMs: 0 }
+  )
+
+  assert.equal(confirmed, true)
+  assert.equal(sleeps, 2)
+})
+
+test('confirmBackendExit fails closed when the backend remains live', async () => {
+  const { child } = makeChild({ pid: 404 })
+
+  const confirmed = await confirmBackendExit(
+    child,
+    {
+      isProcessAlive: () => true,
+      sleep: async () => {}
+    },
+    { attempts: 2, intervalMs: 0 }
+  )
+
+  assert.equal(confirmed, false)
 })

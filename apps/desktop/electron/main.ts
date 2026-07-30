@@ -32,7 +32,11 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { stopBackendChild as stopBackendChildImpl, stopBackendChildrenAndWait } from './backend-child'
+import {
+  confirmBackendExit,
+  stopBackendChild as stopBackendChildImpl,
+  stopBackendChildrenAndWait
+} from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
@@ -7941,26 +7945,48 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
     return
   }
 
-  await new Promise<void>(resolve => {
+  const exitedBeforeTimeout = await new Promise<boolean>(resolve => {
+    const onExit = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
     const timer = setTimeout(() => {
-      try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
-          forceKillProcessTree(child.pid)
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Already gone.
-      }
-
-      resolve()
+      child.off('exit', onExit)
+      resolve(false)
     }, timeoutMs)
 
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
+    child.once('exit', onExit)
   })
+
+  if (exitedBeforeTimeout) {
+    return
+  }
+
+  try {
+    if (IS_WINDOWS && Number.isInteger(child.pid)) {
+      forceKillProcessTree(child.pid)
+    } else {
+      child.kill('SIGKILL')
+    }
+  } catch {
+    // The liveness probe below decides whether "already gone" is true.
+  }
+
+  const confirmed = await confirmBackendExit(child, {
+    isProcessAlive: pid => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch (error: any) {
+        return error?.code !== 'ESRCH'
+      }
+    },
+    sleep: delayMs => new Promise(resolve => setTimeout(resolve, delayMs))
+  })
+
+  if (!confirmed) {
+    throw new Error(`Desktop backend PID ${child.pid ?? 'unknown'} remained live after forced update teardown`)
+  }
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
