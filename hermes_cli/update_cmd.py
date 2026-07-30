@@ -2603,10 +2603,16 @@ def _detect_venv_python_processes(
         venv_prefix = venv_root.rstrip(os.sep) + os.sep
     else:
         # Keep paths case-sensitive and do not resolve Python symlinks to their
-        # base interpreter. Both names are supported by Hermes development and
-        # service launchers; a live process from either can mix runtimes.
+        # base interpreter. Include both the logical and resolved project roots
+        # so installs reached through a symlink still match kernel-normalized
+        # process metadata.
+        project_roots = {
+            os.path.abspath(str(_m().PROJECT_ROOT)),
+            os.path.realpath(str(_m().PROJECT_ROOT)),
+        }
         posix_venv_prefixes = tuple(
-            os.path.abspath(str(_m().PROJECT_ROOT / name)).rstrip(os.sep) + os.sep
+            os.path.join(root, name).rstrip(os.sep) + os.sep
+            for root in project_roots
             for name in ("venv", ".venv")
         )
     root_prefix = ""
@@ -2665,7 +2671,7 @@ def _detect_venv_python_processes(
             ]
             if not any(
                 re.fullmatch(
-                    r"(?:python(?:w)?(?:\d+(?:\.\d+)*)?|pypy(?:\d+(?:\.\d+)*)?)(?:\.exe)?",
+                    r"(?:python(?:w)?(?:\d+(?:\.\d+)*)?t?|pypy(?:\d+(?:\.\d+)*)?)(?:\.exe)?",
                     marker,
                 )
                 for marker in process_markers
