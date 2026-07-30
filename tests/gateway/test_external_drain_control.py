@@ -12,6 +12,8 @@ Q-B, exercises a real `hermes gateway run`); these lock the unit contract.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -47,6 +49,50 @@ class TestMarkerContract:
         assert payload["principal"] == "nas"
         body = dc.read_drain_request()
         assert body is not None and body["principal"] == "nas"
+
+    def test_compare_delete_is_serialized_against_replacement(
+        self,
+        home,
+        monkeypatch,
+    ):
+        owned = dc.write_drain_request(
+            principal="hermes-update",
+            request_id="owned",
+            owner_pid=123,
+            owner_start_time=456,
+        )
+        marker = dc.drain_request_path()
+        unlink_started = threading.Event()
+        replacement_started = threading.Event()
+        original_unlink = Path.unlink
+
+        def delayed_unlink(path, *args, **kwargs):
+            if path == marker:
+                unlink_started.set()
+                assert replacement_started.wait(timeout=1)
+                time.sleep(0.05)
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", delayed_unlink)
+
+        clear_thread = threading.Thread(
+            target=lambda: dc.clear_drain_request_if_matches(owned)
+        )
+
+        def replace_marker():
+            replacement_started.set()
+            dc.write_drain_request(principal="operator")
+
+        writer_thread = threading.Thread(target=replace_marker)
+        clear_thread.start()
+        assert unlink_started.wait(timeout=1)
+        writer_thread.start()
+        clear_thread.join(timeout=2)
+        writer_thread.join(timeout=2)
+
+        assert not clear_thread.is_alive()
+        assert not writer_thread.is_alive()
+        assert dc.read_drain_request()["principal"] == "operator"
 
 
 class TestSuppressNotification:
@@ -210,4 +256,3 @@ class TestNewTurnGate:
         result = await runner._handle_message(event)
         assert result is not None
         assert "draining" in result.lower()
-

@@ -118,6 +118,10 @@ class WinPtyBridge:
         except Exception:
             return False
 
+    def verify_closed(self) -> bool:
+        """Strict child-exit probe used by fail-closed update shutdown."""
+        return not bool(self._proc.isalive())
+
     # -- I/O --------------------------------------------------------------
 
     def read(self, timeout: float = 0.2) -> Optional[bytes]:

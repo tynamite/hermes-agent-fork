@@ -46,6 +46,9 @@ class FakeBridge:
     def close(self):
         self.closed = True
 
+    def is_alive(self):
+        return not self.closed
+
 
 class FakeWS:
     def __init__(self):
@@ -90,6 +93,47 @@ async def test_eof_marks_dead_and_closes_socket_4410():
     assert s.alive is False
     assert ws.close_code == 4410
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_close_propagates_unreaped_child(monkeypatch):
+    import hermes_cli.pty_session as pty_session
+
+    monkeypatch.setattr(pty_session, "_PTY_CLOSE_VERIFY_TIMEOUT_S", 0.01)
+
+    class StuckBridge(FakeBridge):
+        def close(self):
+            self.closed = True
+
+        def is_alive(self):
+            return True
+
+    s = pty_session.PtySession(
+        "stuck",
+        StuckBridge([]),
+        buffer_cap=1024,
+        read_timeout=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="did not terminate"):
+        await s.close()
+
+
+@pytest.mark.asyncio
+async def test_close_all_retains_session_when_child_survives():
+    reg = make_registry()
+
+    class StuckSession:
+        async def close(self):
+            raise RuntimeError("still alive")
+
+    session = StuckSession()
+    reg._sessions["stuck"] = session
+
+    with pytest.raises(RuntimeError, match="still alive"):
+        await reg.close_all()
+
+    assert reg._sessions["stuck"] is session
 
 
 from hermes_cli.pty_session import PtySessionRegistry, RegistryFull

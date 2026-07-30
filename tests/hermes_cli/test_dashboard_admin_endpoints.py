@@ -7,6 +7,12 @@ contract and the CLI-config parity (servers/keys written via the API are
 visible to the CLI data layer), not specific catalog values.
 """
 
+import asyncio
+import contextlib
+import os
+import threading
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 
@@ -967,3 +973,397 @@ def test_spawn_hermes_action_scrubs_gateway_loop_guard_env(monkeypatch, tmp_path
 
     assert "_HERMES_GATEWAY" not in captured["env"]
     assert captured["env"]["HERMES_NONINTERACTIVE"] == "1"
+
+
+def test_spawn_update_identifies_dashboard_supervisor(monkeypatch, tmp_path):
+    """The detached updater may ignore the dashboard that intentionally
+    launched it, without suppressing detection of other venv processes."""
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(ws, "_ACTION_LOG_DIR", tmp_path)
+    captured = {}
+
+    class _FakeProc:
+        pid = 1234
+
+    def _fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _FakeProc()
+
+    monkeypatch.setattr(ws.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
+
+    ws._spawn_hermes_action(["update"], "hermes-update")
+
+    assert captured["env"]["_HERMES_UPDATE_SUPERVISOR_PID"] == str(os.getpid())
+    assert (
+        captured["env"]["_HERMES_UPDATE_SUPERVISOR_QUIESCED"]
+        == "dashboard"
+    )
+
+
+def test_spawn_update_requires_dashboard_quiesce(monkeypatch, tmp_path):
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(ws, "_ACTION_LOG_DIR", tmp_path)
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", False)
+    popen = MagicMock()
+    monkeypatch.setattr(ws.subprocess, "Popen", popen)
+
+    with pytest.raises(RuntimeError, match="before dashboard quiesce"):
+        ws._spawn_hermes_action(["update"], "hermes-update")
+
+    popen.assert_not_called()
+    assert not (tmp_path / ws._ACTION_LOG_FILES["hermes-update"]).exists()
+
+
+def test_dashboard_quiesce_allows_only_update_status(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    client, _header = _client()
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
+    ws._ACTION_PROCS.pop("hermes-update", None)
+
+    assert client.get("/api/config").status_code == 503
+    assert (
+        client.get("/api/actions/hermes-update/status").status_code
+        == 200
+    )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_waits_for_background_work_and_rejects_new():
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+    quiesce_task = None
+    try:
+        with ws._dashboard_background_work_scope() as admitted:
+            assert admitted is True
+            quiesce_task = asyncio.create_task(
+                ws._begin_dashboard_update_quiesce(timeout=0.5)
+            )
+            await asyncio.sleep(0.05)
+            assert quiesce_task.done() is False
+
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        assert ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND == 0
+        with ws._dashboard_background_work_scope() as admitted:
+            assert admitted is False
+    finally:
+        if quiesce_task is not None and not quiesce_task.done():
+            quiesce_task.cancel()
+        ws._end_dashboard_update_quiesce()
+        ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_waits_for_detached_worker():
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+    started = threading.Event()
+    release = threading.Event()
+    quiesce_task = None
+
+    def _worker():
+        started.set()
+        release.wait(timeout=1)
+
+    worker = ws._start_dashboard_background_thread(
+        target=_worker,
+        name="test-dashboard-worker",
+    )
+    assert worker is not None
+    assert started.wait(timeout=1)
+    try:
+        quiesce_task = asyncio.create_task(
+            ws._begin_dashboard_update_quiesce(timeout=0.5)
+        )
+        await asyncio.sleep(0.05)
+        assert quiesce_task.done() is False
+        release.set()
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND == 0
+    finally:
+        release.set()
+        worker.join(timeout=1)
+        if quiesce_task is not None and not quiesce_task.done():
+            quiesce_task.cancel()
+        ws._end_dashboard_update_quiesce()
+        ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+
+
+def test_dashboard_detached_worker_rejected_after_quiesce(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    ran = threading.Event()
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
+
+    worker = ws._start_dashboard_background_thread(target=ran.set)
+
+    assert worker is None
+    assert ran.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_waits_for_dispatched_cron_job(monkeypatch):
+    import cron.scheduler
+    import hermes_cli.web_server as ws
+
+    running = {"job-1"}
+    monkeypatch.setattr(
+        cron.scheduler,
+        "get_running_job_ids",
+        lambda: frozenset(running),
+    )
+    ws._end_dashboard_update_quiesce()
+    try:
+        quiesce_task = asyncio.create_task(
+            ws._begin_dashboard_update_quiesce(timeout=0.5)
+        )
+        await asyncio.sleep(0.05)
+        assert quiesce_task.done() is False
+        running.clear()
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+    finally:
+        ws._end_dashboard_update_quiesce()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_waits_for_detached_action(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    running = True
+
+    class _Proc:
+        def poll(self):
+            return None if running else 0
+
+    monkeypatch.setitem(ws._ACTION_PROCS, "doctor", _Proc())
+    ws._end_dashboard_update_quiesce()
+    try:
+        quiesce_task = asyncio.create_task(
+            ws._begin_dashboard_update_quiesce(timeout=0.5)
+        )
+        await asyncio.sleep(0.05)
+        assert quiesce_task.done() is False
+        running = False
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+    finally:
+        ws._end_dashboard_update_quiesce()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
+    import tui_gateway.server
+    import hermes_cli.web_server as ws
+
+    active = True
+    close_sessions = MagicMock()
+    close_ptys = AsyncMock()
+    monkeypatch.setattr(
+        tui_gateway.server,
+        "has_active_tui_work",
+        lambda: active,
+    )
+    monkeypatch.setattr(
+        tui_gateway.server,
+        "close_sessions_for_update",
+        close_sessions,
+    )
+    monkeypatch.setattr(ws.PTY_REGISTRY, "close_all", close_ptys)
+    ws._end_dashboard_update_quiesce()
+    try:
+        quiesce_task = asyncio.create_task(
+            ws._begin_dashboard_update_quiesce(timeout=0.5)
+        )
+        await asyncio.sleep(0.05)
+        assert quiesce_task.done() is False
+        active = False
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        close_ptys.assert_awaited_once_with()
+        close_sessions.assert_called_once_with()
+    finally:
+        ws._end_dashboard_update_quiesce()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_fails_closed_on_pty_shutdown(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        ws.PTY_REGISTRY,
+        "close_all",
+        AsyncMock(side_effect=RuntimeError("PTY did not stop")),
+    )
+    ws._end_dashboard_update_quiesce()
+
+    with pytest.raises(RuntimeError, match="PTY did not stop"):
+        await ws._begin_dashboard_update_quiesce(timeout=0.5)
+
+    assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is False
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_fails_closed_on_legacy_pty_shutdown(
+    monkeypatch,
+):
+    import hermes_cli.web_server as ws
+
+    bridge = object()
+    ws._LEGACY_PTY_BRIDGES.clear()
+    ws._LEGACY_PTY_BRIDGES.add(bridge)
+    monkeypatch.setattr(ws.PTY_REGISTRY, "close_all", AsyncMock())
+    monkeypatch.setattr(
+        ws,
+        "close_and_verify_bridge",
+        AsyncMock(side_effect=RuntimeError("legacy PTY did not stop")),
+    )
+    ws._end_dashboard_update_quiesce()
+    try:
+        with pytest.raises(RuntimeError, match="legacy PTY did not stop"):
+            await ws._begin_dashboard_update_quiesce(timeout=0.5)
+
+        assert bridge in ws._LEGACY_PTY_BRIDGES
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is False
+    finally:
+        ws._LEGACY_PTY_BRIDGES.clear()
+        ws._end_dashboard_update_quiesce()
+
+
+@pytest.mark.asyncio
+async def test_verified_legacy_pty_is_removed(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    bridge = object()
+    verify = AsyncMock()
+    ws._LEGACY_PTY_BRIDGES.clear()
+    ws._LEGACY_PTY_BRIDGES.add(bridge)
+    monkeypatch.setattr(ws, "close_and_verify_bridge", verify)
+    try:
+        await ws._close_legacy_ptys_for_update()
+
+        verify.assert_awaited_once_with(bridge)
+        assert bridge not in ws._LEGACY_PTY_BRIDGES
+    finally:
+        ws._LEGACY_PTY_BRIDGES.clear()
+
+
+def test_dashboard_rejects_duplicate_live_action(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    existing = MagicMock()
+    existing.poll.return_value = None
+    spawn = MagicMock()
+    monkeypatch.setitem(ws._ACTION_PROCS, "doctor", existing)
+    monkeypatch.setattr(ws, "_spawn_hermes_action_unlocked", spawn)
+
+    with pytest.raises(RuntimeError, match="already running"):
+        ws._spawn_hermes_action(["doctor"], "doctor")
+
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pty_reaper_pauses_during_update(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    calls = 0
+
+    async def _reap_idle():
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(ws.PTY_REGISTRY, "reap_idle", _reap_idle)
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
+    task = asyncio.create_task(ws._dashboard_pty_reaper_loop(interval=0.001))
+    try:
+        await asyncio.sleep(0.01)
+        assert calls == 0
+        ws._end_dashboard_update_quiesce()
+        await asyncio.sleep(0.01)
+        assert calls > 0
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        ws._end_dashboard_update_quiesce()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_closes_and_drains_websockets():
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    ws._DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS.clear()
+    closed = asyncio.Event()
+    registered = asyncio.Event()
+
+    class _FakeWebSocket:
+        async def close(self, **_kwargs):
+            closed.set()
+
+    async def _serve_websocket():
+        assert ws._register_dashboard_update_websocket(_FakeWebSocket())
+        registered.set()
+        await closed.wait()
+
+    websocket_task = asyncio.create_task(_serve_websocket())
+    await registered.wait()
+    try:
+        await ws._begin_dashboard_update_quiesce(timeout=0.5)
+        await websocket_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        assert ws._DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS == {}
+    finally:
+        ws._end_dashboard_update_quiesce()
+        if not websocket_task.done():
+            websocket_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_update_failure_keeps_active_quiesce(monkeypatch):
+    """A losing update request must not release the winner's admission gate."""
+    from fastapi import HTTPException
+
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    finished = threading.Event()
+
+    class _FakeProc:
+        pid = 1234
+
+        def wait(self):
+            finished.wait(timeout=1)
+            return 0
+
+    spawn = MagicMock(return_value=_FakeProc())
+    monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(ws, "detect_install_method", lambda _root: "source")
+    monkeypatch.setattr(ws, "_spawn_hermes_action", spawn)
+
+    try:
+        results = await asyncio.gather(
+            ws.update_hermes(),
+            ws.update_hermes(),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(result, dict) and result["ok"] for result in results) == 1
+        assert sum(isinstance(result, HTTPException) for result in results) == 1
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        spawn.assert_called_once_with(["update"], "hermes-update")
+    finally:
+        finished.set()
+        watchers = tuple(ws._DASHBOARD_UPDATE_WATCHERS)
+        if watchers:
+            await asyncio.gather(*watchers, return_exceptions=True)
+        ws._end_dashboard_update_quiesce()

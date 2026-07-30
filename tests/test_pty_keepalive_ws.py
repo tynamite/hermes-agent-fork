@@ -21,6 +21,9 @@ class FakeBridge:
     def close(self):
         self.alive = False
 
+    def is_alive(self):
+        return self.alive
+
 
 @pytest.fixture
 def pty_keepalive_harness(monkeypatch):
