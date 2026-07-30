@@ -92,6 +92,12 @@ def test_detect_venv_python_finds_posix_venv_launcher(_winp, tmp_path):
                     ["venv/bin/python", "-m", "worker"],
                     cwd=str(tmp_path),
                 ),
+                _proc(
+                    107,
+                    "/usr/bin/python3.14t",
+                    "python3.14t",
+                    [str(tmp_path / "venv" / "bin" / "python3.14t"), "worker.py"],
+                ),
             ]
         ),
         Process=lambda *a, **k: me,
@@ -101,7 +107,31 @@ def test_detect_venv_python_finds_posix_venv_launcher(_winp, tmp_path):
     ):
         matches = cli_main._detect_venv_python_processes()
 
-    assert [m[0] for m in matches] == [101, 103, 105]
+    assert [m[0] for m in matches] == [101, 103, 105, 107]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_matches_resolved_symlinked_project_root(
+    _winp, tmp_path
+):
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+    logical_root = tmp_path / "logical-root"
+    logical_root.symlink_to(real_root, target_is_directory=True)
+    venv_python = str(real_root / "venv" / "bin" / "python")
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [_proc(108, "/usr/bin/python3", "python3", [venv_python, "worker.py"])]
+        ),
+        Process=MagicMock(),
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", logical_root), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [match[0] for match in matches] == [108]
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
