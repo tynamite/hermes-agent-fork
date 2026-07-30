@@ -3075,7 +3075,11 @@ def _quiesce_posix_gateways_for_update(
             read_drain_request,
             write_drain_request_if_unchanged,
         )
-        from gateway.status import get_process_start_time, read_runtime_status
+        from gateway.status import (
+            _pid_exists,
+            get_process_start_time,
+            read_runtime_status,
+        )
         from hermes_cli.gateway import (
             _get_restart_drain_timeout,
             find_profile_gateway_processes,
@@ -3120,10 +3124,14 @@ def _quiesce_posix_gateways_for_update(
                     if owner_pid > 0
                     else None
                 )
-                owner_identity_is_live = bool(
-                    owner_start_time > 0
-                    and live_owner_start_time == owner_start_time
+                owner_pid_is_live = bool(
+                    owner_pid > 0 and _pid_exists(owner_pid)
                 )
+                owner_identity_is_live = owner_pid_is_live
+                if owner_start_time > 0 and live_owner_start_time is not None:
+                    owner_identity_is_live = (
+                        live_owner_start_time == owner_start_time
+                    )
                 owned_by_this_update = bool(
                     is_update_marker
                     and owner_pid == os.getpid()
@@ -3144,6 +3152,14 @@ def _quiesce_posix_gateways_for_update(
                         {"home": home, "marker": body}
                     )
                     break
+                if (
+                    is_update_marker
+                    and owner_identity_is_live
+                    and owner_pid != os.getpid()
+                ):
+                    raise RuntimeError(
+                        f"another updater owns the gateway drain for {home}"
+                    )
                 if is_active and not orphaned_update_marker:
                     break
                 request_id = uuid.uuid4().hex

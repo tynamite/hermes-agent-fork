@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+import pytest
+
 
 class _FakeProc:
     def __init__(self, lines=None, returncode=0):
@@ -115,5 +117,34 @@ def test_start_whatsapp_onboarding_existing_creds_returns_linked_account(monkeyp
     ws._whatsapp_onboarding_sessions.clear()
 
 
+def test_quiesce_rejected_whatsapp_onboarding_removes_pending_session(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    ws._whatsapp_onboarding_sessions.clear()
+    monkeypatch.setattr(ws, "_whatsapp_session_path", lambda: session_dir)
+    monkeypatch.setattr(ws.secrets, "token_urlsafe", lambda _size: "rejected")
+    monkeypatch.setattr(
+        ws,
+        "_start_dashboard_background_thread",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(ws.HTTPException) as exc_info:
+        asyncio.run(
+            ws.start_whatsapp_onboarding(
+                ws.WhatsAppOnboardingStart(
+                    mode="self-chat",
+                    allowed_users="",
+                )
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    assert "rejected" not in ws._whatsapp_onboarding_sessions
 
 

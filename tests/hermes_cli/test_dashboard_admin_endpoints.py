@@ -1195,6 +1195,32 @@ async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dashboard_quiesce_fails_closed_when_tui_liveness_probe_raises(
+    monkeypatch,
+):
+    import tui_gateway.server
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        tui_gateway.server,
+        "has_active_tui_work",
+        MagicMock(side_effect=RuntimeError("unreadable TUI state")),
+    )
+    close_ptys = AsyncMock()
+    monkeypatch.setattr(ws.PTY_REGISTRY, "close_all", close_ptys)
+    ws._end_dashboard_update_quiesce()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Could not verify embedded TUI liveness",
+    ):
+        await ws._begin_dashboard_update_quiesce(timeout=0.05)
+
+    close_ptys.assert_not_awaited()
+    assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is False
+
+
+@pytest.mark.asyncio
 async def test_dashboard_quiesce_fails_closed_on_pty_shutdown(monkeypatch):
     import hermes_cli.web_server as ws
 
@@ -1359,6 +1385,10 @@ async def test_concurrent_update_failure_keeps_active_quiesce(monkeypatch):
 
         assert sum(isinstance(result, dict) and result["ok"] for result in results) == 1
         assert sum(isinstance(result, HTTPException) for result in results) == 1
+        failure = next(
+            result for result in results if isinstance(result, HTTPException)
+        )
+        assert failure.status_code == 409
         assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
         spawn.assert_called_once_with(["update"], "hermes-update")
     finally:

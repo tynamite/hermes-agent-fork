@@ -343,15 +343,23 @@ def _live_updater_owns_marker(marker: dict[str, Any]) -> bool:
         owner_start_time = int(marker.get("owner_start_time", 0) or 0)
     except (TypeError, ValueError):
         return False
-    if owner_pid <= 0 or owner_start_time <= 0:
+    if owner_pid <= 0:
         return False
     try:
-        from gateway.status import get_process_start_time
+        from gateway.status import _pid_exists, get_process_start_time
 
         live_start_time = get_process_start_time(owner_pid)
     except Exception:
-        live_start_time = None
-    return live_start_time == owner_start_time
+        return False
+    if owner_start_time > 0 and live_start_time is not None:
+        return live_start_time == owner_start_time
+    # Some supported hosts cannot read process start time. Preserve the
+    # update-owned marker while its PID is still live; otherwise a concurrent
+    # dashboard/operator request can reopen admission during mutation.
+    try:
+        return bool(_pid_exists(owner_pid))
+    except Exception:
+        return False
 
 
 def _clear_drain_request_unlocked(*, home: Optional[Path] = None) -> bool:

@@ -94,6 +94,46 @@ class TestMarkerContract:
         assert not writer_thread.is_alive()
         assert dc.read_drain_request()["principal"] == "operator"
 
+    def test_live_updater_marker_uses_pid_fallback_without_start_time(
+        self,
+        monkeypatch,
+    ):
+        import gateway.status
+
+        marker = {
+            "principal": "hermes-update",
+            "owner_pid": 123,
+            "owner_start_time": None,
+        }
+        monkeypatch.setattr(
+            gateway.status,
+            "get_process_start_time",
+            lambda _pid: None,
+        )
+        monkeypatch.setattr(gateway.status, "_pid_exists", lambda pid: pid == 123)
+
+        assert dc._live_updater_owns_marker(marker) is True
+
+    def test_updater_marker_rejects_reused_pid_when_start_time_is_known(
+        self,
+        monkeypatch,
+    ):
+        import gateway.status
+
+        marker = {
+            "principal": "hermes-update",
+            "owner_pid": 123,
+            "owner_start_time": 456,
+        }
+        monkeypatch.setattr(
+            gateway.status,
+            "get_process_start_time",
+            lambda _pid: 789,
+        )
+        monkeypatch.setattr(gateway.status, "_pid_exists", lambda _pid: True)
+
+        assert dc._live_updater_owns_marker(marker) is False
+
 
 class TestSuppressNotification:
     """The generic suppress_notification flag on the drain marker.

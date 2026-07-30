@@ -386,7 +386,7 @@ def test_quiesce_posix_gateway_reclaims_reused_owner_pid(
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
-def test_quiesce_posix_gateway_preserves_live_foreign_updater(
+def test_quiesce_posix_gateway_rejects_live_foreign_updater(
     _winp, tmp_path
 ):
     from gateway.drain_control import (
@@ -424,9 +424,7 @@ def test_quiesce_posix_gateway_preserves_live_foreign_updater(
     ):
         token = cli_main._quiesce_posix_gateways_for_update({555})
 
-    assert token is not None
-    assert token["created_markers"] == []
-    cli_main._release_posix_gateway_quiesce(token)
+    assert token is None
     assert read_drain_request(home=profile_home) == original
 
 

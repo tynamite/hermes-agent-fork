@@ -633,6 +633,34 @@ def test_active_tui_work_includes_tui_maintenance(server):
     assert server.has_active_tui_work() is False
 
 
+def test_active_tui_work_tracks_and_quiesce_rejects_detached_workers(server):
+    started = threading.Event()
+    release = threading.Event()
+
+    worker = server._start_tracked_tui_worker(
+        target=lambda: (started.set(), release.wait(timeout=0.5)),
+        name="test-detached-tui-worker",
+    )
+    assert worker is not None
+    assert started.wait(timeout=0.5) is True
+    assert server.has_active_tui_work() is True
+
+    server.begin_update_quiesce()
+    try:
+        rejected = server._start_tracked_tui_worker(
+            target=lambda: None,
+            name="rejected-detached-tui-worker",
+        )
+        assert rejected is None
+    finally:
+        server.end_update_quiesce()
+        release.set()
+        worker.join(timeout=0.5)
+
+    assert worker.is_alive() is False
+    assert server.has_active_tui_work() is False
+
+
 def test_update_quiesce_replays_missed_ws_orphan_reap(server, monkeypatch):
     reaped = threading.Event()
     monkeypatch.setattr(
@@ -642,11 +670,13 @@ def test_update_quiesce_replays_missed_ws_orphan_reap(server, monkeypatch):
     )
 
     server.begin_update_quiesce()
-    server._run_ws_orphan_reap("detached")
-    assert reaped.is_set() is False
-    assert "detached" in server._deferred_ws_orphan_reaps
+    try:
+        server._run_ws_orphan_reap("detached")
+        assert reaped.is_set() is False
+        assert "detached" in server._deferred_ws_orphan_reaps
+    finally:
+        server.end_update_quiesce()
 
-    server.end_update_quiesce()
     assert reaped.wait(timeout=0.5) is True
     assert "detached" not in server._deferred_ws_orphan_reaps
 

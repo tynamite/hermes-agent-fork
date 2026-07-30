@@ -158,6 +158,7 @@ _starting_agent_builds: set[str] = set()
 _scheduled_auto_continues: dict[str, tuple[object, Any]] = {}
 _starting_auto_continues: set[str] = set()
 _deferred_ws_orphan_reaps: set[str] = set()
+_active_detached_tui_workers: set[threading.Thread] = set()
 _active_tui_maintenance = 0
 _tui_update_quiesced = False
 _prompt_lock = threading.Lock()
@@ -303,12 +304,54 @@ _pool = concurrent.futures.ThreadPoolExecutor(
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 
 
+def _start_tracked_tui_worker(
+    *,
+    target,
+    args: tuple = (),
+    daemon: bool = True,
+    name: str | None = None,
+) -> threading.Thread | None:
+    """Atomically admit and track one detached TUI worker.
+
+    Registration and thread start share the update-quiesce lock, so an update
+    cannot attest idle in the gap between admission and ``Thread.start()``.
+    New workers are rejected after quiescence begins; admitted workers remain
+    visible to :func:`has_active_tui_work` until their target returns.
+    """
+
+    def _run() -> None:
+        try:
+            target(*args)
+        finally:
+            with _update_quiesce_lock:
+                _active_detached_tui_workers.discard(
+                    threading.current_thread()
+                )
+
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            return None
+        worker = threading.Thread(
+            target=_run,
+            daemon=daemon,
+            name=name,
+        )
+        _active_detached_tui_workers.add(worker)
+        try:
+            worker.start()
+        except Exception:
+            _active_detached_tui_workers.discard(worker)
+            raise
+    return worker
+
+
 def has_active_tui_work() -> bool:
     """Whether an embedded TUI RPC or agent turn still owns live work."""
     with _update_quiesce_lock:
         if (
             _starting_agent_builds
             or _starting_auto_continues
+            or _active_detached_tui_workers
             or _active_tui_maintenance
         ):
             return True
@@ -2857,7 +2900,11 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
         except Exception:
             logger.debug("failed to persist session git metadata", exc_info=True)
 
-    threading.Thread(target=_run, name="git-meta", daemon=True).start()
+    _start_tracked_tui_worker(
+        target=_run,
+        name="git-meta",
+        daemon=True,
+    )
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
@@ -6220,11 +6267,11 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             info = _session_info(agent, session)
         # Emit outside the lock — write_json must not block under _sessions_lock.
         _emit("session.info", sid, info)
-    threading.Thread(
+    _start_tracked_tui_worker(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",
         daemon=True,
-    ).start()
+    )
 
 
 class _RuntimeFallbackResolution(NamedTuple):
@@ -10015,9 +10062,12 @@ def _run_prompt_submit(
                     spoken = raw
                     # Barge-aware: spoken interruptions must cut this
                     # fallback playback too, not just the streaming path.
-                    threading.Thread(
-                        target=_speak_text_with_barge, args=(spoken,), daemon=True
-                    ).start()
+                    _start_tracked_tui_worker(
+                        target=_speak_text_with_barge,
+                        args=(spoken,),
+                        daemon=True,
+                        name=f"voice-fallback-{sid}",
+                    )
                 except ImportError:
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
@@ -12710,9 +12760,16 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     text_queue: queue.Queue = queue.Queue()
     stop = threading.Event()
     done = threading.Event()
-    threading.Thread(
-        target=stream_tts_to_speaker, args=(text_queue, stop, done), daemon=True
-    ).start()
+    worker = _start_tracked_tui_worker(
+        target=stream_tts_to_speaker,
+        args=(text_queue, stop, done),
+        daemon=True,
+        name="voice-tts-stream",
+    )
+    if worker is None:
+        stop.set()
+        done.set()
+        return None
 
     global _tts_stream_state
     with _tts_stream_lock:
@@ -12784,9 +12841,14 @@ def _arm_full_duplex_listener() -> None:
         if _fd_listener_active:
             return
         _fd_listener_active = True
-    threading.Thread(
-        target=_full_duplex_listener, daemon=True, name="voice-full-duplex"
-    ).start()
+    worker = _start_tracked_tui_worker(
+        target=_full_duplex_listener,
+        daemon=True,
+        name="voice-full-duplex",
+    )
+    if worker is None:
+        with _fd_listener_lock:
+            _fd_listener_active = False
 
 
 def _fd_tts_pending() -> bool:
@@ -12965,7 +13027,16 @@ def _speak_text_with_barge(text: str) -> None:
             with _fd_listener_lock:
                 _fd_speak_pipelines.discard((stop, done))
 
-    threading.Thread(target=_speak, daemon=True).start()
+    worker = _start_tracked_tui_worker(
+        target=_speak,
+        daemon=True,
+        name="voice-tts-fallback",
+    )
+    if worker is None:
+        done.set()
+        with _fd_listener_lock:
+            _fd_speak_pipelines.discard((stop, done))
+        return
     if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
         _arm_full_duplex_listener()
 
@@ -13085,7 +13156,15 @@ def _wake_resume_if_owner(owner: "Transport", *, retry_seconds: float = 15.0,
             with _wake_resume_retry_lock:
                 _wake_resume_retry_active = False
 
-    threading.Thread(target=_retry, daemon=True, name="wake-resume-retry").start()
+    worker = _start_tracked_tui_worker(
+        target=_retry,
+        daemon=True,
+        name="wake-resume-retry",
+    )
+    if worker is None:
+        with _wake_resume_retry_lock:
+            _wake_resume_retry_active = False
+        return False
     return False
 
 
@@ -13611,9 +13690,14 @@ def _(rid, params: dict) -> dict:
         # documented 5026 instead of failing silently in the thread.
         import hermes_cli.voice  # noqa: F401
 
-        threading.Thread(
-            target=_speak_text_with_barge, args=(text,), daemon=True
-        ).start()
+        worker = _start_tracked_tui_worker(
+            target=_speak_text_with_barge,
+            args=(text,),
+            daemon=True,
+            name="voice-tts-rpc",
+        )
+        if worker is None:
+            return _err(rid, 5026, "Hermes update in progress")
         return _ok(rid, {"status": "speaking"})
     except ImportError:
         return _err(rid, 5026, "voice module not available")

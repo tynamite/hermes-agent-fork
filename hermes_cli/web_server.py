@@ -910,13 +910,19 @@ def _register_dashboard_update_websocket(ws: "WebSocket") -> bool:
     return True
 
 
+class _DashboardUpdateBusyError(RuntimeError):
+    """The dashboard is healthy but has not reached an idle update boundary."""
+
+
 async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
     """Establish an idle dashboard boundary before starting a POSIX update."""
     global _DASHBOARD_UPDATE_QUIESCE_ACTIVE
 
     with _DASHBOARD_UPDATE_QUIESCE_LOCK:
         if _DASHBOARD_UPDATE_QUIESCE_ACTIVE:
-            raise RuntimeError("Dashboard update quiesce is already active")
+            raise _DashboardUpdateBusyError(
+                "Dashboard update quiesce is already active"
+            )
         _DASHBOARD_UPDATE_QUIESCE_ACTIVE = True
         websocket_items = list(_DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS.items())
 
@@ -958,8 +964,11 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
             from tui_gateway.server import has_active_tui_work
 
             active_tui_work = has_active_tui_work()
-        except Exception:
-            active_tui_work = False
+        except Exception as exc:
+            _end_dashboard_update_quiesce()
+            raise RuntimeError(
+                "Could not verify embedded TUI liveness"
+            ) from exc
         if (
             active_http == 0
             and active_background == 0
@@ -981,7 +990,9 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
         await asyncio.sleep(0.01)
 
     _end_dashboard_update_quiesce()
-    raise RuntimeError("Dashboard did not reach the update quiesce boundary")
+    raise _DashboardUpdateBusyError(
+        "Dashboard did not reach the update quiesce boundary"
+    )
 
 
 def _end_dashboard_update_quiesce() -> None:
@@ -4360,14 +4371,26 @@ async def update_hermes():
             "update_command": message,
         }
 
-    quiesce_acquired = False
     try:
         await _begin_dashboard_update_quiesce()
-        quiesce_acquired = True
+    except _DashboardUpdateBusyError as exc:
+        _log.warning("Dashboard is busy; update was not started: %s", exc)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dashboard is busy; retry the update shortly: {exc}",
+        )
+    except Exception as exc:
+        _end_dashboard_update_quiesce()
+        _log.exception("Failed to establish dashboard update boundary")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to establish update boundary: {exc}",
+        )
+
+    try:
         proc = _spawn_hermes_action(["update"], "hermes-update")
     except Exception as exc:
-        if quiesce_acquired:
-            _end_dashboard_update_quiesce()
+        _end_dashboard_update_quiesce()
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
     watcher = asyncio.create_task(_watch_dashboard_update_quiesce(proc))
@@ -9026,8 +9049,7 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart):
     )
     if worker is None:
         with _whatsapp_onboarding_lock:
-            record.status = "error"
-            record.error = "Hermes update started before WhatsApp setup could begin."
+            _whatsapp_onboarding_sessions.pop(pairing_id, None)
         raise HTTPException(
             status_code=503,
             detail="Dashboard is quiesced while Hermes updates",
