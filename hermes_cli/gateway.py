@@ -1,7 +1,7 @@
 """
 Gateway subcommand for hermes CLI.
 
-Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
+Handles: hermes gateway [run|start|stop|restart|status|inject|install|uninstall|setup]
 """
 
 import asyncio
@@ -6779,6 +6779,63 @@ def _gateway_command_inner(args):
 
     if subcmd == "setup":
         gateway_setup()
+        return
+
+    if subcmd == "inject":
+        from gateway.session_ipc import (
+            SessionIPCRequestError,
+            gateway_session_socket_path,
+            inject_gateway_session,
+        )
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = get_active_profile_name() or "default"
+        ipc_home = None
+        default_home = None
+        if profile != "default":
+            # A default-profile multiplexer owns the only IPC socket while
+            # retaining the named profile in the request for exact routing.
+            default_home = get_default_hermes_root()
+            if (
+                not gateway_session_socket_path().exists()
+                and gateway_session_socket_path(default_home).exists()
+            ):
+                ipc_home = default_home
+        try:
+            try:
+                response = inject_gateway_session(
+                    profile=profile,
+                    session_key=args.session_key,
+                    expected_session_id=args.expected_session_id,
+                    idempotency_key=args.idempotency_key,
+                    message=args.message,
+                    hermes_home=ipc_home,
+                )
+            except SessionIPCRequestError as exc:
+                if (
+                    profile == "default"
+                    or ipc_home is not None
+                    or exc.code != "gateway_unavailable"
+                ):
+                    raise
+                # A crash-stale named-profile socket can exist but refuse the
+                # connection. That failure occurs before any bytes are sent,
+                # so the same idempotent request can safely retry against the
+                # default multiplexer socket.
+                response = inject_gateway_session(
+                    profile=profile,
+                    session_key=args.session_key,
+                    expected_session_id=args.expected_session_id,
+                    idempotency_key=args.idempotency_key,
+                    message=args.message,
+                    hermes_home=default_home,
+                )
+        except SessionIPCRequestError as exc:
+            response = exc.to_response()
+        print(json.dumps(response, sort_keys=True))
+        if not response.get("ok"):
+            raise SystemExit(1)
         return
 
     # Service management commands

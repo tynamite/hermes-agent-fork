@@ -86,6 +86,66 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_failed_native_turn_returns_accepted_ipc_steer(self):
+        class FailedSession:
+            def request_steer(self, text):
+                return True
+
+            def run_turn(self, user_input):
+                raise RuntimeError("native turn failed")
+
+            def close(self):
+                return None
+
+        agent = _make_codex_agent()
+        agent._codex_session = FailedSession()
+        agent._open_steer_admission()
+        assert agent.steer(
+            "/restart trusted recovery",
+            _gateway_session_ipc=True,
+        )
+
+        result = agent.run_conversation("start")
+
+        assert result["completed"] is False
+        assert result["pending_steer_chunks"] == [
+            {
+                "text": "/restart trusted recovery",
+                "gateway_session_ipc": True,
+            }
+        ]
+        assert agent._codex_native_pending_steer_chunks == []
+
+    def test_successful_native_turn_acknowledges_accepted_steer(
+        self,
+    ):
+        class SuccessfulSession:
+            def request_steer(self, text):
+                return True
+
+            def run_turn(self, user_input):
+                return TurnResult(
+                    final_text="done",
+                    projected_messages=[
+                        {"role": "assistant", "content": "done"}
+                    ],
+                    interrupted=False,
+                    error=None,
+                    turn_id="turn-success",
+                    thread_id="thread-success",
+                )
+
+        agent = _make_codex_agent()
+        agent._codex_session = SuccessfulSession()
+        agent._open_steer_admission()
+        assert agent.steer("continue with tests")
+
+        result = agent.run_conversation("start")
+
+        assert result["completed"] is True
+        assert "pending_steer_chunks" not in result
+        assert agent._codex_native_pending_steer_chunks == []
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

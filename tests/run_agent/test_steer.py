@@ -23,6 +23,10 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._pending_steer_chunks = []
+    agent._pending_steer_is_gateway_session_ipc = False
+    agent._codex_native_pending_steer_chunks = []
+    agent._steer_accepting = True
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
     agent._model_request_active = threading.Event()
@@ -60,6 +64,51 @@ class TestSteerDrain:
         agent = _bare_agent()
         agent.steer("hello")
         assert agent._drain_pending_steer() == "hello"
+        assert agent._pending_steer is None
+
+    def test_close_atomically_drains_and_rejects_late_steer(self):
+        agent = _bare_agent()
+        assert agent.steer("before close") is True
+
+        assert agent._close_steer_admission() == "before close"
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
+    def test_new_turn_reopens_admission(self):
+        agent = _bare_agent()
+        agent._close_steer_admission()
+
+        agent._open_steer_admission()
+
+        assert agent.steer("new turn") is True
+        assert agent._drain_pending_steer() == "new turn"
+
+    def test_close_preserves_gateway_session_ipc_provenance(self):
+        agent = _bare_agent()
+        assert agent.steer(
+            "/restart trusted task",
+            _gateway_session_ipc=True,
+        ) is True
+
+        text, trusted = agent._close_steer_admission_with_provenance()
+
+        assert text == "/restart trusted task"
+        assert trusted is True
+        assert agent._pending_steer is None
+        assert agent._pending_steer_is_gateway_session_ipc is False
+
+    def test_mixed_steers_retain_independent_provenance(self):
+        agent = _bare_agent()
+        assert agent.steer("/stop") is True
+        assert agent.steer(
+            "/restart trusted task",
+            _gateway_session_ipc=True,
+        ) is True
+
+        assert agent._close_steer_admission_with_chunks() == [
+            ("/stop", False),
+            ("/restart trusted task", True),
+        ]
         assert agent._pending_steer is None
 
 
@@ -177,6 +226,46 @@ class TestActiveTurnRedirect:
         agent.interrupt()
 
         assert calls == ["interrupt"]
+
+    def test_codex_app_server_steer_reaches_native_session(self):
+        agent = _bare_agent()
+        calls = []
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {
+                "request_steer": (
+                    lambda self, text: calls.append(text) or True
+                )
+            },
+        )()
+        agent._open_steer_admission()
+
+        assert agent.steer(
+            "/restart trusted task",
+            _gateway_session_ipc=True,
+        )
+        assert calls == ["/restart trusted task"]
+        assert agent._pending_steer is None
+        assert [
+            (text, trusted)
+            for _token, text, trusted in (
+                agent._codex_native_pending_steer_chunks
+            )
+        ] == [("/restart trusted task", True)]
+
+    def test_rejected_codex_native_steer_is_not_retained(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {"request_steer": lambda self, text: False},
+        )()
+
+        assert agent.steer("too late") is False
+        assert agent._codex_native_pending_steer_chunks == []
 
 
     def test_redirect_during_tool_execution_uses_safe_steer_boundary(self):
@@ -424,6 +513,29 @@ class TestSteerClearedOnInterrupt:
         agent.clear_interrupt()
         assert agent._pending_steer is None
         assert agent._pending_redirect is None
+
+    def test_clear_interrupt_retains_acknowledged_ipc_steers(self):
+        agent = _bare_agent()
+        agent._interrupt_requested = True
+        agent.steer("ordinary steer")
+        agent.steer(
+            "/restart acknowledged task",
+            _gateway_session_ipc=True,
+        )
+        native_token = object()
+        agent._codex_native_pending_steer_chunks = [
+            (object(), "ordinary native steer", False),
+            (native_token, "/status acknowledged task", True),
+        ]
+
+        agent.clear_interrupt()
+
+        assert agent._drain_pending_steer_chunks() == [
+            ("/restart acknowledged task", True),
+        ]
+        assert agent._codex_native_pending_steer_chunks == [
+            (native_token, "/status acknowledged task", True),
+        ]
 
 
 class TestPreApiCallSteerDrain:

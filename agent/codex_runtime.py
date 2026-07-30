@@ -615,6 +615,34 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+def _settle_codex_native_steers(
+    agent: Any,
+    result: Dict[str, Any],
+    *,
+    delivered: bool,
+) -> Dict[str, Any]:
+    """Acknowledge native steers or expose them for next-turn recovery."""
+    drain = getattr(agent, "_drain_codex_native_pending_steer_chunks", None)
+    if not callable(drain):
+        return result
+    chunks = drain()
+    if delivered or not chunks:
+        return result
+    result["pending_steer"] = "\n".join(
+        text for text, _trusted in chunks
+    )
+    result["pending_steer_chunks"] = [
+        {
+            "text": text,
+            "gateway_session_ipc": trusted,
+        }
+        for text, trusted in chunks
+    ]
+    if all(trusted for _text, trusted in chunks):
+        result["pending_steer_is_gateway_session_ipc"] = True
+    return result
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -715,7 +743,7 @@ def run_codex_app_server_turn(
         )
         if _user_interrupted:
             agent.clear_interrupt()
-        return {
+        result = {
             "final_response": (
                 f"Codex app-server turn failed: {exc}. "
                 f"Fall back to default runtime with `/codex-runtime auto`."
@@ -732,6 +760,11 @@ def run_codex_app_server_turn(
             ),
             "error": str(exc),
         }
+        return _settle_codex_native_steers(
+            agent,
+            result,
+            delivered=False,
+        )
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
@@ -859,7 +892,7 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
-    return {
+    result = {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
@@ -888,6 +921,14 @@ def run_codex_app_server_turn(
         "codex_turn_id": turn.turn_id,
         **usage_result,
     }
+    return _settle_codex_native_steers(
+        agent,
+        result,
+        delivered=bool(
+            not turn.interrupted
+            and turn.error is None
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

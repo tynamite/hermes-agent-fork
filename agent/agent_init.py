@@ -780,6 +780,24 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Keep provenance per accepted steer. A single bit for a newline-joined
+    # batch lets an ordinary slash command either declassify a trusted
+    # gateway-session IPC task or accidentally confer trust on it, depending
+    # solely on arrival order. ``_pending_steer`` and the legacy bit remain as
+    # compatibility mirrors for lightweight stubs and older callers.
+    agent._pending_steer_chunks: list[tuple[str, bool]] = []
+    agent._pending_steer_is_gateway_session_ipc = False
+    # Codex app-server consumes steers natively, outside Hermes' tool-result
+    # drain. Retain accepted requests until that native turn reports success so
+    # a caught runtime failure can hand them back to the gateway.
+    agent._codex_native_pending_steer_chunks: list[
+        tuple[object, str, bool]
+    ] = []
+    # Admission is opened by run_conversation() and atomically closed by the
+    # finalizer before its last drain.  A surface that races turn completion
+    # therefore gets False from steer() and can queue a real follow-up instead
+    # of accepting text that this turn can no longer consume.
+    agent._steer_accepting = False
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn

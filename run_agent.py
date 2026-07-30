@@ -3080,17 +3080,31 @@ class AIAgent:
                     _set_interrupt(False, _wtid)
                 except Exception:
                     pass
-        # A hard interrupt supersedes any pending /steer — the steer was
-        # meant for the agent's next tool-call iteration, which will no
-        # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
+        # A hard interrupt supersedes an ordinary user /steer — the steer was
+        # meant for the agent's next tool-call iteration, which will no longer
+        # happen. A trusted gateway-session IPC steer is different: its caller
+        # has already received ``disposition: steered``, so dropping it here
+        # would lose an acknowledged task. Retain trusted chunks for the failed
+        # turn recovery path (or the next turn) while discarding user steers.
         _steer_lock = getattr(self, "_pending_steer_lock", None)
         if _steer_lock is not None:
             with _steer_lock:
-                self._pending_steer = None
+                self._pending_steer_chunks = [
+                    (text, trusted)
+                    for text, trusted in self._pending_steer_chunks_locked()
+                    if trusted
+                ]
+                self._sync_pending_steer_compat_locked()
+                self._codex_native_pending_steer_chunks = [
+                    item
+                    for item in getattr(
+                        self, "_codex_native_pending_steer_chunks", []
+                    )
+                    if len(item) >= 3 and item[2]
+                ]
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, _gateway_session_ipc: bool = False) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3111,20 +3125,172 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            # Codex owns its internal tool loop. Its native turn/steer request
+            # is the only live-turn admission path; the Hermes pending-tool
+            # slot below is never drained by this runtime.
+            return self._request_codex_native_steer(
+                cleaned,
+                is_gateway_session_ipc=_gateway_session_ipc,
+            )
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if not getattr(self, "_steer_accepting", True):
+                return False
+            self._append_pending_steer_locked(
+                cleaned,
+                is_gateway_session_ipc=_gateway_session_ipc,
+            )
             return True
         with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
+            if not getattr(self, "_steer_accepting", True):
+                return False
+            self._append_pending_steer_locked(
+                cleaned,
+                is_gateway_session_ipc=_gateway_session_ipc,
+            )
         return True
+
+    def _pending_steer_chunks_locked(self) -> list[tuple[str, bool]]:
+        """Return the lossless pending-steer state while its lock is held."""
+        chunks = getattr(self, "_pending_steer_chunks", None)
+        if chunks is None:
+            text = getattr(self, "_pending_steer", None)
+            chunks = (
+                [
+                    (
+                        str(text),
+                        bool(
+                            getattr(
+                                self,
+                                "_pending_steer_is_gateway_session_ipc",
+                                False,
+                            )
+                        ),
+                    )
+                ]
+                if text
+                else []
+            )
+            self._pending_steer_chunks = chunks
+        return chunks
+
+    def _sync_pending_steer_compat_locked(self) -> None:
+        """Refresh the legacy aggregate fields from per-steer chunks."""
+        chunks = self._pending_steer_chunks_locked()
+        self._pending_steer = "\n".join(text for text, _trusted in chunks) or None
+        self._pending_steer_is_gateway_session_ipc = bool(
+            chunks and all(trusted for _text, trusted in chunks)
+        )
+
+    def _append_pending_steer_locked(
+        self,
+        text: str,
+        *,
+        is_gateway_session_ipc: bool,
+    ) -> None:
+        self._pending_steer_chunks_locked().append(
+            (text, bool(is_gateway_session_ipc))
+        )
+        self._sync_pending_steer_compat_locked()
+
+    def _request_codex_native_steer(
+        self,
+        text: str,
+        *,
+        is_gateway_session_ipc: bool,
+    ) -> bool:
+        """Send a native Codex steer and retain it until turn success.
+
+        Stage the entry before the cross-thread request. If the native turn
+        completes concurrently, its success drain sees and acknowledges the
+        staged entry. A rejected request removes only its own opaque token.
+        """
+        _codex_session = getattr(self, "_codex_session", None)
+        _native_steer = getattr(_codex_session, "request_steer", None)
+        if not callable(_native_steer):
+            return False
+        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        if _redirect_lock is not None:
+            with _redirect_lock:
+                if self._interrupt_requested:
+                    return False
+        elif self._interrupt_requested:
+            return False
+
+        token = object()
+        _steer_lock = getattr(self, "_pending_steer_lock", None)
+        if _steer_lock is None:
+            pending = getattr(
+                self, "_codex_native_pending_steer_chunks", None
+            )
+            if pending is None:
+                pending = []
+                self._codex_native_pending_steer_chunks = pending
+            pending.append((token, text, bool(is_gateway_session_ipc)))
+        else:
+            with _steer_lock:
+                pending = getattr(
+                    self, "_codex_native_pending_steer_chunks", None
+                )
+                if pending is None:
+                    pending = []
+                    self._codex_native_pending_steer_chunks = pending
+                pending.append(
+                    (token, text, bool(is_gateway_session_ipc))
+                )
+
+        try:
+            accepted = bool(_native_steer(text))
+        except Exception:
+            logger.debug("Codex app-server turn/steer failed", exc_info=True)
+            accepted = False
+        if not accepted:
+            self._discard_codex_native_pending_steer(token)
+        return accepted
+
+    def _discard_codex_native_pending_steer(self, token: object) -> None:
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._codex_native_pending_steer_chunks = [
+                item
+                for item in getattr(
+                    self, "_codex_native_pending_steer_chunks", []
+                )
+                if item[0] is not token
+            ]
+            return
+        with _lock:
+            self._codex_native_pending_steer_chunks = [
+                item
+                for item in getattr(
+                    self, "_codex_native_pending_steer_chunks", []
+                )
+                if item[0] is not token
+            ]
+
+    def _drain_codex_native_pending_steer_chunks(
+        self,
+    ) -> list[tuple[str, bool]]:
+        """Acknowledge or recover all native steers for the current turn."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            pending = list(
+                getattr(self, "_codex_native_pending_steer_chunks", [])
+            )
+            self._codex_native_pending_steer_chunks = []
+        else:
+            with _lock:
+                pending = list(
+                    getattr(
+                        self, "_codex_native_pending_steer_chunks", []
+                    )
+                )
+                self._codex_native_pending_steer_chunks = []
+        return [(text, trusted) for _token, text, trusted in pending]
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -3147,21 +3313,10 @@ class AIAgent:
         # Codex owns its internal reasoning/tool loop, so use its first-class
         # active-turn steering protocol rather than interrupting the subprocess.
         if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _native_steer = getattr(_codex_session, "request_steer", None)
-            if callable(_native_steer):
-                _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if self._interrupt_requested:
-                            return False
-                elif self._interrupt_requested:
-                    return False
-                try:
-                    return bool(_native_steer(cleaned))
-                except Exception:
-                    logger.debug("Codex app-server turn/steer failed", exc_info=True)
-                    return False
+            return self._request_codex_native_steer(
+                cleaned,
+                is_gateway_session_ipc=False,
+            )
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
@@ -3244,15 +3399,102 @@ class AIAgent:
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
         """
+        text, _is_gateway_session_ipc = self._drain_pending_steer_with_provenance()
+        return text
+
+    def _drain_pending_steer_with_provenance(self) -> tuple[Optional[str], bool]:
+        """Compatibility wrapper for callers that can represent one trust bit."""
+        chunks = self._drain_pending_steer_chunks()
+        text = "\n".join(chunk for chunk, _trusted in chunks) or None
+        return text, bool(chunks and all(trusted for _text, trusted in chunks))
+
+    def _drain_pending_steer_chunks(self) -> list[tuple[str, bool]]:
+        """Return and clear pending steers without collapsing provenance."""
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
-            text = getattr(self, "_pending_steer", None)
+            chunks = list(self._pending_steer_chunks_locked())
+            self._pending_steer_chunks = []
             self._pending_steer = None
-            return text
+            self._pending_steer_is_gateway_session_ipc = False
+            return chunks
         with _lock:
-            text = self._pending_steer
+            chunks = list(self._pending_steer_chunks_locked())
+            self._pending_steer_chunks = []
             self._pending_steer = None
+            self._pending_steer_is_gateway_session_ipc = False
+        return chunks
+
+    def _restore_pending_steer(
+        self,
+        text: str,
+        *,
+        is_gateway_session_ipc: bool = False,
+    ) -> None:
+        """Put a temporarily drained steer back without losing provenance."""
+        self._restore_pending_steer_chunks(
+            [(text, bool(is_gateway_session_ipc))]
+        )
+
+    def _restore_pending_steer_chunks(
+        self,
+        chunks: list[tuple[str, bool]],
+    ) -> None:
+        """Restore an ordered steer batch without merging trust domains."""
+        if not chunks:
+            return
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._pending_steer_chunks_locked().extend(chunks)
+            self._sync_pending_steer_compat_locked()
+            return
+        with _lock:
+            self._pending_steer_chunks_locked().extend(chunks)
+            self._sync_pending_steer_compat_locked()
+
+    def _open_steer_admission(self) -> None:
+        """Allow steer() calls for the current conversation turn."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = True
+            return
+        with _lock:
+            self._steer_accepting = True
+
+    def _close_steer_admission(self) -> Optional[str]:
+        """Atomically reject future steers and drain the final pending text.
+
+        The close and drain share steer()'s lock.  Once this returns, a
+        concurrent surface cannot report a steer as accepted unless it was
+        included in the returned text.
+        """
+        text, _is_gateway_session_ipc = (
+            self._close_steer_admission_with_provenance()
+        )
         return text
+
+    def _close_steer_admission_with_provenance(self) -> tuple[Optional[str], bool]:
+        """Compatibility wrapper for callers that can represent one trust bit."""
+        chunks = self._close_steer_admission_with_chunks()
+        text = "\n".join(chunk for chunk, _trusted in chunks) or None
+        return text, bool(chunks and all(trusted for _text, trusted in chunks))
+
+    def _close_steer_admission_with_chunks(self) -> list[tuple[str, bool]]:
+        """Atomically close admission and retain each steer's provenance."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = False
+            chunks = list(self._pending_steer_chunks_locked())
+            self._pending_steer_chunks = []
+            self._pending_steer = None
+            self._pending_steer_is_gateway_session_ipc = False
+            return chunks
+        with _lock:
+            self._steer_accepting = False
+            chunks = list(self._pending_steer_chunks_locked())
+            self._pending_steer_chunks = []
+            self._pending_steer = None
+            self._pending_steer_is_gateway_session_ipc = False
+        return chunks
 
     def _record_file_mutation_result(
         self,

@@ -2126,6 +2126,8 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
+        if is_gateway_session_ipc_task(self):
+            return False
         return (self.text or "").lstrip().startswith("/")
     
     def get_command(self) -> Optional[str]:
@@ -2196,6 +2198,33 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
                 return
     except Exception:
         return
+
+
+_GATEWAY_SESSION_IPC_CAPABILITY = object()
+
+
+class _GatewaySessionIPCEvent(MessageEvent):
+    """Private event subtype constructible only with the in-process capability."""
+
+    def __init__(self, capability: object, **kwargs: Any) -> None:
+        if capability is not _GATEWAY_SESSION_IPC_CAPABILITY:
+            raise TypeError("trusted gateway session IPC events require server capability")
+        super().__init__(**kwargs)
+
+
+def _new_gateway_session_ipc_event(**kwargs: Any) -> MessageEvent:
+    """Create a server-owned IPC event; not part of the adapter/plugin API."""
+    return _GatewaySessionIPCEvent(_GATEWAY_SESSION_IPC_CAPABILITY, **kwargs)
+
+
+def is_gateway_session_ipc_task(event: "MessageEvent") -> bool:
+    """Return whether *event* carries the process-private IPC event type.
+
+    This prevents trust forgery through platform payloads or copied metadata. Loaded
+    Python code already executes inside the trusted gateway process and is outside
+    this owner-local IPC threat boundary.
+    """
+    return isinstance(event, _GatewaySessionIPCEvent)
 
 
 @dataclass
@@ -5386,6 +5415,30 @@ class BasePlatformAdapter(ABC):
             task.add_done_callback(self._expected_cancelled_tasks.discard)
         return True
 
+    def accept_internal_task(self, event: MessageEvent, session_key: str) -> bool:
+        """Synchronously claim or FIFO-queue a validated non-command IPC task."""
+        if not is_gateway_session_ipc_task(event):
+            return False
+        metadata = event.metadata or {}
+        if metadata.get("gateway_session_key") != session_key:
+            return False
+
+        # Match ordinary inbound dispatch: a completed owner task can leave a
+        # stale active-session guard behind.  Heal it before choosing the busy
+        # queue, otherwise accepted IPC work has no live task to drain it.
+        self._heal_stale_session_lock(session_key)
+        if session_key in self._active_sessions:
+            runner = getattr(self, "gateway_runner", None)
+            enqueue_internal = getattr(runner, "_enqueue_internal_fifo_event", None)
+            if callable(enqueue_internal):
+                return bool(enqueue_internal(session_key, event, self))
+            if session_key in self._pending_messages:
+                return False
+            self._pending_messages[session_key] = event
+            return True
+
+        return self._start_session_processing(event, session_key)
+
     async def cancel_session_processing(
         self,
         session_key: str,
@@ -5543,7 +5596,9 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
-        coerce_plaintext_gateway_command(event)
+        trusted_ipc_task = is_gateway_session_ipc_task(event)
+        if not trusted_ipc_task:
+            coerce_plaintext_gateway_command(event)
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
         # (Telegram DM topic mode) so the session key, guard checks, and
@@ -5556,6 +5611,14 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+        if trusted_ipc_task:
+            # IPC task text is model input, never command/control input.  Keep
+            # all slash/admin/approval/clarify handlers below unreachable.
+            if (event.metadata or {}).get("gateway_session_key") != session_key:
+                return
+            self.accept_internal_task(event, session_key)
+            return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or

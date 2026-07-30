@@ -327,6 +327,9 @@ class TestSegmentedDispatchIntegration:
         def fake_handle(name, args, task_id, **kwargs):
             return json.dumps({"ok": True})
 
+        # This direct dispatcher test bypasses run_conversation(), which opens
+        # steer admission for a live turn in production.
+        agent._open_steer_admission()
         agent.steer("focus on the tests")
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")
