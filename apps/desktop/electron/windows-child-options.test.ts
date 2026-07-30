@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { stopBackendChild } from './backend-child'
+import { stopBackendChild, stopBackendChildrenAndWait } from './backend-child'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
 test('hiddenWindowsChildOptions adds windowsHide:true on Windows when unset', () => {
@@ -129,4 +129,26 @@ test('stopBackendChild swallows errors thrown by the kill strategy', () => {
       isWindows: false
     })
   })
+})
+
+test('stopBackendChildrenAndWait stops and awaits every distinct managed backend', async () => {
+  const first = makeChild({ pid: 101 })
+  const second = makeChild({ pid: 202 })
+  const waited: number[] = []
+
+  const count = await stopBackendChildrenAndWait(
+    [first.child, second.child, first.child, null, undefined],
+    {
+      forceKillProcessTree: () => {},
+      isWindows: false,
+      waitForExit: async child => {
+        waited.push(child.pid as number)
+      }
+    }
+  )
+
+  assert.equal(count, 2)
+  assert.deepEqual(first.calls, ['SIGTERM'])
+  assert.deepEqual(second.calls, ['SIGTERM'])
+  assert.deepEqual(waited.sort((a, b) => a - b), [101, 202])
 })

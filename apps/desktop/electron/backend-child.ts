@@ -24,6 +24,11 @@ export interface StopBackendChildDeps {
   forceKillProcessTree: (pid: number) => void
 }
 
+export interface StopBackendChildrenDeps extends StopBackendChildDeps {
+  /** Resolve only after the child has exited or the bounded exit policy ran. */
+  waitForExit: (child: KillableChild) => Promise<unknown>
+}
+
 export interface KillableChild {
   pid?: number | null
   killed?: boolean
@@ -52,4 +57,26 @@ export function stopBackendChild(child: KillableChild | null | undefined, deps: 
   } catch {
     // Already gone.
   }
+}
+
+/**
+ * Stop every distinct desktop-managed backend and await its bounded exit path.
+ *
+ * Update callers must close the whole primary + profile-pool set before
+ * mutating the shared Python environment. Deduplication matters during
+ * connection handoffs, where two registries can briefly reference one child.
+ */
+export async function stopBackendChildrenAndWait(
+  children: Array<KillableChild | null | undefined>,
+  deps: StopBackendChildrenDeps
+): Promise<number> {
+  const managed = [...new Set(children.filter((child): child is KillableChild => Boolean(child)))]
+
+  for (const child of managed) {
+    stopBackendChild(child, deps)
+  }
+
+  await Promise.all(managed.map(child => deps.waitForExit(child)))
+
+  return managed.length
 }

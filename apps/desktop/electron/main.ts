@@ -32,7 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { stopBackendChild as stopBackendChildImpl } from './backend-child'
+import { stopBackendChild as stopBackendChildImpl, stopBackendChildrenAndWait } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
@@ -2833,6 +2833,34 @@ async function releaseBackendLock(updateRoot, tag) {
   return { unlocked: false }
 }
 
+async function quiesceDesktopBackendsForPosixUpdate() {
+  const primary = backendConnectionState.getProcess()
+  const pooled = [...backendPool.values()].map(entry => entry.process)
+
+  // updateInFlight closes the backend-start gate before this function runs.
+  // Invalidate every registry first so renderer reconnects cannot rediscover
+  // an old child while shutdown is in progress.
+  backendStartFailure = null
+  remoteReauthFailure = null
+  remoteLiveness.clear()
+  backendConnectionState.invalidate()
+  backendPool.clear()
+
+  softRehomeInProgress = true
+
+  try {
+    const count = await stopBackendChildrenAndWait([primary, ...pooled], {
+      forceKillProcessTree,
+      isWindows: false,
+      waitForExit: child => waitForBackendExit(child)
+    })
+
+    rememberLog(`[updates] quiesced ${count} desktop-managed backend(s) before POSIX update`)
+  } finally {
+    softRehomeInProgress = false
+  }
+}
+
 // applyUpdates — hand off to the installer's --update flow, then exit.
 //
 // The desktop is a pure consumer: it does NOT git pull / pip install / rebuild
@@ -2849,19 +2877,26 @@ async function applyUpdates(opts = {}) {
   }
 
   updateInFlight = true
+  let restartPosixBackends = false
 
   try {
     const updater = resolveUpdaterBinary()
 
     if (!updater && !IS_WINDOWS) {
-      // macOS/Linux: never hand off, staged hermes-setup or not — the resolver
-      // returns null there by policy. Unlike Windows (where a venv-shim file
-      // lock forces the quit→hand-off→rebuild dance), there's no mandatory file
-      // locking here, so the desktop can drive the whole update itself:
-      // `hermes update` (backend) + `hermes desktop --build-only` (OS-aware GUI
-      // rebuild), then swap the running .app bundle with the freshly built one
-      // and relaunch.
-      return await applyUpdatesPosixInApp(opts)
+      // macOS/Linux drag-install: no staged Tauri hermes-setup. Unlike Windows
+      // (where a venv-shim file lock forces the quit→hand-off→rebuild dance),
+      // there's no mandatory file locking here, so the desktop can drive the
+      // whole update itself: `hermes update` (backend) + `hermes desktop
+      // --build-only` (OS-aware GUI rebuild), then swap the running .app bundle
+      // with the freshly built one and relaunch.
+      restartPosixBackends = true
+      const result = await applyUpdatesPosixInApp(opts)
+
+      if (result?.handedOff) {
+        restartPosixBackends = false
+      }
+
+      return result
     }
 
     if (!updater) {
@@ -3017,6 +3052,12 @@ async function applyUpdates(opts = {}) {
     return { ok: true, handedOff: true, updater }
   } finally {
     updateInFlight = false
+
+    if (restartPosixBackends) {
+      void startHermes().catch(error => {
+        rememberLog(`[updates] failed to restart desktop backend after POSIX update: ${error?.message || error}`)
+      })
+    }
   }
 }
 
@@ -3260,6 +3301,13 @@ async function applyUpdatesPosixInApp(opts: any) {
   // ── Pre-flight state.db integrity guard (#68474) ──
   preflightStateDb(HERMES_HOME, rememberLog)
 
+  // POSIX permits replacing files mapped by a live process, but that process
+  // then runs a mixed old/new Python environment. Stop and await every backend
+  // this desktop owns before invoking the shared updater. Detached descendants
+  // are intentionally not exempted: the updater's holder guard will fail
+  // closed if any survive this bounded teardown.
+  await quiesceDesktopBackendsForPosixUpdate()
+
   // Put the Hermes-managed Node and the venv on PATH so `hermes desktop`'s
   // npm build can find them on a machine with no system Node. Windows portable
   // Node lives directly under %LOCALAPPDATA%\\hermes\\node, not node\\bin.
@@ -3271,34 +3319,6 @@ async function applyUpdatesPosixInApp(opts: any) {
     HERMES_HOME,
     PYTHONUNBUFFERED: '1',
     PATH: pathWithHermesManagedNode(path.join(updateRoot, 'venv', 'bin'))
-  }
-
-  // `hermes update` reaps stale `hermes serve` backends (a code update
-  // leaves the running process serving old Python against the freshly-updated
-  // JS bundle). But OUR backend is one of those processes, and killing it
-  // mid-update produces the boot→kill→crash loop in #37532 — the desktop
-  // already restarts its own backend via the rebuild+relaunch below, so the
-  // reap must spare it. Hand the live backend's PID to the update process;
-  // _kill_stale_dashboard_processes reads HERMES_DESKTOP_CHILD_PID and excludes
-  // it while still reaping any genuinely-orphaned backends. (#37532)
-  // Exclude every desktop-managed backend (primary + all pool profiles) from
-  // the update reaper. _kill_stale_dashboard_processes accepts a comma-separated
-  // list (a single int still parses for back-compat).
-  const desktopChildPids = []
-  const hermesProcess = backendConnectionState.getProcess()
-
-  if (hermesProcess && Number.isInteger(hermesProcess.pid)) {
-    desktopChildPids.push(hermesProcess.pid)
-  }
-
-  for (const entry of backendPool.values()) {
-    if (entry.process && Number.isInteger(entry.process.pid)) {
-      desktopChildPids.push(entry.process.pid)
-    }
-  }
-
-  if (desktopChildPids.length) {
-    env.HERMES_DESKTOP_CHILD_PID = desktopChildPids.join(',')
   }
 
   // Branch-pin so a non-main checkout doesn't get switched to main (and self-heal
