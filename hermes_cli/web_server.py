@@ -161,11 +161,21 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     real gateway on the same HERMES_HOME — whichever process grabs the lock
     first wins the tick.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    if isinstance(provider, InProcessCronScheduler):
+        provider.start(
+            stop_event,
+            interval=interval,
+            dispatch_scope=_dashboard_background_work_scope,
+        )
+    else:
+        # External providers register their work outside this process; only
+        # the built-in provider can launch an agent inside the dashboard
+        # process while its installation is being updated.
+        provider.start(stop_event, interval=interval)
 
 
 def _warm_gateway_module() -> None:
@@ -219,7 +229,7 @@ async def _lifespan(app: "FastAPI"):
         cron_thread.start()
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
-    pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
+    pty_reaper_task = asyncio.create_task(_dashboard_pty_reaper_loop())
 
     # Periodic authenticated self-test (feeds the ``dashboard`` component on
     # /api/status).  The loop exits immediately when httpx is unavailable.
@@ -737,6 +747,264 @@ async def _dashboard_health_middleware(request: Request, call_next):
     return response
 
 
+# A dashboard-launched POSIX updater must not rewrite its own imported files
+# while this supervisor is still serving unrelated work.  Keep only the
+# update-status poll alive, reject new work, and wait for admitted HTTP and
+# WebSocket requests to leave before the child is spawned.
+_DASHBOARD_UPDATE_QUIESCE_LOCK = threading.Lock()
+_DASHBOARD_UPDATE_QUIESCE_ACTIVE = False
+_DASHBOARD_UPDATE_ACTIVE_HTTP = 0
+_DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+_DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS: Dict[asyncio.Task, Any] = {}
+_DASHBOARD_UPDATE_WATCHERS: set[asyncio.Task] = set()
+_DASHBOARD_UPDATE_STATUS_PATH = "/api/actions/hermes-update/status"
+
+
+def _try_begin_dashboard_background_work() -> bool:
+    """Reserve one background-work slot unless update quiesce has begun."""
+    global _DASHBOARD_UPDATE_ACTIVE_BACKGROUND
+
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        if _DASHBOARD_UPDATE_QUIESCE_ACTIVE:
+            return False
+        _DASHBOARD_UPDATE_ACTIVE_BACKGROUND += 1
+    return True
+
+
+def _finish_dashboard_background_work() -> None:
+    global _DASHBOARD_UPDATE_ACTIVE_BACKGROUND
+
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        _DASHBOARD_UPDATE_ACTIVE_BACKGROUND = max(
+            _DASHBOARD_UPDATE_ACTIVE_BACKGROUND - 1,
+            0,
+        )
+
+
+@contextmanager
+def _dashboard_background_work_scope():
+    """Admit one background operation and track it through completion."""
+    admitted = _try_begin_dashboard_background_work()
+    try:
+        yield admitted
+    finally:
+        if admitted:
+            _finish_dashboard_background_work()
+
+
+def _start_dashboard_background_thread(
+    *,
+    target,
+    args: tuple = (),
+    kwargs: Optional[dict] = None,
+    daemon: bool = True,
+    name: Optional[str] = None,
+) -> Optional[threading.Thread]:
+    """Start and track a detached dashboard worker.
+
+    Admission is reserved in the calling thread before ``Thread.start()``, so
+    update quiesce cannot slip between an endpoint returning and its worker
+    becoming visible to the boundary.
+    """
+    if not _try_begin_dashboard_background_work():
+        return None
+
+    def _run() -> None:
+        try:
+            target(*args, **(kwargs or {}))
+        finally:
+            _finish_dashboard_background_work()
+
+    worker = threading.Thread(target=_run, daemon=daemon, name=name)
+    try:
+        worker.start()
+    except Exception:
+        _finish_dashboard_background_work()
+        raise
+    return worker
+
+
+def _run_dashboard_background_call(target, *args, **kwargs):
+    """Run executor work inside the same update-quiesce admission boundary."""
+    with _dashboard_background_work_scope() as admitted:
+        if not admitted:
+            raise RuntimeError("Dashboard is quiesced while Hermes updates")
+        return target(*args, **kwargs)
+
+
+def _dashboard_action_is_running(name: str, proc: Any) -> bool:
+    """Return whether one tracked detached action still owns live work."""
+    if name == "hermes-update":
+        return False
+    return _tracked_process_is_running(proc)
+
+
+def _tracked_process_is_running(proc: Any) -> bool:
+    """Best-effort liveness for a process registered by the dashboard."""
+    poll = getattr(proc, "poll", None)
+    if not callable(poll):
+        # Production entries are subprocess.Popen instances. Some embedders
+        # and unit stubs expose only wait()/pid; they cannot provide a
+        # trustworthy liveness snapshot, so the other admission counters own
+        # their boundary.
+        return False
+    try:
+        return poll() is None
+    except Exception:
+        # Fail safe toward refusing an update if a real process cannot report
+        # whether it has exited.
+        return True
+
+
+@app.middleware("http")
+async def _dashboard_update_quiesce_middleware(request: Request, call_next):
+    """Reject dashboard work outside the update-status route while quiesced."""
+    global _DASHBOARD_UPDATE_ACTIVE_HTTP
+
+    path = request.url.path
+    is_status_poll = (
+        request.method == "GET" and path == _DASHBOARD_UPDATE_STATUS_PATH
+    )
+    is_update_start = request.method == "POST" and path == "/api/hermes/update"
+    counted = False
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        if _DASHBOARD_UPDATE_QUIESCE_ACTIVE and not is_status_poll:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Dashboard is quiesced while Hermes updates"},
+            )
+        if not is_status_poll and not is_update_start:
+            _DASHBOARD_UPDATE_ACTIVE_HTTP += 1
+            counted = True
+    try:
+        return await call_next(request)
+    finally:
+        if counted:
+            with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+                _DASHBOARD_UPDATE_ACTIVE_HTTP = max(
+                    _DASHBOARD_UPDATE_ACTIVE_HTTP - 1,
+                    0,
+                )
+
+
+def _register_dashboard_update_websocket(ws: "WebSocket") -> bool:
+    """Track one accepted WebSocket so update quiesce can close and await it."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        # Authentication helpers also have synchronous unit-level callers.
+        # Production WebSocket routes always run inside an asyncio task.
+        return not _DASHBOARD_UPDATE_QUIESCE_ACTIVE
+    if task is None:
+        return not _DASHBOARD_UPDATE_QUIESCE_ACTIVE
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        if _DASHBOARD_UPDATE_QUIESCE_ACTIVE:
+            return False
+        _DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS[task] = ws
+
+    def _discard(completed: asyncio.Task) -> None:
+        with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+            _DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS.pop(completed, None)
+
+    task.add_done_callback(_discard)
+    return True
+
+
+async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
+    """Establish an idle dashboard boundary before starting a POSIX update."""
+    global _DASHBOARD_UPDATE_QUIESCE_ACTIVE
+
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        if _DASHBOARD_UPDATE_QUIESCE_ACTIVE:
+            raise RuntimeError("Dashboard update quiesce is already active")
+        _DASHBOARD_UPDATE_QUIESCE_ACTIVE = True
+        websocket_items = list(_DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS.items())
+
+    try:
+        from tui_gateway.server import begin_update_quiesce
+
+        begin_update_quiesce()
+    except Exception:
+        _end_dashboard_update_quiesce()
+        raise
+
+    for _task, ws in websocket_items:
+        with contextlib.suppress(Exception):
+            await ws.close(code=1012, reason="Hermes update in progress")
+
+    deadline = time.monotonic() + max(float(timeout), 0.1)
+    current = asyncio.current_task()
+    while time.monotonic() < deadline:
+        with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+            active_http = _DASHBOARD_UPDATE_ACTIVE_HTTP
+            active_background = _DASHBOARD_UPDATE_ACTIVE_BACKGROUND
+            active_ws = [
+                task
+                for task in _DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS
+                if task is not current and not task.done()
+            ]
+        try:
+            from cron.scheduler import get_running_job_ids
+
+            active_cron_jobs = get_running_job_ids()
+        except Exception:
+            active_cron_jobs = frozenset()
+        active_actions = [
+            name
+            for name, proc in tuple(_ACTION_PROCS.items())
+            if _dashboard_action_is_running(name, proc)
+        ]
+        try:
+            from tui_gateway.server import has_active_tui_work
+
+            active_tui_work = has_active_tui_work()
+        except Exception:
+            active_tui_work = False
+        if (
+            active_http == 0
+            and active_background == 0
+            and not active_ws
+            and not active_cron_jobs
+            and not active_actions
+            and not active_tui_work
+        ):
+            try:
+                await PTY_REGISTRY.close_all()
+                await _close_legacy_ptys_for_update()
+                from tui_gateway.server import close_sessions_for_update
+
+                close_sessions_for_update()
+            except Exception:
+                _end_dashboard_update_quiesce()
+                raise
+            return
+        await asyncio.sleep(0.01)
+
+    _end_dashboard_update_quiesce()
+    raise RuntimeError("Dashboard did not reach the update quiesce boundary")
+
+
+def _end_dashboard_update_quiesce() -> None:
+    """Re-open dashboard admission after the updater exits or fails to start."""
+    global _DASHBOARD_UPDATE_QUIESCE_ACTIVE
+
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        was_active = _DASHBOARD_UPDATE_QUIESCE_ACTIVE
+        _DASHBOARD_UPDATE_QUIESCE_ACTIVE = False
+    if was_active:
+        with contextlib.suppress(Exception):
+            from tui_gateway.server import end_update_quiesce
+
+            end_update_quiesce()
+
+
+async def _watch_dashboard_update_quiesce(proc: subprocess.Popen) -> None:
+    try:
+        await asyncio.to_thread(proc.wait)
+    finally:
+        _end_dashboard_update_quiesce()
+
+
 # ---------------------------------------------------------------------------
 # Authenticated-route self-test: every minute, make one in-process request
 # against a cheap DB-touching authenticated route with the real session
@@ -783,7 +1051,9 @@ async def _dashboard_selftest_loop() -> None:
         # the probe would false-alarm 401 — skip until the gate is off.
         if getattr(app.state, "auth_required", False):
             continue
-        await _dashboard_selftest_once()
+        with _dashboard_background_work_scope() as admitted:
+            if admitted:
+                await _dashboard_selftest_once()
 
 
 # ---------------------------------------------------------------------------
@@ -3660,6 +3930,7 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 # report liveness and exit code without shelling out to ``ps``.
 _ACTION_PROCS: Dict[str, subprocess.Popen] = {}
 _ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
+_ACTION_SPAWN_LOCK = threading.Lock()
 
 # ``name`` → completed synthetic action result for actions the server handled
 # without spawning a subprocess (for example, unsupported Docker updates).
@@ -3697,11 +3968,29 @@ def _dashboard_spawn_executable() -> str:
 
 
 def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
+    """Spawn one uniquely named detached action."""
+    with _ACTION_SPAWN_LOCK:
+        existing = _ACTION_PROCS.get(name)
+        if existing is not None and _tracked_process_is_running(existing):
+            raise RuntimeError(f"Dashboard action {name!r} is already running")
+        return _spawn_hermes_action_unlocked(subcommand, name)
+
+
+def _spawn_hermes_action_unlocked(
+    subcommand: List[str],
+    name: str,
+) -> subprocess.Popen:
     """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
 
     Uses the running interpreter's ``hermes_cli.main`` module so the action
     inherits the same venv/PYTHONPATH the web server is using.
     """
+    if (
+        subcommand[:1] == ["update"]
+        and not _DASHBOARD_UPDATE_QUIESCE_ACTIVE
+    ):
+        raise RuntimeError("Refusing to spawn updater before dashboard quiesce")
+
     log_file_name = _ACTION_LOG_FILES[name]
     _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = _ACTION_LOG_DIR / log_file_name
@@ -3719,6 +4008,13 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     # drops it (gateway/run.py); mirror that here (#52470).
     action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
     action_env.pop("_HERMES_GATEWAY", None)
+    if subcommand[:1] == ["update"]:
+        # The dashboard intentionally remains alive while its detached updater
+        # starts. Identify that one supervisor and attest that this process has
+        # closed its other admission paths before the venv-holder guard
+        # excludes it.
+        action_env["_HERMES_UPDATE_SUPERVISOR_PID"] = str(os.getpid())
+        action_env["_HERMES_UPDATE_SUPERVISOR_QUIESCED"] = "dashboard"
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
@@ -3940,9 +4236,9 @@ async def gateway_drain(request: Request):
     ``POST /api/gateway/restart`` force path, which supersedes a drain.
     """
     from gateway.drain_control import (
-        clear_drain_request,
+        cancel_drain_request,
         drain_requested,
-        write_drain_request,
+        write_operator_drain_request,
     )
 
     try:
@@ -3957,9 +4253,30 @@ async def gateway_drain(request: Request):
     principal = getattr(principal_obj, "principal", None) or "dashboard"
 
     if action == "cancel":
-        existed = clear_drain_request()
-        _log.info("Gateway drain CANCEL requested by %s (existed=%s)", principal, existed)
-        return {"ok": True, "action": "cancel", "was_draining": existed}
+        outcome = cancel_drain_request()
+        if outcome == "protected":
+            _log.warning(
+                "Gateway drain CANCEL refused for %s: live update owns marker",
+                principal,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Gateway drain is owned by a live Hermes update and "
+                    "cannot be cancelled until that update finishes"
+                ),
+            )
+        existed = outcome == "cleared"
+        _log.info(
+            "Gateway drain CANCEL requested by %s (existed=%s)",
+            principal,
+            existed,
+        )
+        return {
+            "ok": True,
+            "action": "cancel",
+            "was_draining": existed,
+        }
 
     if action != "drain":
         raise HTTPException(
@@ -3967,10 +4284,22 @@ async def gateway_drain(request: Request):
             detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'",
         )
 
-    payload = write_drain_request(
+    outcome, payload = write_operator_drain_request(
         principal=str(principal),
         suppress_notification=bool((body or {}).get("suppress_notification", False)),
     )
+    if outcome == "protected":
+        _log.warning(
+            "Gateway drain BEGIN refused for %s: live update owns marker",
+            principal,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Gateway drain is owned by a live Hermes update and "
+                "cannot be replaced until that update finishes"
+            ),
+        )
     _log.info(
         "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
         principal,
@@ -4031,11 +4360,19 @@ async def update_hermes():
             "update_command": message,
         }
 
+    quiesce_acquired = False
     try:
+        await _begin_dashboard_update_quiesce()
+        quiesce_acquired = True
         proc = _spawn_hermes_action(["update"], "hermes-update")
     except Exception as exc:
+        if quiesce_acquired:
+            _end_dashboard_update_quiesce()
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
+    watcher = asyncio.create_task(_watch_dashboard_update_quiesce(proc))
+    _DASHBOARD_UPDATE_WATCHERS.add(watcher)
+    watcher.add_done_callback(_DASHBOARD_UPDATE_WATCHERS.discard)
     return {
         "ok": True,
         "pid": proc.pid,
@@ -4511,6 +4848,9 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
+    if not _register_dashboard_update_websocket(ws):
+        await ws.close(code=1012, reason="Hermes update in progress")
+        return
     await ws.accept()
 
     # Profile via query param, like /api/pty and /api/console: the provider
@@ -4532,7 +4872,10 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         return streamer, cap
 
     try:
-        streamer, cap = await loop.run_in_executor(None, _resolve)
+        streamer, cap = await loop.run_in_executor(
+            None,
+            functools.partial(_run_dashboard_background_call, _resolve),
+        )
     except Exception:
         _log.exception("speak-stream provider resolution failed")
         streamer, cap = None, 0
@@ -4601,7 +4944,15 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         finally:
             loop.call_soon_threadsafe(chunks.put_nowait, None)
 
-    threading.Thread(target=_produce, daemon=True).start()
+    producer = _start_dashboard_background_thread(
+        target=_produce,
+        daemon=True,
+        name="dashboard-speak-stream",
+    )
+    if producer is None:
+        with contextlib.suppress(Exception):
+            await ws.close(code=1012, reason="Hermes update in progress")
+        return
 
     async def _pump_client():
         # Text frames feed synthesis; done ends the text; stop/disconnect
@@ -8667,11 +9018,20 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart):
         _supersede_whatsapp_onboarding_sessions(session_path)
         _whatsapp_onboarding_sessions[pairing_id] = record
 
-    threading.Thread(
+    worker = _start_dashboard_background_thread(
         target=_run_whatsapp_pairing,
         args=(pairing_id, session_path, mode),
         daemon=True,
-    ).start()
+        name=f"whatsapp-pair-{pairing_id[:6]}",
+    )
+    if worker is None:
+        with _whatsapp_onboarding_lock:
+            record.status = "error"
+            record.error = "Hermes update started before WhatsApp setup could begin."
+        raise HTTPException(
+            status_code=503,
+            detail="Dashboard is quiesced while Hermes updates",
+        )
 
     return _whatsapp_onboarding_payload(pairing_id, record)
 
@@ -10199,9 +10559,19 @@ async def _start_device_code_flow(
         sess["portal_base_url"] = portal_base_url
         sess["client_id"] = client_id
         sess["scope"] = effective_scope
-        threading.Thread(
-            target=_nous_poller, args=(sid,), daemon=True, name=f"oauth-poll-{sid[:6]}"
-        ).start()
+        worker = _start_dashboard_background_thread(
+            target=_nous_poller,
+            args=(sid,),
+            daemon=True,
+            name=f"oauth-poll-{sid[:6]}",
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10219,10 +10589,19 @@ async def _start_device_code_flow(
         # so we run the full helper in a worker and proxy the user_code +
         # verification_url back via the session dict. The helper prints
         # to stdout — we capture nothing here, just status.
-        threading.Thread(
-            target=_codex_full_login_worker, args=(sid,), daemon=True,
+        worker = _start_dashboard_background_thread(
+            target=_codex_full_login_worker,
+            args=(sid,),
+            daemon=True,
             name=f"oauth-codex-{sid[:6]}",
-        ).start()
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         # Block briefly until the worker has populated the user_code, OR error.
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -10307,12 +10686,19 @@ async def _start_device_code_flow(
             expires_at_ts = time.time() + expired_in_raw
             expires_in_seconds = expired_in_raw
         sess["expires_at"] = expires_at_ts
-        threading.Thread(
+        worker = _start_dashboard_background_thread(
             target=_minimax_poller,
             args=(sid,),
             daemon=True,
             name=f"oauth-poll-{sid[:6]}",
-        ).start()
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10340,12 +10726,19 @@ async def _start_device_code_flow(
         sess["device_code"] = str(device_data["device_code"])
         sess["interval"] = int(device_data["interval"])
         sess["expires_at"] = time.time() + int(device_data["expires_in"])
-        threading.Thread(
+        worker = _start_dashboard_background_thread(
             target=_xai_device_poller,
             args=(sid,),
             daemon=True,
             name=f"oauth-poll-{sid[:6]}",
-        ).start()
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -11059,10 +11452,12 @@ async def _auto_archive_ticker_loop(
 
     await asyncio.sleep(initial_delay_s)
     while True:
-        try:
-            await asyncio.to_thread(_sweep)
-        except Exception as exc:
-            _log.debug("auto-archive tick skipped: %s", exc)
+        with _dashboard_background_work_scope() as admitted:
+            if admitted:
+                try:
+                    await asyncio.to_thread(_sweep)
+                except Exception as exc:
+                    _log.debug("auto-archive tick skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
 
@@ -14167,7 +14562,11 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
+from hermes_cli.pty_session import (  # noqa: E402
+    PtySessionRegistry,
+    RegistryFull,
+    close_and_verify_bridge,
+)
 
 PTY_REGISTRY = PtySessionRegistry(
     ttl=30 * 60,
@@ -14175,6 +14574,39 @@ PTY_REGISTRY = PtySessionRegistry(
     buffer_cap=1 * 1024 * 1024,
     read_timeout=_PTY_READ_CHUNK_TIMEOUT,
 )
+_LEGACY_PTY_BRIDGES: set[object] = set()
+
+
+async def _close_legacy_pty(bridge) -> None:
+    """Verify one legacy PTY and retain failures for the update boundary.
+
+    The bridge proves its leader and dedicated PTY group exited. Any
+    Hermes-owned Python helper that deliberately called ``setsid()`` remains
+    outside the dashboard-supervisor exclusion and is caught by the updater's
+    managed-venv holder guard; external detached applications are neither
+    tracked nor signalled here.
+    """
+    await close_and_verify_bridge(bridge)
+    _LEGACY_PTY_BRIDGES.discard(bridge)
+
+
+async def _close_legacy_ptys_for_update() -> None:
+    """Close every legacy PTY, failing closed if any tree survives."""
+    for bridge in list(_LEGACY_PTY_BRIDGES):
+        await _close_legacy_pty(bridge)
+
+
+async def _dashboard_pty_reaper_loop(interval: float = 60.0) -> None:
+    """Reap idle PTYs without crossing a dashboard update boundary."""
+    while True:
+        await asyncio.sleep(interval)
+        with _dashboard_background_work_scope() as admitted:
+            if not admitted:
+                continue
+            try:
+                await PTY_REGISTRY.reap_idle()
+            except Exception:
+                pass
 
 
 async def _legacy_pump(ws: "WebSocket", bridge) -> None:
@@ -14219,7 +14651,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
             # can be skipped, leaking the PTY. Closing from the EOF path makes
             # the reap independent of that cancellation race (#54028).
             try:
-                await asyncio.to_thread(bridge.close)
+                await _close_legacy_pty(bridge)
             except Exception:
                 pass
             try:
@@ -14260,7 +14692,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
             await reader_task
         except (asyncio.CancelledError, Exception):
             pass
-        await asyncio.to_thread(bridge.close)
+        await _close_legacy_pty(bridge)
 
 
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -15065,6 +15497,9 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if not _register_dashboard_update_websocket(ws):
+        await ws.close(code=1012, reason="Hermes update in progress")
+        return
     await ws.accept()
 
     profile = _console_profile_from_ws(ws)
@@ -15131,6 +15566,7 @@ async def console_ws(ws: WebSocket) -> None:
                 loop.run_in_executor(
                     _get_console_executor(),
                     functools.partial(
+                        _run_dashboard_background_call,
                         _execute_console_line,
                         engine,
                         line,
@@ -15421,6 +15857,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if not _register_dashboard_update_websocket(ws):
+        await ws.close(code=1012, reason="Hermes update in progress")
+        return
     await ws.accept()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
@@ -15503,6 +15942,7 @@ async def pty_ws(ws: WebSocket) -> None:
             await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
             await ws.close(code=1011)
             return
+        _LEGACY_PTY_BRIDGES.add(bridge)
         await _legacy_pump(ws, bridge)
         return
 
@@ -15585,6 +16025,10 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    if not _register_dashboard_update_websocket(ws):
+        await ws.close(code=1012, reason="Hermes update in progress")
+        return
+
     from tui_gateway.ws import handle_ws
 
     await handle_ws(ws)
@@ -15621,6 +16065,9 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4400)
         return
 
+    if not _register_dashboard_update_websocket(ws):
+        await ws.close(code=1012, reason="Hermes update in progress")
+        return
     await ws.accept()
 
     try:
@@ -15649,6 +16096,9 @@ async def events_ws(ws: WebSocket) -> None:
         await ws.close(code=4400)
         return
 
+    if not _register_dashboard_update_websocket(ws):
+        await ws.close(code=1012, reason="Hermes update in progress")
+        return
     await ws.accept()
 
     event_channels, event_lock = _get_event_state(ws.app)
@@ -17018,7 +17468,11 @@ def _maybe_open_browser(
         except Exception:
             pass
 
-    threading.Thread(target=_open, daemon=True).start()
+    _start_dashboard_background_thread(
+        target=_open,
+        daemon=True,
+        name="dashboard-open-browser",
+    )
 
 
 def start_server(

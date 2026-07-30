@@ -37,6 +37,9 @@ class _OneFrameBridge:
     def close(self):
         self.closed = True
 
+    def is_alive(self):
+        return not self.closed
+
 
 @pytest.fixture
 def pty_client(monkeypatch, _isolate_hermes_home):

@@ -310,6 +310,71 @@ class TestWebServerEndpoints:
         resp = self.client.post("/api/gateway/drain", json={"action": "explode"})
         assert resp.status_code == 400
 
+    def test_gateway_drain_cancel_refuses_live_updater(self):
+        import os
+
+        from gateway.drain_control import (
+            drain_request_path,
+            write_drain_request,
+        )
+        from gateway.status import get_process_start_time
+
+        write_drain_request(
+            principal="hermes-update",
+            request_id="active-update",
+            owner_pid=os.getpid(),
+            owner_start_time=get_process_start_time(os.getpid()),
+        )
+
+        resp = self.client.post(
+            "/api/gateway/drain",
+            json={"action": "cancel"},
+        )
+
+        assert resp.status_code == 409
+        assert drain_request_path().exists()
+
+    def test_gateway_drain_begin_preserves_live_updater(self):
+        import os
+
+        from gateway.drain_control import (
+            read_drain_request,
+            write_drain_request,
+        )
+        from gateway.status import get_process_start_time
+
+        original = write_drain_request(
+            principal="hermes-update",
+            request_id="active-update",
+            owner_pid=os.getpid(),
+            owner_start_time=get_process_start_time(os.getpid()),
+        )
+
+        resp = self.client.post(
+            "/api/gateway/drain",
+            json={"action": "drain"},
+        )
+
+        assert resp.status_code == 409
+        assert read_drain_request() == original
+
+    def test_gateway_drain_cancel_clears_operator_marker(self):
+        from gateway.drain_control import (
+            drain_request_path,
+            write_drain_request,
+        )
+
+        write_drain_request(principal="operator")
+
+        resp = self.client.post(
+            "/api/gateway/drain",
+            json={"action": "cancel"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["was_draining"] is True
+        assert not drain_request_path().exists()
+
 
 
 
@@ -3516,5 +3581,3 @@ class TestDashboardComponentHealth:
         assert self.ws.DASHBOARD_HEALTH.selftest_status == "failing"
         assert self.ws.DASHBOARD_HEALTH.selftest_http_status == 500
         assert self.ws.DASHBOARD_HEALTH.snapshot()["status"] == "degraded"
-
-

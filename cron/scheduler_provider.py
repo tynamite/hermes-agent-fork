@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Any
 
 
@@ -182,6 +183,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        dispatch_scope=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -209,6 +211,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                dispatch_scope=dispatch_scope,
             )
             return
 
@@ -225,16 +228,20 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    cron_tick(
-                        verbose=False,
-                        adapters=adapters,
-                        loop=loop,
-                        sync=False,
-                        can_dispatch=can_dispatch,
-                    )
+                scope = dispatch_scope() if dispatch_scope else nullcontext(True)
+                with scope as admitted:
+                    if not admitted:
+                        logger.debug("Cron dispatch paused while dashboard updates")
+                    elif can_dispatch is not None and not can_dispatch():
+                        logger.debug("Cron dispatch paused while gateway drains existing work")
+                    else:
+                        cron_tick(
+                            verbose=False,
+                            adapters=adapters,
+                            loop=loop,
+                            sync=False,
+                            can_dispatch=can_dispatch,
+                        )
                 ok = True
             except BaseException as e:
                 # Catch BaseException (not just Exception) so a SystemExit from
@@ -269,6 +276,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        dispatch_scope=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -315,23 +323,27 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    for entry in profile_homes:
-                        home = entry[1] if isinstance(entry, tuple) else entry
-                        home_token = set_hermes_home_override(str(home))
-                        try:
-                            with use_cron_store(home):
-                                cron_tick(
-                                    verbose=False,
-                                    adapters=adapters,
-                                    loop=loop,
-                                    sync=False,
-                                    can_dispatch=can_dispatch,
-                                )
-                        finally:
-                            reset_hermes_home_override(home_token)
+                scope = dispatch_scope() if dispatch_scope else nullcontext(True)
+                with scope as admitted:
+                    if not admitted:
+                        logger.debug("Cron dispatch paused while dashboard updates")
+                    elif can_dispatch is not None and not can_dispatch():
+                        logger.debug("Cron dispatch paused while gateway drains existing work")
+                    else:
+                        for entry in profile_homes:
+                            home = entry[1] if isinstance(entry, tuple) else entry
+                            home_token = set_hermes_home_override(str(home))
+                            try:
+                                with use_cron_store(home):
+                                    cron_tick(
+                                        verbose=False,
+                                        adapters=adapters,
+                                        loop=loop,
+                                        sync=False,
+                                        can_dispatch=can_dispatch,
+                                    )
+                            finally:
+                                reset_hermes_home_override(home_token)
                 ok = True
             except BaseException as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)

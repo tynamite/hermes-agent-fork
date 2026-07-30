@@ -101,6 +101,16 @@ class PtyBridge:
         self._proc = proc
         self._fd: int = proc.fd
         self._closed = False
+        try:
+            pgid = os.getpgid(proc.pid)  # windows-footgun: ok — POSIX-only module
+            # Never use group signalling unless ptyprocess gave the child a
+            # dedicated group.  Killing our own group would terminate the
+            # dashboard and unrelated siblings.
+            self._pgid: Optional[int] = (
+                pgid if pgid != os.getpgrp() else None
+            )
+        except Exception:
+            self._pgid = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -172,6 +182,24 @@ class PtyBridge:
             return bool(self._proc.isalive())
         except Exception:
             return False
+
+    def verify_closed(self) -> bool:
+        """Strict PTY-leader/group probe used by fail-closed update shutdown."""
+        return not bool(self._proc.isalive()) and not self._process_group_alive()
+
+    def _process_group_alive(self) -> bool:
+        """Return whether any process remains in the PTY's dedicated group."""
+        pgid = self._pgid
+        if pgid is None:
+            return False
+        try:
+            os.killpg(pgid, 0)  # windows-footgun: ok — POSIX-only module
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # The group exists even if the current user cannot signal it.
+            return True
 
     # -- I/O --------------------------------------------------------------
 
@@ -257,17 +285,17 @@ class PtyBridge:
             return
         self._closed = True
 
-        try:
-            pgid = os.getpgid(self._proc.pid)  # windows-footgun: ok — POSIX-only module (imports fcntl/termios/ptyprocess at top)
-        except Exception:
-            pgid = None
+        pgid = self._pgid
 
         # SIGHUP is the conventional "your terminal went away" signal.
-        # Send it to the whole foreground process group, not just the PTY
-        # leader: the dashboard TUI starts helper children such as the Python
-        # slash worker, and killing only the leader can strand those helpers.
+        # Send it to the whole PTY process group, not just the leader, so
+        # ordinary helper children cannot be stranded. Hermes-owned helpers
+        # that intentionally create a separate session are Python/PyPy
+        # processes from the managed venv; the updater's holder guard sees
+        # those processes and does not include them in the dashboard
+        # supervisor exclusion.
         for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):  # windows-footgun: ok — POSIX-only module (imports fcntl/termios/ptyprocess at top)
-            if not self._proc.isalive():
+            if not self._proc.isalive() and not self._process_group_alive():
                 break
             try:
                 if pgid is not None:
@@ -277,7 +305,10 @@ class PtyBridge:
             except Exception:
                 pass
             deadline = time.monotonic() + 0.5
-            while self._proc.isalive() and time.monotonic() < deadline:
+            while (
+                (self._proc.isalive() or self._process_group_alive())
+                and time.monotonic() < deadline
+            ):
                 time.sleep(0.02)
 
         try:

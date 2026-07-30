@@ -308,8 +308,15 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
 
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_live_sessions": 2})
     evicted: list[str] = []
+
+    def _record_close(sid, end_reason=None):
+        evicted.append(sid)
+        server._sessions.pop(sid, None)
+
     monkeypatch.setattr(
-        server, "_close_session_by_id", lambda sid, end_reason=None: evicted.append(sid)
+        server,
+        "_close_session_by_id",
+        _record_close,
     )
 
     def _ready() -> threading.Event:
@@ -523,6 +530,193 @@ def test_dispatch_runs_short_handlers_inline(server):
     assert resp == {"jsonrpc": "2.0", "id": "r1", "result": {"pong": True}}
 
 
+def test_active_tui_work_includes_running_detached_session(server):
+    server._sessions["detached-running"] = {
+        "running": True,
+        "transport": server._detached_ws_transport,
+    }
+
+    assert server.has_active_tui_work() is True
+
+    server._sessions["detached-running"]["running"] = False
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.has_active_tui_work() is False
+
+
+def test_active_tui_work_includes_live_agent_build(server):
+    ready = threading.Event()
+    server._sessions["building"] = {
+        "running": False,
+        "agent_ready": ready,
+        "agent_build_started": True,
+    }
+
+    assert server.has_active_tui_work() is True
+
+    ready.set()
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.has_active_tui_work() is False
+
+
+def test_update_quiesce_defers_scheduled_agent_build(server, monkeypatch):
+    built = threading.Event()
+    server._sessions["deferred"] = {}
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda sid, session: built.set(),
+    )
+
+    server.begin_update_quiesce()
+    try:
+        server._schedule_agent_build("deferred", delay=0.0)
+        assert built.wait(timeout=0.05) is False
+    finally:
+        server.end_update_quiesce()
+
+    assert built.wait(timeout=0.5) is True
+
+
+def test_update_quiesce_defers_auto_continue_kickoff(server):
+    kicked_off = threading.Event()
+
+    server.begin_update_quiesce()
+    try:
+        server._schedule_auto_continue_kickoff("deferred", kicked_off.set)
+        assert kicked_off.wait(timeout=0.05) is False
+    finally:
+        server.end_update_quiesce()
+
+    assert kicked_off.wait(timeout=0.5) is True
+
+
+def test_active_tui_work_includes_auto_continue_handoff(server):
+    started = threading.Event()
+    release = threading.Event()
+
+    def kickoff():
+        started.set()
+        release.wait(timeout=0.5)
+
+    server._schedule_auto_continue_kickoff("starting", kickoff)
+    assert started.wait(timeout=0.5) is True
+    assert server.has_active_tui_work() is True
+
+    release.set()
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.has_active_tui_work() is False
+
+
+def test_update_quiesce_rejects_tui_maintenance(server):
+    server.begin_update_quiesce()
+    try:
+        with server._tui_maintenance_scope() as admitted:
+            assert admitted is False
+    finally:
+        server.end_update_quiesce()
+
+
+def test_active_tui_work_includes_tui_maintenance(server):
+    with server._tui_maintenance_scope() as admitted:
+        assert admitted is True
+        assert server.has_active_tui_work() is True
+
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.has_active_tui_work() is False
+
+
+def test_update_quiesce_replays_missed_ws_orphan_reap(server, monkeypatch):
+    reaped = threading.Event()
+    monkeypatch.setattr(
+        server,
+        "_reap_ws_orphan_if_still_detached",
+        lambda sid: reaped.set(),
+    )
+
+    server.begin_update_quiesce()
+    server._run_ws_orphan_reap("detached")
+    assert reaped.is_set() is False
+    assert "detached" in server._deferred_ws_orphan_reaps
+
+    server.end_update_quiesce()
+    assert reaped.wait(timeout=0.5) is True
+    assert "detached" not in server._deferred_ws_orphan_reaps
+
+
+def test_update_quiesce_rejects_autonomous_tui_turn(server):
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+
+    server.begin_update_quiesce()
+    try:
+        assert server._try_claim_autonomous_turn(session) is False
+        assert session["running"] is False
+    finally:
+        server.end_update_quiesce()
+
+
+def test_close_sessions_for_update_releases_workers(server, monkeypatch):
+    closed = {"agent": 0, "worker": 0, "joined": 0}
+
+    class _Closable:
+        def __init__(self, key):
+            self.key = key
+
+        def close(self):
+            closed[self.key] += 1
+
+    class _Poller:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            closed["joined"] += 1
+            self.alive = False
+
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    server._sessions["idle"] = {
+        "session_key": "idle",
+        "agent": _Closable("agent"),
+        "slash_worker": _Closable("worker"),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "_notif_stop": threading.Event(),
+        "_notif_thread": _Poller(),
+    }
+
+    server.close_sessions_for_update()
+
+    assert server._sessions == {}
+    assert closed == {"agent": 1, "worker": 1, "joined": 1}
+
+
+def test_close_sessions_for_update_rejects_live_poller(server, monkeypatch):
+    class _Poller:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: server._sessions.clear())
+    server._sessions["blocked"] = {"_notif_thread": _Poller()}
+
+    with pytest.raises(RuntimeError, match="did not stop before update"):
+        server.close_sessions_for_update()
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
@@ -614,5 +808,3 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-
-

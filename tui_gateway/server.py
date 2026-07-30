@@ -148,6 +148,16 @@ _db_error: str | None = None
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+_rpc_futures_lock = threading.Lock()
+_active_rpc_futures: set[concurrent.futures.Future] = set()
+_update_quiesce_lock = threading.Lock()
+_scheduled_agent_builds: dict[str, object] = {}
+_starting_agent_builds: set[str] = set()
+_scheduled_auto_continues: dict[str, tuple[object, Any]] = {}
+_starting_auto_continues: set[str] = set()
+_deferred_ws_orphan_reaps: set[str] = set()
+_active_tui_maintenance = 0
+_tui_update_quiesced = False
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -289,6 +299,110 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+
+
+def has_active_tui_work() -> bool:
+    """Whether an embedded TUI RPC or agent turn still owns live work."""
+    with _update_quiesce_lock:
+        if (
+            _starting_agent_builds
+            or _starting_auto_continues
+            or _active_tui_maintenance
+        ):
+            return True
+    with _sessions_lock:
+        if any(
+            session.get("running")
+            or (
+                (run_thread := session.get("_run_thread")) is not None
+                and run_thread.is_alive()
+            )
+            or (
+                (ready := session.get("agent_ready")) is not None
+                and not ready.is_set()
+                and session.get("agent_build_started")
+            )
+            for session in _sessions.values()
+        ):
+            return True
+    with _rpc_futures_lock:
+        return any(not future.done() for future in _active_rpc_futures)
+
+
+def begin_update_quiesce() -> None:
+    """Pause deferred TUI agent builds at the dashboard update boundary.
+
+    A build already past admission remains visible through
+    ``_starting_agent_builds`` and the session's ``agent_build_started`` flag,
+    so the caller can wait for it. Builds whose timers have not fired remain
+    scheduled and resume only after :func:`end_update_quiesce`.
+    """
+    global _tui_update_quiesced
+
+    with _update_quiesce_lock:
+        _tui_update_quiesced = True
+
+
+def end_update_quiesce() -> None:
+    """Resume deferred TUI agent builds after an update exits or aborts."""
+    global _tui_update_quiesced
+
+    with _update_quiesce_lock:
+        if not _tui_update_quiesced:
+            return
+        _tui_update_quiesced = False
+        pending_builds = list(_scheduled_agent_builds)
+        pending_continues = [
+            (sid, target)
+            for sid, (_token, target) in _scheduled_auto_continues.items()
+        ]
+        pending_orphan_reaps = list(_deferred_ws_orphan_reaps)
+        _scheduled_agent_builds.clear()
+        _scheduled_auto_continues.clear()
+        _deferred_ws_orphan_reaps.clear()
+    for sid in pending_builds:
+        _schedule_agent_build(sid, delay=0.0)
+    for sid, target in pending_continues:
+        _schedule_auto_continue_kickoff(sid, target)
+    for sid in pending_orphan_reaps:
+        threading.Thread(
+            target=_run_ws_orphan_reap,
+            args=(sid,),
+            daemon=True,
+        ).start()
+    # A one-shot cap/orphan/lease sweep may have fired while updates were
+    # paused. Re-run the consolidated maintenance pass now so pausing remains
+    # lossless without letting teardown work cross the update boundary.
+    threading.Thread(target=_reap_idle_sessions, daemon=True).start()
+
+
+@contextlib.contextmanager
+def _tui_maintenance_scope():
+    """Admit one short TUI maintenance sweep unless an update is quiesced."""
+    global _active_tui_maintenance
+
+    with _update_quiesce_lock:
+        admitted = not _tui_update_quiesced
+        if admitted:
+            _active_tui_maintenance += 1
+    try:
+        yield admitted
+    finally:
+        if admitted:
+            with _update_quiesce_lock:
+                _active_tui_maintenance = max(_active_tui_maintenance - 1, 0)
+
+
+def _try_claim_autonomous_turn(session: dict) -> bool:
+    """Atomically admit one poller-owned turn outside update quiescence."""
+    with _update_quiesce_lock:
+        if _tui_update_quiesced or session.get("_finalized"):
+            return False
+        with session["history_lock"]:
+            if session.get("running"):
+                return False
+            session["running"] = True
+            return True
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -905,25 +1019,46 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         return
 
     def _reap() -> None:
-        # Serialize the orphan re-check against session.resume (which re-binds a
-        # live transport under _session_resume_lock and would make this session
-        # non-orphaned). Claim teardown by popping under both lifecycle locks,
-        # then release the global resume lock before the slow finalization work.
-        # The dict mutation still happens under _sessions_lock — consistent
-        # with every other _sessions mutator
-        # (#39591: _reap previously popped under _session_resume_lock, giving no
-        # mutual exclusion against _init_session / _close_session_by_id, which
-        # guard with _sessions_lock). _sessions_lock is an RLock and the global
-        # ordering is always resume_lock -> sessions_lock, so nesting is safe.
-        with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
-                return
-            session = _pop_session_by_id(sid)
-        _teardown_popped_session(session, end_reason="ws_orphan_reap")
+        _run_ws_orphan_reap(sid)
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
     timer.daemon = True
     timer.start()
+
+
+def _run_ws_orphan_reap(sid: str) -> None:
+    """Run or defer one grace-expired WebSocket orphan check."""
+    global _active_tui_maintenance
+
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            _deferred_ws_orphan_reaps.add(sid)
+            return
+        _active_tui_maintenance += 1
+    try:
+        _reap_ws_orphan_if_still_detached(sid)
+    finally:
+        with _update_quiesce_lock:
+            _active_tui_maintenance = max(_active_tui_maintenance - 1, 0)
+
+
+def _reap_ws_orphan_if_still_detached(sid: str) -> None:
+    """Claim and tear down one still-detached WS session."""
+    # Serialize the orphan re-check against session.resume (which re-binds a
+    # live transport under _session_resume_lock and would make this session
+    # non-orphaned). Claim teardown by popping under both lifecycle locks,
+    # then release the global resume lock before the slow finalization work.
+    # The dict mutation still happens under _sessions_lock — consistent
+    # with every other _sessions mutator
+    # (#39591: _reap previously popped under _session_resume_lock, giving no
+    # mutual exclusion against _init_session / _close_session_by_id, which
+    # guard with _sessions_lock). _sessions_lock is an RLock and the global
+    # ordering is always resume_lock -> sessions_lock, so nesting is safe.
+    with _session_resume_lock:
+        if not _ws_session_is_orphaned(_sessions.get(sid)):
+            return
+        session = _pop_session_by_id(sid)
+    _teardown_popped_session(session, end_reason="ws_orphan_reap")
 
 
 def _close_sessions_for_transport(
@@ -974,6 +1109,44 @@ def _shutdown_sessions() -> None:
         _close_session_by_id(sid, end_reason="tui_shutdown")
 
 
+def close_sessions_for_update() -> None:
+    """Close idle embedded-TUI sessions before the managed venv is rewritten.
+
+    Dashboard WebSocket closure detaches resumable sessions by design, so their
+    notification pollers and slash-worker Python subprocesses otherwise survive
+    the transport task. The POSIX holder guard must then reject the update.
+    Quiesce admission is already closed when this runs; tear sessions down and
+    briefly join their pollers so no venv-backed child or lazy import crosses
+    the updater spawn.
+    """
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+    _shutdown_sessions()
+    current = threading.current_thread()
+    deadline = time.monotonic() + 1.0
+    pollers = []
+    for session in sessions:
+        poller = session.get("_notif_thread")
+        if (
+            poller is not None
+            and poller is not current
+            and getattr(poller, "is_alive", lambda: False)()
+        ):
+            pollers.append(poller)
+    for poller in pollers:
+        poller.join(timeout=max(deadline - time.monotonic(), 0.0))
+    still_alive = [
+        poller
+        for poller in pollers
+        if getattr(poller, "is_alive", lambda: False)()
+    ]
+    if still_alive:
+        raise RuntimeError(
+            f"{len(still_alive)} embedded-TUI notification poller(s) "
+            "did not stop before update"
+        )
+
+
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
 # hours-scale because last_active freezes during a long turn and on passive
 # viewing — running/pending/starting/live-transport are hard exemptions instead.
@@ -1011,13 +1184,20 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
 
 
 def _reap_idle_sessions() -> None:
-    now = time.time()
-    with _sessions_lock:
-        victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
-    for sid in victims:
-        _close_session_by_id(sid, end_reason="idle_timeout")
-    _enforce_session_cap()
-    _reclaim_orphaned_leases()
+    with _tui_maintenance_scope() as admitted:
+        if not admitted:
+            return
+        now = time.time()
+        with _sessions_lock:
+            victims = [
+                sid
+                for sid, s in _sessions.items()
+                if _session_is_evictable(sid, s, now)
+            ]
+        for sid in victims:
+            _close_session_by_id(sid, end_reason="idle_timeout")
+        _enforce_session_cap()
+        _reclaim_orphaned_leases()
 
 
 def _reclaim_orphaned_leases() -> None:
@@ -1074,22 +1254,28 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
 
 
 def _enforce_session_cap() -> None:
-    cap = _max_live_sessions()
-    if cap <= 0:
-        return
-    with _sessions_lock:
-        total = len(_sessions)
-        if total <= cap:
+    with _tui_maintenance_scope() as admitted:
+        if not admitted:
             return
-        evictable = [
-            (sid, s) for sid, s in _sessions.items() if _session_is_lru_evictable(sid, s)
-        ]
-    # Oldest-touched first; only evict down to the cap (live/focused sessions on
-    # a live transport are never eligible, so we may stop short of the cap).
-    evictable.sort(key=lambda kv: float(kv[1].get("last_active") or 0.0))
-    overflow = total - cap
-    for sid, _s in evictable[:overflow]:
-        _close_session_by_id(sid, end_reason="lru_evict")
+        cap = _max_live_sessions()
+        if cap <= 0:
+            return
+        with _sessions_lock:
+            total = len(_sessions)
+            if total <= cap:
+                return
+            evictable = [
+                (sid, s)
+                for sid, s in _sessions.items()
+                if _session_is_lru_evictable(sid, s)
+            ]
+        # Oldest-touched first; only evict down to the cap (live/focused
+        # sessions on a live transport are never eligible, so we may stop short
+        # of the cap).
+        evictable.sort(key=lambda kv: float(kv[1].get("last_active") or 0.0))
+        overflow = total - cap
+        for sid, _s in evictable[:overflow]:
+            _close_session_by_id(sid, end_reason="lru_evict")
 
 
 def _schedule_session_cap_enforcement() -> None:
@@ -1734,7 +1920,15 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        future = _pool.submit(lambda: ctx.run(run))
+        with _rpc_futures_lock:
+            _active_rpc_futures.add(future)
+
+        def _discard_rpc_future(completed: concurrent.futures.Future) -> None:
+            with _rpc_futures_lock:
+                _active_rpc_futures.discard(completed)
+
+        future.add_done_callback(_discard_rpc_future)
 
         return None
     finally:
@@ -7016,7 +7210,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             with session["history_lock"]:
                 session["running"] = False
 
-    threading.Thread(target=kickoff, daemon=True).start()
+    _schedule_auto_continue_kickoff(sid, kickoff)
     logger.info(
         "auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago)",
         session_key,
@@ -7374,15 +7568,90 @@ def _claim_or_reuse_live(
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     """Pre-warm a deferred session's agent off the response path (session.create
     and cold resume both build through here; _sess() also builds on demand)."""
+    schedule_token = object()
 
     def _run():
-        session = _sessions.get(sid)
-        if session is not None:
-            _start_agent_build(sid, session)
+        with _update_quiesce_lock:
+            if _scheduled_agent_builds.get(sid) is not schedule_token:
+                # The quiesce ended and re-armed this sid with a fresh timer
+                # before this older timer acquired the lock.
+                return
+            if _tui_update_quiesced:
+                # Leave the sid scheduled. end_update_quiesce() will arm a
+                # fresh timer after the updater exits.
+                return
+            _scheduled_agent_builds.pop(sid, None)
+            _starting_agent_builds.add(sid)
+        try:
+            session = _sessions.get(sid)
+            if session is not None:
+                _start_agent_build(sid, session)
+        finally:
+            with _update_quiesce_lock:
+                _starting_agent_builds.discard(sid)
+
+    with _update_quiesce_lock:
+        if sid in _scheduled_agent_builds or sid in _starting_agent_builds:
+            return
+        _scheduled_agent_builds[sid] = schedule_token
+        if _tui_update_quiesced:
+            return
 
     timer = threading.Timer(delay, _run)
     timer.daemon = True
-    timer.start()
+    try:
+        timer.start()
+    except Exception:
+        with _update_quiesce_lock:
+            if _scheduled_agent_builds.get(sid) is schedule_token:
+                _scheduled_agent_builds.pop(sid, None)
+        raise
+
+
+def _schedule_auto_continue_kickoff(sid: str, target) -> None:
+    """Start one crash-recovery kickoff unless update quiesce defers it.
+
+    The kickoff directly starts or waits for an agent build and can then launch
+    a synthesized turn. Track the entire handoff so an update cannot attest
+    idle between the resume RPC returning and either the build or turn becoming
+    visible through the ordinary session flags.
+    """
+    schedule_token = object()
+
+    def _run() -> None:
+        with _update_quiesce_lock:
+            pending = _scheduled_auto_continues.get(sid)
+            if pending is None or pending[0] is not schedule_token:
+                return
+            if _tui_update_quiesced:
+                return
+            _scheduled_auto_continues.pop(sid, None)
+            _starting_auto_continues.add(sid)
+        try:
+            target()
+        finally:
+            with _update_quiesce_lock:
+                _starting_auto_continues.discard(sid)
+
+    with _update_quiesce_lock:
+        if sid in _scheduled_auto_continues or sid in _starting_auto_continues:
+            return
+        _scheduled_auto_continues[sid] = (schedule_token, target)
+        if _tui_update_quiesced:
+            return
+
+    worker = threading.Thread(
+        target=_run,
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        with _update_quiesce_lock:
+            pending = _scheduled_auto_continues.get(sid)
+            if pending is not None and pending[0] is schedule_token:
+                _scheduled_auto_continues.pop(sid, None)
+        raise
 
 
 def _session_pending_kind(sid: str) -> str:
@@ -8651,9 +8920,8 @@ def _notification_poller_loop(
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
+                if _try_claim_autonomous_turn(session):
+                    with session["history_lock"]:
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
                 if _batch:
@@ -8723,14 +8991,8 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        _requeued = False
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
-        if _requeued:
+        if not _try_claim_autonomous_turn(session):
+            process_registry.completion_queue.put(evt)
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
@@ -8772,6 +9034,9 @@ def _notification_poller_loop(
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            return
     deferred: list = []
     while not process_registry.completion_queue.empty():
         try:
@@ -8809,11 +9074,9 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
+        if not _try_claim_autonomous_turn(session):
+            process_registry.completion_queue.put(evt)
+            break
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -8955,6 +9218,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         args=(stop, sid, session),
         daemon=True,
     )
+    session["_notif_thread"] = t
     t.start()
     return stop
 
