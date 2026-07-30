@@ -3964,11 +3964,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # supervised lifecycle, but gateway processes are safe to
                     # exclude only after they refuse new work and report zero
                     # active work. The post-install path restarts the fleet.
-                    from hermes_cli.gateway import find_gateway_pids
+                    from hermes_cli.gateway import (
+                        find_gateway_pids,
+                        find_profile_gateway_processes,
+                    )
 
                     _gateway_pids = {
                         int(pid) for pid in find_gateway_pids(all_profiles=True)
                     }
+                    # Process-table discovery intentionally excludes the
+                    # caller's ancestor chain so management commands are not
+                    # mistaken for gateways. For a foreground gateway's
+                    # `/update`, however, that ancestor is the live gateway
+                    # supervisor itself. Admit it only when the profile PID
+                    # registry independently validates the exact PID; an
+                    # arbitrary ancestor supplied through the environment
+                    # must never gain a venv-guard exclusion.
+                    _profile_gateway_pids = {
+                        int(proc.pid)
+                        for proc in find_profile_gateway_processes()
+                    }
+                    if _supervisor_pid in _profile_gateway_pids:
+                        _gateway_pids.add(_supervisor_pid)
                     _posix_gateway_quiesce = (
                         _m()._quiesce_posix_gateways_for_update(_gateway_pids)
                     )

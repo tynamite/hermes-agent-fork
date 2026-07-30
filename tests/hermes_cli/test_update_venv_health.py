@@ -464,6 +464,7 @@ def _run_update_until_guard(
     is_windows=True,
     detector=None,
     quiesce_token=None,
+    profile_gateways=(),
 ):
     """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
 
@@ -498,6 +499,9 @@ def _run_update_until_guard(
         return_value=[(101, "python.exe", "python.exe -m hermes_cli.main serve")],
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
+    ), patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=list(profile_gateways),
     ):
         try:
             cli_main._cmd_update_impl(args, gateway_mode=False)
@@ -555,6 +559,40 @@ def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
 
     assert result == "past_guard", capsys.readouterr().out
     assert seen == [{555, 666}]
+
+
+def test_venv_holder_guard_quiesces_mapped_foreground_gateway_supervisor(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return []
+
+    # find_gateway_pids deliberately omits ancestors, matching the real
+    # foreground `/update` topology. The independently validated profile PID
+    # mapping must restore the gateway to the drain set before exclusion.
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token={"pids": {555}, "created_markers": []},
+            profile_gateways=[
+                SimpleNamespace(profile="default", path="/tmp/hermes", pid=555)
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [{555}]
 
 
 def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
