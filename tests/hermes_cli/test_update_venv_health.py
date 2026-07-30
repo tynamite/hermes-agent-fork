@@ -98,6 +98,12 @@ def test_detect_venv_python_finds_posix_venv_launcher(_winp, tmp_path):
                     "python3.14t",
                     [str(tmp_path / "venv" / "bin" / "python3.14t"), "worker.py"],
                 ),
+                _proc(
+                    109,
+                    "/usr/bin/python3.14td",
+                    "python3.14td",
+                    [str(tmp_path / "venv" / "bin" / "python3.14td"), "worker.py"],
+                ),
             ]
         ),
         Process=lambda *a, **k: me,
@@ -107,7 +113,7 @@ def test_detect_venv_python_finds_posix_venv_launcher(_winp, tmp_path):
     ):
         matches = cli_main._detect_venv_python_processes()
 
-    assert [m[0] for m in matches] == [101, 103, 105, 107]
+    assert [m[0] for m in matches] == [101, 103, 105, 107, 109]
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
@@ -119,9 +125,18 @@ def test_detect_venv_python_matches_resolved_symlinked_project_root(
     logical_root = tmp_path / "logical-root"
     logical_root.symlink_to(real_root, target_is_directory=True)
     venv_python = str(real_root / "venv" / "bin" / "python")
+    venv_versioned_python = str(real_root / "venv" / "bin" / "python3.13")
     fake_psutil = types.SimpleNamespace(
         process_iter=lambda attrs: iter(
-            [_proc(108, "/usr/bin/python3", "python3", [venv_python, "worker.py"])]
+            [
+                _proc(
+                    108,
+                    "/usr/bin/python3",
+                    "python3",
+                    [venv_python, "worker.py"],
+                ),
+                _proc(110, venv_versioned_python, "python3.13"),
+            ]
         ),
         Process=MagicMock(),
     )
@@ -131,7 +146,7 @@ def test_detect_venv_python_matches_resolved_symlinked_project_root(
     ):
         matches = cli_main._detect_venv_python_processes()
 
-    assert [match[0] for match in matches] == [108]
+    assert [match[0] for match in matches] == [108, 110]
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
@@ -480,6 +495,12 @@ def _run_update_until_guard(
         def __truediv__(self, _other):
             raise _PastGuard
 
+    detector_effect = detector or (
+        lambda **_kw: [
+            (101, "python.exe", "python.exe -m hermes_cli.main serve")
+        ]
+    )
+
     with patch.object(cli_main, "_is_windows", return_value=is_windows), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
     ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
@@ -495,8 +516,7 @@ def _run_update_until_guard(
     ), patch.object(
         cli_main,
         "_detect_venv_python_processes",
-        side_effect=detector,
-        return_value=[(101, "python.exe", "python.exe -m hermes_cli.main serve")],
+        side_effect=detector_effect,
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
     ), patch(

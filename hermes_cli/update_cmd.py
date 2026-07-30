@@ -2932,7 +2932,7 @@ def _detect_venv_python_processes(
             ]
             if not any(
                 re.fullmatch(
-                    r"(?:python(?:w)?(?:\d+(?:\.\d+)*)?t?|pypy(?:\d+(?:\.\d+)*)?)(?:\.exe)?",
+                    r"(?:python(?:w)?(?:\d+(?:\.\d+)*t?d?)?|pypy(?:\d+(?:\.\d+)*)?)(?:\.exe)?",
                     marker,
                 )
                 for marker in process_markers
@@ -3950,8 +3950,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if not getattr(args, "force_venv", False):
         _venv_guard_exclude: set[int] = set()
         try:
-            _supervisor_pid = int(
-                os.environ.get("_HERMES_UPDATE_SUPERVISOR_PID", "")
+            _raw_supervisor_pid = os.environ.get(
+                "_HERMES_UPDATE_SUPERVISOR_PID", ""
+            ).strip()
+            _supervisor_pid = (
+                int(_raw_supervisor_pid)
+                if _raw_supervisor_pid.isdigit()
+                else 0
             )
             if _supervisor_pid > 0:
                 import psutil
