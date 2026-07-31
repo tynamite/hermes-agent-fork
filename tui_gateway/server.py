@@ -1199,7 +1199,15 @@ def close_sessions_for_update() -> None:
     the updater spawn.
     """
     with _sessions_lock:
-        sessions = list(_sessions.values())
+        session_items = list(_sessions.items())
+    sessions = [session for _sid, session in session_items]
+    delegation_owners = [
+        (
+            str(session.get("session_key") or ""),
+            str(sid or session.get("_sid") or ""),
+        )
+        for sid, session in session_items
+    ]
     _shutdown_sessions()
     current = threading.current_thread()
     deadline = time.monotonic() + 1.0
@@ -1214,6 +1222,31 @@ def close_sessions_for_update() -> None:
             pollers.append(poller)
     for poller in pollers:
         poller.join(timeout=max(deadline - time.monotonic(), 0.0))
+    try:
+        from tools.async_delegation import active_count_for_session
+
+        while (
+            any(
+                active_count_for_session(
+                    session_key=session_key,
+                    origin_ui_session_id=sid,
+                )
+                for session_key, sid in delegation_owners
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        live_delegations = sum(
+            active_count_for_session(
+                session_key=session_key,
+                origin_ui_session_id=sid,
+            )
+            for session_key, sid in delegation_owners
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not verify embedded-TUI delegation shutdown"
+        ) from exc
     still_alive = [
         poller
         for poller in pollers
@@ -1223,6 +1256,11 @@ def close_sessions_for_update() -> None:
         raise RuntimeError(
             f"{len(still_alive)} embedded-TUI notification poller(s) "
             "did not stop before update"
+        )
+    if live_delegations:
+        raise RuntimeError(
+            f"{live_delegations} embedded-TUI delegation(s) did not stop "
+            "before update"
         )
 
 

@@ -3143,10 +3143,11 @@ def _quiesce_posix_gateways_for_update(
                     and not owned_by_this_update
                     and not owner_identity_is_live
                 )
-                # Preserve an active operator/NAS drain, but replace a marker
-                # from an earlier machine epoch or terminated updater. The
-                # conditional write prevents a controller that wins after our
-                # observation from being overwritten.
+                # Preserve an active operator/NAS drain, but do not use it as
+                # the updater's boundary: ordinary drains intentionally allow
+                # internal events, while an updater-owned marker blocks all
+                # new module-loading work. Replace only a marker from an
+                # earlier machine epoch or terminated updater.
                 if owned_by_this_update:
                     created_markers.append(
                         {"home": home, "marker": body}
@@ -3161,7 +3162,9 @@ def _quiesce_posix_gateways_for_update(
                         f"another updater owns the gateway drain for {home}"
                     )
                 if is_active and not orphaned_update_marker:
-                    break
+                    raise RuntimeError(
+                        f"operator-owned drain cannot protect update for {home}"
+                    )
                 request_id = uuid.uuid4().hex
                 payload = write_drain_request_if_unchanged(
                     observed,

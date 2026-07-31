@@ -266,6 +266,40 @@ class TestDrainStateMachine:
         assert runner._external_drain_active is False
         runner._update_runtime_status.assert_not_called()
 
+    def test_active_work_count_includes_async_delegations(
+        self,
+        monkeypatch,
+    ):
+        import tools.async_delegation
+
+        runner, _ = _drain_runner()
+        runner._running_agents = {}
+        runner._background_tasks = set()
+        monkeypatch.setattr(
+            tools.async_delegation,
+            "active_count",
+            lambda: 1,
+        )
+
+        assert runner._active_work_count() == 1
+
+    def test_active_work_count_fails_closed_when_background_probe_raises(
+        self,
+        monkeypatch,
+    ):
+        import tools.async_delegation
+
+        runner, _ = _drain_runner()
+        runner._running_agents = {}
+        runner._background_tasks = set()
+        monkeypatch.setattr(
+            tools.async_delegation,
+            "active_count",
+            MagicMock(side_effect=RuntimeError("unreadable")),
+        )
+
+        assert runner._active_work_count() == 1
+
 
 # ---------------------------------------------------------------------------
 # Watcher reconciliation

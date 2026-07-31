@@ -121,6 +121,11 @@ def make_restart_runner(
     runner._active_api_run_count = GatewayRunner._active_api_run_count.__get__(
         runner, GatewayRunner
     )
+    runner._active_background_work_count = (
+        GatewayRunner._active_background_work_count.__get__(
+            runner, GatewayRunner
+        )
+    )
     runner._active_work_count = GatewayRunner._active_work_count.__get__(
         runner, GatewayRunner
     )

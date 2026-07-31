@@ -441,6 +441,37 @@ def test_list_async_delegations_exposes_live_activity(monkeypatch):
         gate.set()
 
 
+def test_active_count_for_session_matches_any_owner_selector():
+    records = {
+        "a": {
+            "status": "running",
+            "session_key": "session-a",
+            "origin_ui_session_id": "tab-a",
+        },
+        "b": {
+            "status": "finalizing",
+            "parent_session_id": "parent-b",
+        },
+        "done": {
+            "status": "completed",
+            "session_key": "session-a",
+        },
+    }
+    with ad._records_lock:
+        previous = dict(ad._records)
+        ad._records.clear()
+        ad._records.update(records)
+    try:
+        assert ad.active_count_for_session(session_key="session-a") == 1
+        assert ad.active_count_for_session(origin_ui_session_id="tab-a") == 1
+        assert ad.active_count_for_session(parent_session_id="parent-b") == 1
+        assert ad.active_count_for_session() == 0
+    finally:
+        with ad._records_lock:
+            ad._records.clear()
+            ad._records.update(previous)
+
+
 def test_in_tool_stall_uses_higher_threshold(monkeypatch):
     """A frozen child inside a tool gets the in-tool ceiling, not the idle one."""
     _fast_stale_monitor(monkeypatch, idle=0.1, in_tool=10.0, grace=0.1)
@@ -728,4 +759,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

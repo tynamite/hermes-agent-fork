@@ -7050,7 +7050,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_background_work_count()
         )
+
+    def _active_background_work_count(self) -> int:
+        """Whether detached work still owns the managed runtime.
+
+        One is sufficient for the persisted zero/non-zero drain contract.
+        Probe failures also return one: update quiescence must not attest idle
+        when delegation or process-registry liveness is unreadable.
+        """
+        if any(
+            not task.done()
+            for task in getattr(self, "_background_tasks", ())
+        ):
+            return 1
+        try:
+            from tools.async_delegation import active_count
+
+            if active_count() > 0:
+                return 1
+        except Exception:
+            logger.debug(
+                "background async-delegation check failed",
+                exc_info=True,
+            )
+            return 1
+        try:
+            from tools.process_registry import process_registry
+
+            if process_registry.has_any_active():
+                return 1
+            if process_registry.pending_watchers:
+                return 1
+        except Exception:
+            logger.debug(
+                "background process-registry check failed",
+                exc_info=True,
+            )
+            return 1
+        return 0
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
@@ -7100,25 +7139,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Checks the runner's own tracked tasks + the process registry's running
         processes + any pending process-completion watchers.
         """
-        if any(not t.done() for t in self._background_tasks):
-            return True
-        try:
-            from tools.async_delegation import active_count
-
-            if active_count() > 0:
-                return True
-        except Exception:  # noqa: BLE001 - never let the idle check raise
-            logger.debug("scale-to-zero async-delegation check failed", exc_info=True)
-        try:
-            from tools.process_registry import process_registry
-
-            if process_registry.has_any_active():
-                return True
-            if process_registry.pending_watchers:
-                return True
-        except Exception:  # noqa: BLE001 - never let the idle check raise
-            logger.debug("scale-to-zero bg-work check failed", exc_info=True)
-        return False
+        return self._active_background_work_count() > 0
 
     def _scale_to_zero_idle_timeout_seconds(self) -> float:
         from gateway.scale_to_zero import parse_idle_timeout_seconds

@@ -278,9 +278,7 @@ def test_quiesce_posix_gateway_preserves_active_operator_drain(
     ):
         token = cli_main._quiesce_posix_gateways_for_update({555})
 
-    assert token is not None
-    assert token["created_markers"] == []
-    cli_main._release_posix_gateway_quiesce(token)
+    assert token is None
     assert marker.read_text(encoding="utf-8") == '{"principal":"operator"}'
 
 

@@ -750,6 +750,58 @@ def test_close_sessions_for_update_rejects_live_poller(server, monkeypatch):
         server.close_sessions_for_update()
 
 
+def test_close_sessions_for_update_waits_for_delegations(server, monkeypatch):
+    import tools.async_delegation
+
+    counts = iter([1, 0, 0])
+    seen = []
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: server._sessions.clear())
+    monkeypatch.setattr(
+        tools.async_delegation,
+        "active_count_for_session",
+        lambda **kwargs: seen.append(kwargs) or next(counts),
+    )
+    monkeypatch.setattr(server.time, "sleep", lambda _delay: None)
+    server._sessions["delegating"] = {
+        "session_key": "session-key",
+        "_sid": "tab-1",
+    }
+
+    server.close_sessions_for_update()
+
+    assert seen
+    assert all(
+        call == {
+            "session_key": "session-key",
+            "origin_ui_session_id": "delegating",
+        }
+        for call in seen
+    )
+
+
+def test_close_sessions_for_update_rejects_live_delegation(
+    server,
+    monkeypatch,
+):
+    import tools.async_delegation
+
+    clock = iter([0.0, 2.0])
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: server._sessions.clear())
+    monkeypatch.setattr(
+        tools.async_delegation,
+        "active_count_for_session",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(clock, 2.0))
+    server._sessions["delegating"] = {
+        "session_key": "session-key",
+        "_sid": "tab-1",
+    }
+
+    with pytest.raises(RuntimeError, match="delegation.*did not stop"):
+        server.close_sessions_for_update()
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
