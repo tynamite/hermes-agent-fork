@@ -433,18 +433,29 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_foreground_gateway_supervisor_is_included_in_restart_fleet(
+    @pytest.mark.parametrize("supervisor_pid", ("555", None))
+    def test_quiesced_profile_gateway_is_included_in_restart_fleet(
         self,
         mock_run,
         _mock_which,
         mock_args,
         tmp_path,
         monkeypatch,
+        supervisor_pid,
     ):
         from hermes_cli import main as hm
 
         mock_args.gateway = True
-        monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+        if supervisor_pid is None:
+            monkeypatch.delenv(
+                "_HERMES_UPDATE_SUPERVISOR_PID",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "_HERMES_UPDATE_SUPERVISOR_PID",
+                supervisor_pid,
+            )
         mock_run.side_effect = _make_run_side_effect(
             branch="main",
             verify_ok=True,

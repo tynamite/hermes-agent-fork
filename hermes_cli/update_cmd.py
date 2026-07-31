@@ -5868,20 +5868,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     all_profiles=True,
                 )
             )
-            # Foreground `/update` runs beneath the gateway it must restart.
-            # Generic discovery intentionally excludes updater ancestors, so
-            # restore only the supervisor identity that was independently
-            # profile-mapped and quiesced before mutation.
-            if (
-                _supervisor_pid > 0
-                and _supervisor_pid in _profile_gateway_pids
-                and _supervisor_pid
-                in set(
+            # Generic discovery intentionally excludes updater ancestors and
+            # can miss gateways whose process title was shortened to bare
+            # ``hermes``. Restore every PID that was independently
+            # profile-mapped and quiesced before mutation, while leaving
+            # service-owned processes to their managers above.
+            quiesced_profile_pids = (
+                set(
                     (_posix_gateway_quiesce or {}).get("pids", set())
                 )
-                and _supervisor_pid not in service_pids
-            ):
-                manual_pids.add(_supervisor_pid)
+                & _profile_gateway_pids
+            )
+            manual_pids.update(
+                quiesced_profile_pids - set(service_pids)
+            )
             profile_processes = {
                 proc.pid: proc
                 for proc in find_profile_gateway_processes(exclude_pids=service_pids)
