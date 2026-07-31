@@ -7072,6 +7072,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if task not in supervised_tasks
         ):
             return 1
+        for registry_name in (
+            "_deferred_agent_cleanup_tasks",
+            "_fatal_handler_tasks",
+        ):
+            if any(
+                not task.done()
+                for task in getattr(self, registry_name, ())
+            ):
+                return 1
         try:
             from tools.async_delegation import active_count
 
@@ -10957,7 +10966,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _bg = getattr(self, "_background_tasks", None)
                 if _bg is not None:
                     _bg.add(self._loop_heartbeat_task)
-                    self._loop_heartbeat_task.add_done_callback(_bg.discard)
+                    _supervised = getattr(
+                        self,
+                        "_supervised_tasks",
+                        None,
+                    )
+                    if _supervised is None:
+                        _supervised = set()
+                        self._supervised_tasks = _supervised
+                    _supervised.add(self._loop_heartbeat_task)
+
+                    def _discard_loop_heartbeat(task):
+                        _bg.discard(task)
+                        _supervised.discard(task)
+
+                    self._loop_heartbeat_task.add_done_callback(
+                        _discard_loop_heartbeat
+                    )
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
 
@@ -12321,7 +12346,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _task.cancel()
             self._background_tasks.clear()
-            self._supervised_tasks.clear()
+            supervised_tasks = getattr(
+                self,
+                "_supervised_tasks",
+                None,
+            )
+            if supervised_tasks is not None:
+                supervised_tasks.clear()
 
             self.adapters.clear()
             for _session_key in list(self._running_agents):
@@ -17001,7 +17032,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 watchers = process_registry.pending_watchers
                 process_registry.pending_watchers = []
                 for i, watcher in enumerate(watchers):
-                    asyncio.create_task(self._run_process_watcher(watcher))
+                    watcher_task = asyncio.create_task(
+                        self._run_process_watcher(watcher)
+                    )
+                    self._background_tasks.add(watcher_task)
+                    watcher_task.add_done_callback(
+                        self._background_tasks.discard
+                    )
                     if i % 100 == 99:
                         await asyncio.sleep(0)
             except Exception as e:

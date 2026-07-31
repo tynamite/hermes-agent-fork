@@ -28,6 +28,21 @@ export interface BackendStartFailureContext {
    * cloud) primary backend rather than spawning a local child.
    */
   attemptedRemote: boolean
+  /** The failure raised by this particular startup attempt. */
+  error?: unknown
+}
+
+/**
+ * A local backend start that lost the in-process race to an update.
+ *
+ * This is expected and retryable once the update gate reopens; it must never
+ * become the permanent `backendStartFailure` latch used for broken installs.
+ */
+export class BackendStartInterruptedByUpdateError extends Error {
+  constructor() {
+    super('Hermes update started while resolving the primary backend')
+    this.name = 'BackendStartInterruptedByUpdateError'
+  }
 }
 
 /**
@@ -37,7 +52,10 @@ export interface BackendStartFailureContext {
  * without an app restart).
  */
 export function shouldLatchBackendStartFailure(context: BackendStartFailureContext): boolean {
-  return !context.attemptedRemote
+  return (
+    !context.attemptedRemote
+    && !(context.error instanceof BackendStartInterruptedByUpdateError)
+  )
 }
 
 export interface RemoteReauthFailureContext {

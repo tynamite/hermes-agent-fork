@@ -292,10 +292,11 @@ class TestDrainStateMachine:
 
         runner, _ = _drain_runner()
         runner._running_agents = {}
-        lifecycle_task = MagicMock()
-        lifecycle_task.done.return_value = False
-        runner._background_tasks = {lifecycle_task}
-        runner._supervised_tasks = {lifecycle_task}
+        heartbeat_task = MagicMock()
+        heartbeat_task.done.return_value = False
+        runner._loop_heartbeat_task = heartbeat_task
+        runner._background_tasks = {heartbeat_task}
+        runner._supervised_tasks = {heartbeat_task}
         monkeypatch.setattr(tools.async_delegation, "active_count", lambda: 0)
         monkeypatch.setattr(
             tools.process_registry.process_registry,
@@ -313,6 +314,42 @@ class TestDrainStateMachine:
         finite_task = MagicMock()
         finite_task.done.return_value = False
         runner._background_tasks.add(finite_task)
+
+        assert runner._active_work_count() == 1
+
+    @pytest.mark.parametrize(
+        "registry_name",
+        (
+            "_deferred_agent_cleanup_tasks",
+            "_fatal_handler_tasks",
+        ),
+    )
+    def test_active_work_count_includes_detached_owned_registries(
+        self,
+        monkeypatch,
+        registry_name,
+    ):
+        import tools.async_delegation
+        import tools.process_registry
+
+        runner, _ = _drain_runner()
+        runner._running_agents = {}
+        runner._background_tasks = set()
+        runner._supervised_tasks = set()
+        detached_task = MagicMock()
+        detached_task.done.return_value = False
+        setattr(runner, registry_name, {detached_task})
+        monkeypatch.setattr(tools.async_delegation, "active_count", lambda: 0)
+        monkeypatch.setattr(
+            tools.process_registry.process_registry,
+            "has_any_active",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            tools.process_registry.process_registry,
+            "pending_watchers",
+            set(),
+        )
 
         assert runner._active_work_count() == 1
 

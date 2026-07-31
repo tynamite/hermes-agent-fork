@@ -49,7 +49,11 @@ import {
   verifyHermesCli
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
+import {
+  BackendStartInterruptedByUpdateError,
+  shouldLatchBackendStartFailure,
+  shouldLatchRemoteReauthFailure
+} from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
@@ -8481,7 +8485,7 @@ async function startHermes() {
     // Runtime resolution and boot-progress updates may yield after the startup
     // gate. Recheck the in-process owner immediately before creating the child.
     if (updateInFlight) {
-      throw new Error('Hermes update started while resolving the primary backend')
+      throw new BackendStartInterruptedByUpdateError()
     }
 
     const hermesProcess = spawn(
@@ -8658,7 +8662,7 @@ async function startHermes() {
     // child 'exit' handler to clear the cache — latching it would wedge the app
     // on "session expired" until a full restart, defeating reconnect, the
     // "Sign out & sign in" reload, and the wake-recovery revalidate path.
-    if (shouldLatchBackendStartFailure({ attemptedRemote })) {
+    if (shouldLatchBackendStartFailure({ attemptedRemote, error })) {
       backendStartFailure = error instanceof Error ? error : new Error(message)
     }
 
