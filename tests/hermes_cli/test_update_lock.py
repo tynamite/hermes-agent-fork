@@ -45,6 +45,36 @@ def test_windows_pid_above_dword_range_is_not_probed(monkeypatch):
     assert update_lock._pid_alive(0x1_0000_0000) is False
 
 
+@pytest.mark.parametrize(
+    ("wait_result", "expected"),
+    [
+        (0x00000102, True),   # WAIT_TIMEOUT: still running
+        (0x00000000, False),  # WAIT_OBJECT_0: exited
+        (0xFFFFFFFF, False),  # WAIT_FAILED: cannot attest liveness
+    ],
+)
+def test_windows_pid_liveness_requires_unsignaled_process(
+    monkeypatch,
+    wait_result,
+    expected,
+):
+    import ctypes
+
+    from hermes_cli import update_lock
+
+    kernel32 = Mock()
+    kernel32.OpenProcess = Mock(return_value=123)
+    kernel32.WaitForSingleObject = Mock(return_value=wait_result)
+    kernel32.CloseHandle = Mock(return_value=True)
+    monkeypatch.setattr(ctypes, "WinDLL", Mock(return_value=kernel32), raising=False)
+    monkeypatch.setattr(update_lock.os, "name", "nt")
+
+    assert update_lock._pid_alive(4321) is expected
+    kernel32.OpenProcess.assert_called_once_with(0x101000, False, 4321)
+    kernel32.WaitForSingleObject.assert_called_once_with(123, 0)
+    kernel32.CloseHandle.assert_called_once_with(123)
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires procfs")
 def test_zombie_owner_is_reclaimed_immediately(marker):
     """A defunct updater must not block every entrypoint until marker expiry."""

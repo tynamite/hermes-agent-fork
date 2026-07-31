@@ -157,16 +157,27 @@ def _pid_alive(pid: int) -> bool:
                 wintypes.DWORD,
             )
             kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = (
+                wintypes.HANDLE,
+                wintypes.DWORD,
+            )
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
             kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
             kernel32.CloseHandle.restype = wintypes.BOOL
             process = kernel32.OpenProcess(
-                0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
+                0x1000 | 0x100000,  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
                 False,
                 pid,
             )
             if process:
-                kernel32.CloseHandle(process)
-                return True
+                try:
+                    # A successfully opened process object can already be
+                    # signaled (exited) while another handle keeps it alive.
+                    # WAIT_TIMEOUT is the only result that proves execution is
+                    # still in progress.
+                    return kernel32.WaitForSingleObject(process, 0) == 0x00000102
+                finally:
+                    kernel32.CloseHandle(process)
             return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED => alive
         except (AttributeError, OSError, OverflowError):
             return False
