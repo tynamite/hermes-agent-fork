@@ -18,10 +18,11 @@ once — so a dashboard-spawned ``hermes update`` and an installer-driven
 under a live interpreter and leaving the tree half-updated.
 
 This module makes that same marker the single lock for **all** update
-entrypoints instead of adding a fourth mechanism. Format and location are
-unchanged and remain byte-compatible with the Rust and Electron readers:
+entrypoints instead of adding a fourth mechanism. Its wire format remains
+backward-compatible with the Rust and Electron readers:
 
-    <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
+    <HERMES_ROOT>/.hermes-update-in-progress
+        body: "<pid>\\n<started_at_unix>[\\nruntime-restarts]"
 
 A marker only counts as a live update when its pid is alive AND it is younger
 than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
@@ -85,40 +86,64 @@ UPDATE_EXIT_CONCURRENT = 2
 def update_marker_path() -> Path:
     """Path of the shared update marker.
 
-    Uses the *process* Hermes home (never the context-local profile override):
-    the Rust updater resolves ``$HERMES_HOME`` or the platform default, and the
-    desktop pins that same value into the updater's env. A profile-scoped path
-    here would put the lock somewhere the other two owners never look.
+    Uses the install-wide Hermes root so every named profile sharing one
+    checkout/venv observes the same update boundary. The Rust updater and
+    desktop resolve this root too; a profile-local marker would let another
+    profile launch into the same installation during mutation.
     """
-    from hermes_constants import get_process_hermes_home
+    from hermes_constants import get_default_hermes_root
 
-    return get_process_hermes_home() / MARKER_NAME
+    return get_default_hermes_root() / MARKER_NAME
 
 
 def _pid_alive(pid: int) -> bool:
     """True when a process with ``pid`` currently exists.
 
-    Delegates to :func:`gateway.status._pid_exists`, the project's existing
-    no-kill probe. Do NOT hand-roll this with ``os.kill(pid, 0)``: on Windows
-    that is not a no-op — CPython routes ``sig=0`` to
-    ``GenerateConsoleCtrlEvent``, which Ctrl+C's the target's whole console
-    process group (bpo-14484). A liveness check that killed the updater it was
-    asking about would be a spectacular way to fix a concurrency bug.
-
-    Any pid we cannot evaluate counts as dead: a corrupt marker must not wedge
-    the lock forever.
+    This must remain stdlib-only because the launch gate calls it from
+    :mod:`hermes_bootstrap`, before interrupted-install recovery can repair
+    third-party packages. POSIX ``kill(pid, 0)`` is a non-signalling probe.
+    Windows must use ``OpenProcess`` instead: CPython's ``os.kill(pid, 0)``
+    routes to ``GenerateConsoleCtrlEvent`` there and can interrupt the updater
+    it is meant to inspect (bpo-14484).
     """
     if pid <= 0:
         return False
-    try:
-        from gateway.status import _pid_exists
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
 
-        return bool(_pid_exists(pid))
-    except Exception as exc:
-        # Import failure or an unusable pid (e.g. larger than the platform's
-        # pid_t). Treat the marker as stale rather than blocking updates.
-        logger.debug("Could not probe pid %s: %s", pid, exc)
+            kernel32 = ctypes.WinDLL(  # type: ignore[attr-defined]
+                "kernel32", use_last_error=True
+            )
+            kernel32.OpenProcess.argtypes = (
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            )
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            process = kernel32.OpenProcess(
+                0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
+                False,
+                pid,
+            )
+            if process:
+                kernel32.CloseHandle(process)
+                return True
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED => alive
+        except (AttributeError, OSError, OverflowError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
 
 
 def _handoff_pid() -> int | None:
@@ -166,6 +191,7 @@ class UpdateHolder:
 
     pid: int
     age_seconds: float
+    runtime_restarts_authorized: bool = False
 
 
 def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
@@ -200,7 +226,14 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
             pass
         return None
 
-    return UpdateHolder(pid=pid, age_seconds=age)
+    runtime_restarts_authorized = (
+        len(lines) > 2 and lines[2].strip() == "runtime-restarts"
+    )
+    return UpdateHolder(
+        pid=pid,
+        age_seconds=age,
+        runtime_restarts_authorized=runtime_restarts_authorized,
+    )
 
 
 def describe_holder(holder: UpdateHolder) -> str:
@@ -231,6 +264,7 @@ class UpdateLock:
         self.path = path or update_marker_path()
         self.acquired = False
         self.holder: UpdateHolder | None = None
+        self._claim_pid: int | None = None
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -245,6 +279,14 @@ class UpdateLock:
         existing = read_live_update(path=self.path)
         if existing is not None:
             if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                self.holder = existing
+                self._claim_pid = existing.pid
+                # A previous child stage may have crashed during the narrow
+                # restart phase. Close that phase before this retry performs
+                # any new mutation under the parent's still-live claim.
+                if not self.deauthorize_runtime_restarts():
+                    self._claim_pid = None
+                    return False
                 return True
             self.holder = existing
             return False
@@ -260,26 +302,73 @@ class UpdateLock:
             logger.debug("Could not write update marker %s: %s", self.path, exc)
             return True
         self.acquired = True
+        self._claim_pid = os.getpid()
         return True
+
+    def _set_runtime_restarts_authorized(self, authorized: bool) -> bool:
+        """Compare-and-rewrite our live claim's restart phase."""
+        if self._claim_pid is None:
+            # Marker creation is best-effort. If no claim exists, there is no
+            # launch gate to bypass.
+            return True
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+            lines = raw.splitlines()
+            owner = int(lines[0].strip())
+            started_at = lines[1].strip()
+        except (OSError, IndexError, ValueError):
+            return False
+        if owner != self._claim_pid:
+            return False
+        body = f"{owner}\n{started_at}\n"
+        if authorized:
+            body += "runtime-restarts\n"
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary.write_text(body, encoding="utf-8")
+            os.replace(temporary, self.path)
+        except OSError:
+            return False
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return True
+
+    def authorize_runtime_restarts(self) -> bool:
+        """Allow only managed runtime entrypoints after mutation completes."""
+        return self._set_runtime_restarts_authorized(True)
+
+    def deauthorize_runtime_restarts(self) -> bool:
+        """Close the restart phase while preserving an orchestrator's claim."""
+        return self._set_runtime_restarts_authorized(False)
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""
         if not self.acquired:
+            self.deauthorize_runtime_restarts()
+            self._claim_pid = None
             return
         self.acquired = False
         try:
             raw = self.path.read_text(encoding="utf-8")
             owner = int(raw.splitlines()[0].strip())
         except (OSError, IndexError, ValueError):
+            self._claim_pid = None
             return
         if owner != os.getpid():
             # A handoff partner took ownership (e.g. the Tauri updater wrote
             # its own pid). Leave it alone — it's still a live update.
+            self._claim_pid = None
             return
         try:
             self.path.unlink()
         except OSError:
             pass
+        self._claim_pid = None
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

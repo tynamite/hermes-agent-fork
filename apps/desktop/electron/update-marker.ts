@@ -3,8 +3,9 @@
  *
  * The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
  * duration of an `--update` run (see apps/bootstrap-installer/src-tauri/src/
- * update.rs `UpdateMarkerGuard`). The marker body is two lines: the updater's
- * pid and the unix-seconds it started.
+ * update.rs `UpdateMarkerGuard`). The marker starts with the updater's pid and
+ * unix start time. Python may append a third `runtime-restarts` phase line;
+ * this reader intentionally ignores additional lines.
  *
  * Why: if the user relaunches the desktop mid-update — the window vanished with
  * no progress and looks crashed — a fresh instance must NOT spawn its own local

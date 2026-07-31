@@ -36,7 +36,7 @@ import time as _time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
@@ -4022,7 +4022,12 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
-def _cmd_update_impl(args, gateway_mode: bool):
+def _cmd_update_impl(
+    args,
+    gateway_mode: bool,
+    *,
+    authorize_runtime_restarts: Callable[[], bool] | None = None,
+):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
     # In gateway mode, use file-based IPC for prompts instead of stdin
@@ -5372,6 +5377,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _exit_code_path.write_text("0", encoding="utf-8")
             except OSError:
                 pass
+
+        if (
+            authorize_runtime_restarts is not None
+            and not authorize_runtime_restarts()
+        ):
+            print(
+                "✗ Could not authorize post-update runtime restarts; "
+                "leaving existing processes untouched."
+            )
+            sys.exit(1)
 
         gateway_fleet_restart_incomplete = False
 

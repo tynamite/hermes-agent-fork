@@ -17,7 +17,10 @@ disk.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -35,7 +38,7 @@ from hermes_cli.update_lock import (
 
 
 def test_non_update_cli_launch_is_blocked_by_live_update(monkeypatch, capsys):
-    from hermes_cli import main as cli_main
+    import hermes_bootstrap
 
     holder = UpdateHolder(pid=4321, age_seconds=3)
     monkeypatch.setattr(
@@ -44,23 +47,198 @@ def test_non_update_cli_launch_is_blocked_by_live_update(monkeypatch, capsys):
     )
 
     with pytest.raises(SystemExit) as exc:
-        cli_main._refuse_cli_launch_during_update(["chat"])
+        hermes_bootstrap.enforce_update_launch_gate(
+            ["chat"], entrypoint="cli"
+        )
 
     assert exc.value.code == UPDATE_EXIT_CONCURRENT
     assert "Another Hermes update is already running" in capsys.readouterr().out
 
 
-def test_update_cli_launch_reaches_authoritative_lock(monkeypatch):
-    from hermes_cli import main as cli_main
+def test_update_cli_without_holder_reaches_authoritative_lock(monkeypatch):
+    import hermes_bootstrap
 
-    read = Mock(side_effect=AssertionError("must not pre-read update lock"))
+    read = Mock(return_value=None)
     monkeypatch.setattr("hermes_cli.update_lock.read_live_update", read)
 
-    cli_main._refuse_cli_launch_during_update(
-        ["--profile", "work", "update", "--yes"]
+    hermes_bootstrap.enforce_update_launch_gate(
+        ["--profile", "work", "update", "--yes"],
+        entrypoint="cli",
     )
 
-    read.assert_not_called()
+    read.assert_called_once_with()
+
+
+def test_foreign_update_is_blocked_before_recovery(monkeypatch):
+    import hermes_bootstrap
+
+    monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(
+            ["update", "--yes"], entrypoint="cli"
+        )
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
+
+
+def test_verified_update_handoff_passes_bootstrap_gate(monkeypatch):
+    import hermes_bootstrap
+
+    monkeypatch.setenv(HANDOFF_PID_ENV, "4321")
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+
+    hermes_bootstrap.enforce_update_launch_gate(
+        ["update", "--yes"], entrypoint="cli"
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gateway"],
+        ["gateway", "run"],
+        ["dashboard", "--no-open"],
+        ["serve"],
+    ],
+)
+def test_authorized_runtime_restart_passes_launch_gate(
+    monkeypatch, argv
+):
+    import hermes_bootstrap
+
+    holder = UpdateHolder(
+        pid=4321,
+        age_seconds=3,
+        runtime_restarts_authorized=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: holder,
+    )
+
+    hermes_bootstrap.enforce_update_launch_gate(
+        argv, entrypoint="cli"
+    )
+
+
+def test_restart_phase_does_not_admit_general_cli(monkeypatch):
+    import hermes_bootstrap
+
+    holder = UpdateHolder(
+        pid=4321,
+        age_seconds=3,
+        runtime_restarts_authorized=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: holder,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(
+            ["chat"], entrypoint="cli"
+        )
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["dashboard", "--status"],
+        ["serve", "--stop"],
+        ["dashboard", "register"],
+    ],
+)
+def test_restart_phase_does_not_admit_runtime_management(
+    monkeypatch, argv
+):
+    import hermes_bootstrap
+
+    holder = UpdateHolder(
+        pid=4321,
+        age_seconds=3,
+        runtime_restarts_authorized=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: holder,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(
+            argv, entrypoint="cli"
+        )
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["other", "agent", "acp"],
+)
+def test_restart_phase_does_not_admit_sibling_entrypoints(
+    monkeypatch, entrypoint
+):
+    import hermes_bootstrap
+
+    holder = UpdateHolder(
+        pid=4321,
+        age_seconds=3,
+        runtime_restarts_authorized=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: holder,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(
+            ["update"], entrypoint=entrypoint
+        )
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "hermes_cli.main",
+        "run_agent",
+        "acp_adapter.entry",
+    ],
+)
+def test_fresh_entrypoint_import_is_blocked_in_bootstrap(
+    tmp_path, module
+):
+    marker = tmp_path / ".hermes-update-in-progress"
+    marker.write_text(
+        f"{os.getpid()}\n{int(time.time())}\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == UPDATE_EXIT_CONCURRENT
+    assert "Another Hermes update is already running" in result.stdout
+
 
 # A pid no live process owns. os.kill(pid, 0) must report it dead so a crashed
 # updater can never wedge every future update. Deliberately larger than any
@@ -73,14 +251,29 @@ def marker(tmp_path):
     return tmp_path / ".hermes-update-in-progress"
 
 
-def test_marker_path_follows_process_hermes_home(tmp_path, monkeypatch):
-    """The lock must land where the Rust updater and Electron gate look.
+def test_marker_path_is_shared_across_profiles(tmp_path, monkeypatch):
+    """Named profiles sharing one install must observe the same lock."""
+    root = tmp_path / "hermes-root"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    assert update_marker_path() == root / ".hermes-update-in-progress"
 
-    All three resolve the *process* HERMES_HOME; a profile-scoped path would
-    put the lock somewhere the other two owners never read.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    assert update_marker_path() == tmp_path / ".hermes-update-in-progress"
+
+def test_runtime_restart_phase_is_live_claim_metadata(marker):
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+
+    assert lock.authorize_runtime_restarts() is True
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.runtime_restarts_authorized is True
+
+    assert lock.deauthorize_runtime_restarts() is True
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.runtime_restarts_authorized is False
+    lock.release()
 
 
 def test_acquire_writes_pid_and_start_time(marker):
@@ -221,16 +414,29 @@ class TestHandoffFromOrchestratingUpdater:
 
     def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch):
         # Stand in for the parent updater with our own (live) pid.
-        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_text(
+            f"{os.getpid()}\n{int(time.time())}\nruntime-restarts\n",
+            encoding="utf-8",
+        )
         monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True
         assert lock.acquired is False, "the parent's claim is not ours to own"
+        assert read_live_update(
+            path=marker
+        ).runtime_restarts_authorized is False
+        assert lock.authorize_runtime_restarts() is True
+        assert read_live_update(
+            path=marker
+        ).runtime_restarts_authorized is True
 
         lock.release()
         assert marker.exists(), "the parent still needs its marker after our stage ends"
         assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+        assert read_live_update(
+            path=marker
+        ).runtime_restarts_authorized is False
 
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(self, marker, monkeypatch):
         """The env var alone must not bypass the lock."""

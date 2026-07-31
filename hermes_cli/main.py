@@ -9113,7 +9113,13 @@ def cmd_update(args):
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
     try:
-        _cmd_update_impl(args, gateway_mode=gateway_mode)
+        _cmd_update_impl(
+            args,
+            gateway_mode=gateway_mode,
+            authorize_runtime_restarts=(
+                _update_lock.authorize_runtime_restarts
+            ),
+        )
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
@@ -10650,66 +10656,6 @@ def _plugin_cli_discovery_needed() -> bool:
     return True
 
 
-def _raw_cli_invokes_update(argv: list[str]) -> bool:
-    """Return whether raw CLI arguments select the update subcommand."""
-    value_flags = {
-        "-c",
-        "--continue",
-        "-m",
-        "--model",
-        "--profile",
-        "-p",
-        "--provider",
-        "-r",
-        "--resume",
-        "-s",
-        "--skills",
-        "-t",
-        "--toolsets",
-        "--usage-file",
-        "-z",
-        "--oneshot",
-    }
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token == "--":
-            return i + 1 < len(argv) and argv[i + 1] == "update"
-        if token.startswith("-"):
-            if "=" not in token and token in value_flags and i + 1 < len(argv):
-                i += 2
-            else:
-                i += 1
-            continue
-        return token == "update"
-    return False
-
-
-def _refuse_cli_launch_during_update(argv: list[str] | None = None) -> None:
-    """Block new Hermes runtimes while another process mutates the install."""
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if _raw_cli_invokes_update(raw_argv):
-        # The update command performs the authoritative lock acquisition,
-        # including the desktop updater's parent-to-child handoff.
-        return
-    try:
-        from hermes_cli.update_lock import (
-            UPDATE_EXIT_CONCURRENT,
-            describe_holder,
-            read_live_update,
-        )
-
-        holder = read_live_update()
-    except Exception:
-        # Match UpdateLock's existing best-effort contract: an unreadable
-        # marker must not wedge every Hermes command.
-        return
-    if holder is None:
-        return
-    print(describe_holder(holder))
-    sys.exit(UPDATE_EXIT_CONCURRENT)
-
-
 def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
     """Materialize the deferred platform whose top-level CLI command matches.
 
@@ -11180,12 +11126,6 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
-    # The shared update lock previously serialized only updater processes.
-    # Refuse every other Hermes launch while it is live so no new venv-backed
-    # runtime can enter after the updater's holder snapshot and survive a
-    # checkout/dependency rewrite.
-    _refuse_cli_launch_during_update()
-
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()

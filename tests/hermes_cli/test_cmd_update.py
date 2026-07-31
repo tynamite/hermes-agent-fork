@@ -568,7 +568,12 @@ class TestCmdUpdateBranchFallback:
             "hermes_cli.gateway._prepare_profile_gateway_update_restart",
             return_value="external-supervisor",
         )
-        with patch("psutil.Process") as psutil_process, patch.object(
+        with patch(
+            "hermes_cli.update_lock.UpdateLock.authorize_runtime_restarts",
+            return_value=True,
+        ) as authorize_restarts, patch(
+            "psutil.Process"
+        ) as psutil_process, patch.object(
             hm,
             "_is_windows",
             return_value=False,
@@ -601,6 +606,7 @@ class TestCmdUpdateBranchFallback:
             cmd_update(mock_args)
 
         prepare_mock.assert_called_with("default", 555)
+        authorize_restarts.assert_called_once_with()
 
 
 class TestCmdUpdateMigrationPrompt:
