@@ -161,6 +161,10 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import {
+  createPosixBackendRestartLatch,
+  type PosixBackendRestartLatch
+} from './posix-update-restart'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
@@ -2885,7 +2889,7 @@ async function applyUpdates(opts = {}) {
   }
 
   updateInFlight = true
-  let restartPosixBackends = false
+  const posixBackendRestart = createPosixBackendRestartLatch()
 
   try {
     const updater = resolveUpdaterBinary()
@@ -2897,11 +2901,10 @@ async function applyUpdates(opts = {}) {
       // whole update itself: `hermes update` (backend) + `hermes desktop
       // --build-only` (OS-aware GUI rebuild), then swap the running .app bundle
       // with the freshly built one and relaunch.
-      restartPosixBackends = true
-      const result = await applyUpdatesPosixInApp(opts)
+      const result = await applyUpdatesPosixInApp(opts, posixBackendRestart)
 
       if (result?.handedOff) {
-        restartPosixBackends = false
+        posixBackendRestart.suppressRestart()
       }
 
       return result
@@ -3061,7 +3064,7 @@ async function applyUpdates(opts = {}) {
   } finally {
     updateInFlight = false
 
-    if (restartPosixBackends) {
+    if (posixBackendRestart.shouldRestart()) {
       void startHermes().catch(error => {
         rememberLog(`[updates] failed to restart desktop backend after POSIX update: ${error?.message || error}`)
       })
@@ -3296,7 +3299,10 @@ function shellQuote(value) {
 // (`hermes desktop --build-only`), then atomically swap the running .app bundle
 // with the freshly built one and relaunch. Degrades to "backend updated,
 // restart to load the new GUI" if the swap can't be performed.
-async function applyUpdatesPosixInApp(opts: any) {
+async function applyUpdatesPosixInApp(
+  opts: any,
+  backendRestart: PosixBackendRestartLatch
+) {
   const updateRoot = resolveUpdateRoot()
   const hermes = resolveHermesCliBinary(updateRoot)
 
@@ -3314,7 +3320,7 @@ async function applyUpdatesPosixInApp(opts: any) {
   // this desktop owns before invoking the shared updater. Detached descendants
   // are intentionally not exempted: the updater's holder guard will fail
   // closed if any survive this bounded teardown.
-  await quiesceDesktopBackendsForPosixUpdate()
+  await backendRestart.quiesce(quiesceDesktopBackendsForPosixUpdate)
 
   // Put the Hermes-managed Node and the venv on PATH so `hermes desktop`'s
   // npm build can find them on a machine with no system Node. Windows portable
