@@ -1146,6 +1146,74 @@ def test_finish_posix_quiesce_retains_drain_for_live_old_gateway(
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
+def test_mutation_guard_retains_drain_on_early_exit_until_finish(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": set(),
+        "process_start_times": {},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    cli_main._mark_posix_gateway_mutation(token)
+    cli_main._release_posix_gateway_quiesce_at_exit(token)
+
+    assert token["mutation_started"] is True
+    assert token["retain_on_exit"] is True
+    assert drain_request_path(profile_home).exists()
+
+    assert cli_main._finish_posix_gateway_quiesce(token) == set()
+    assert token["retain_on_exit"] is False
+    assert not drain_request_path(profile_home).exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_proven_noop_disarms_mutation_exit_guard(_winp, tmp_path):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": set(),
+        "process_start_times": {},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    cli_main._begin_posix_gateway_mutation(token)
+    cli_main._complete_posix_gateway_mutation(token, mutated=False)
+    cli_main._release_posix_gateway_quiesce_at_exit(token)
+
+    assert token["retain_on_exit"] is False
+    assert not drain_request_path(profile_home).exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
 def test_finish_posix_quiesce_releases_drain_after_pid_reuse(
     _winp, tmp_path
 ):
@@ -1176,4 +1244,5 @@ def test_finish_posix_quiesce_releases_drain_after_pid_reuse(
         surviving = cli_main._finish_posix_gateway_quiesce(token)
 
     assert surviving == set()
+    assert token["retain_on_exit"] is False
     assert not drain_request_path(profile_home).exists()

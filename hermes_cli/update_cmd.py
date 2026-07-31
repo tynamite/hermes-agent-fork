@@ -3455,6 +3455,34 @@ def _release_posix_gateway_quiesce_at_exit(token: dict | None) -> None:
         return
     _m()._release_posix_gateway_quiesce(token)
 
+
+def _begin_posix_gateway_mutation(token: dict | None) -> None:
+    """Fail closed if an operation exits before reporting whether it mutated."""
+    if token:
+        token["retain_on_exit"] = True
+
+
+def _complete_posix_gateway_mutation(
+    token: dict | None,
+    *,
+    mutated: bool,
+) -> None:
+    """Record a completed mutation probe and disarm a proven no-op."""
+    if not token:
+        return
+    if mutated:
+        token["mutation_started"] = True
+        token["retain_on_exit"] = True
+    elif not token.get("mutation_started"):
+        token["retain_on_exit"] = False
+
+
+def _mark_posix_gateway_mutation(token: dict | None) -> None:
+    """Mark the update boundary as mutating before an irreversible operation."""
+    _m()._begin_posix_gateway_mutation(token)
+    _m()._complete_posix_gateway_mutation(token, mutated=True)
+
+
 def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
     """Release drains only after every original gateway identity is gone."""
     if not token:
@@ -3487,8 +3515,7 @@ def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
                 continue
             surviving.add(pid)
 
-    if surviving:
-        token["retain_on_exit"] = True
+    token["retain_on_exit"] = bool(surviving)
     _m()._release_posix_gateway_quiesce(
         token,
         retain_pids=surviving,
@@ -4272,6 +4299,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the same thing — get HEAD onto the requested branch first, then
         # fast-forward.
         if current_branch != branch:
+            _m()._mark_posix_gateway_mutation(_posix_gateway_quiesce)
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
@@ -4336,7 +4364,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             # Even if origin is up to date, the fork may be behind upstream
             if is_fork and branch == "main":
+                pre_sync_sha = _capture_head_sha(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                )
+                _m()._begin_posix_gateway_mutation(
+                    _posix_gateway_quiesce
+                )
                 _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+                post_sync_sha = _capture_head_sha(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                )
+                _m()._complete_posix_gateway_mutation(
+                    _posix_gateway_quiesce,
+                    mutated=pre_sync_sha != post_sync_sha,
+                )
 
             # Restore stash and switch back to original branch if we moved
             if auto_stash_ref is not None:
@@ -4363,11 +4406,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
             runtime_repairs = []
+            _m()._begin_posix_gateway_mutation(_posix_gateway_quiesce)
             update_managed_uv(repair_observer=runtime_repairs.append)
             ensure_uv(repair_observer=runtime_repairs.append)
             runtime_repaired = next(
                 (result for result in runtime_repairs if result.repaired),
                 None,
+            )
+            _m()._complete_posix_gateway_mutation(
+                _posix_gateway_quiesce,
+                mutated=runtime_repaired is not None,
             )
 
             # A current checkout does NOT imply a healthy install: a previous
@@ -4379,6 +4427,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
             if not healthy:
+                _m()._mark_posix_gateway_mutation(
+                    _posix_gateway_quiesce
+                )
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
@@ -4429,6 +4480,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "long-lived processes still use the previous runtime."
                 )
                 print("  Restart each of them to pick up the repaired runtime.")
+            if (
+                _posix_gateway_quiesce
+                and _posix_gateway_quiesce.get("mutation_started")
+            ):
+                surviving = _m()._finish_posix_gateway_quiesce(
+                    _posix_gateway_quiesce
+                )
+                if surviving:
+                    print()
+                    print(
+                        "  ⚠ Update drain retained for gateway PID(s) still "
+                        "running the previous version: "
+                        + ", ".join(str(pid) for pid in sorted(surviving))
+                    )
+                    print(
+                        "    Restart those gateways before cancelling their "
+                        "update drain."
+                    )
+            else:
+                _m()._release_posix_gateway_quiesce(
+                    _posix_gateway_quiesce
+                )
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
@@ -4442,6 +4515,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        _m()._mark_posix_gateway_mutation(_posix_gateway_quiesce)
         try:
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
