@@ -5900,6 +5900,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Long-lived lifecycle watchers are retained in ``_background_tasks``
+        # too, but they do not represent user work that must drain before an
+        # update.  Keep their handles separate so the persisted active-work
+        # count can exclude them without weakening shutdown ownership.
+        self._supervised_tasks: set = set()
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -7060,9 +7065,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Probe failures also return one: update quiescence must not attest idle
         when delegation or process-registry liveness is unreadable.
         """
+        supervised_tasks = getattr(self, "_supervised_tasks", ())
         if any(
             not task.done()
             for task in getattr(self, "_background_tasks", ())
+            if task not in supervised_tasks
         ):
             return 1
         try:
@@ -11179,6 +11186,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(self, "_background_tasks", None) is None:
             self._background_tasks = set()
+        if getattr(self, "_supervised_tasks", None) is None:
+            self._supervised_tasks = set()
 
         # Monotonic spawn timestamp captured per spawn: the ``_done`` callback
         # uses it to distinguish a rapid crash-loop from a healthy-run-then-crash.
@@ -11188,6 +11197,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # create_task with a signature that rejects the name kwarg.
         task = asyncio.create_task(coro_factory())
         self._background_tasks.add(task)
+        self._supervised_tasks.add(task)
         if on_spawn is not None:
             # Record the live handle NOW so an external tracker (e.g.
             # _reconnect_watcher_task) always points at the current task, not a
@@ -11199,6 +11209,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def _done(t):
             self._background_tasks.discard(t)
+            self._supervised_tasks.discard(t)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -11242,7 +11253,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 respawn_task = asyncio.create_task(_respawn())
                 self._background_tasks.add(respawn_task)
-                respawn_task.add_done_callback(self._background_tasks.discard)
+                self._supervised_tasks.add(respawn_task)
+
+                def _discard_respawn(t):
+                    self._background_tasks.discard(t)
+                    self._supervised_tasks.discard(t)
+
+                respawn_task.add_done_callback(_discard_respawn)
 
         task.add_done_callback(_done)
         return task
@@ -12304,6 +12321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+            self._supervised_tasks.clear()
 
             self.adapters.clear()
             for _session_key in list(self._running_agents):

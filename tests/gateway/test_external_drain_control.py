@@ -283,6 +283,39 @@ class TestDrainStateMachine:
 
         assert runner._active_work_count() == 1
 
+    def test_active_work_count_excludes_supervised_lifecycle_tasks(
+        self,
+        monkeypatch,
+    ):
+        import tools.async_delegation
+        import tools.process_registry
+
+        runner, _ = _drain_runner()
+        runner._running_agents = {}
+        lifecycle_task = MagicMock()
+        lifecycle_task.done.return_value = False
+        runner._background_tasks = {lifecycle_task}
+        runner._supervised_tasks = {lifecycle_task}
+        monkeypatch.setattr(tools.async_delegation, "active_count", lambda: 0)
+        monkeypatch.setattr(
+            tools.process_registry.process_registry,
+            "has_any_active",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            tools.process_registry.process_registry,
+            "pending_watchers",
+            set(),
+        )
+
+        assert runner._active_work_count() == 0
+
+        finite_task = MagicMock()
+        finite_task.done.return_value = False
+        runner._background_tasks.add(finite_task)
+
+        assert runner._active_work_count() == 1
+
     def test_active_work_count_fails_closed_when_background_probe_raises(
         self,
         monkeypatch,
