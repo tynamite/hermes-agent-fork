@@ -3,7 +3,7 @@
 import hashlib
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -1173,6 +1173,67 @@ termux = ["rich>=14"]
 class TestNodeRuntimeNpmResolution:
     """Regression tests for #30271 — WSL must not run Windows npm against the
     Linux checkout, and a failed Node refresh must not report success."""
+
+    def test_direct_update_attests_its_desktop_rebuild_child(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import update_cmd
+        from hermes_cli.update_lock import HANDOFF_PID_ENV, UpdateHolder
+
+        env = {}
+        monkeypatch.setattr(update_cmd.os, "getpid", lambda: 4321)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4321, age_seconds=3),
+        )
+
+        assert update_cmd._prepare_desktop_build_handoff(env) is False
+        assert env[HANDOFF_PID_ENV] == "4321"
+
+    def test_tauri_update_defers_duplicate_desktop_rebuild(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import update_cmd
+        from hermes_cli.update_lock import UpdateHolder
+
+        env = {}
+        monkeypatch.setattr(update_cmd.os, "getpid", lambda: 9000)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4321, age_seconds=3),
+        )
+        verified = Mock(return_value=True)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.is_verified_handoff",
+            verified,
+        )
+
+        assert update_cmd._prepare_desktop_build_handoff(env) is True
+        assert env == {}
+        verified.assert_called_once_with(4321)
+
+    def test_foreign_update_cannot_delegate_desktop_rebuild(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import update_cmd
+        from hermes_cli.update_lock import UpdateHolder
+
+        env = {}
+        monkeypatch.setattr(update_cmd.os, "getpid", lambda: 9000)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4321, age_seconds=3),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.is_verified_handoff",
+            lambda _pid: False,
+        )
+
+        assert update_cmd._prepare_desktop_build_handoff(env) is False
+        assert env == {}
 
 
 

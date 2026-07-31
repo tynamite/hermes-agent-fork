@@ -3515,6 +3515,35 @@ def _complete_posix_gateway_noop(token: dict | None) -> None:
     token["retain_on_exit"] = False
 
 
+def _prepare_desktop_build_handoff(env: dict[str, str]) -> bool:
+    """Authorize our exact rebuild child, or defer it to the Tauri owner.
+
+    Returns True when a verified parent orchestrator owns the marker and will
+    perform its own rebuild stage. A direct CLI updater instead owns the
+    marker itself, so its PID is added to the child environment for the
+    bootstrap gate's existing owner/child verification.
+    """
+    try:
+        from hermes_cli.update_lock import (
+            HANDOFF_PID_ENV,
+            is_verified_handoff,
+            read_live_update,
+        )
+
+        holder = read_live_update()
+        if holder is None:
+            return False
+        current_pid = os.getpid()
+        if holder.pid == current_pid:
+            env[HANDOFF_PID_ENV] = str(current_pid)
+            return False
+        return is_verified_handoff(holder.pid)
+    except Exception:
+        # Marker creation is best-effort. If it is unavailable, the child sees
+        # no live gate either; an unverifiable foreign holder is not delegated.
+        return False
+
+
 def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
     """Release drains only after every original gateway identity is gone."""
     if not token:
@@ -4922,14 +4951,26 @@ def _cmd_update_impl(
             # subprocess would run with source_mode=False — mirror that here.
             # Any error in the pre-check falls through to the subprocess.
             _skip_desktop_build = False
-            try:
-                _skip_desktop_build = not _m()._desktop_build_needed(
-                    desktop_dir, _m().PROJECT_ROOT, source_mode=False
-                )
-            except Exception:
-                _skip_desktop_build = False
+            from hermes_constants import with_hermes_node_path
+
+            _build_env = with_hermes_node_path()
+            _desktop_build_delegated = _prepare_desktop_build_handoff(
+                _build_env
+            )
+            if _desktop_build_delegated:
+                _skip_desktop_build = True
+            else:
+                try:
+                    _skip_desktop_build = not _m()._desktop_build_needed(
+                        desktop_dir, _m().PROJECT_ROOT, source_mode=False
+                    )
+                except Exception:
+                    _skip_desktop_build = False
             if _skip_desktop_build:
-                print("  ✓ Desktop app up to date")
+                if _desktop_build_delegated:
+                    print("  → Desktop rebuild delegated to the app updater")
+                else:
+                    print("  ✓ Desktop app up to date")
             else:
                 _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
                 # Capture the (very loud) Electron/vite build output into
@@ -4944,9 +4985,6 @@ def _cmd_update_impl(
                 # (Desktop → hermes-setup → hermes update), the shell PATH
                 # customizations are lost, so a bare-PATH child would fail with
                 # `node: not found` before cmd_gui can self-heal.
-                from hermes_constants import with_hermes_node_path
-
-                _build_env = with_hermes_node_path()
                 build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
                 if build_result.returncode != 0:
                     build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)

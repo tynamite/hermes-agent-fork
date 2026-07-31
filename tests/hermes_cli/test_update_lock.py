@@ -177,6 +177,23 @@ def test_verified_handoff_passes_exact_desktop_rebuild_stage(monkeypatch):
     )
 
 
+def test_unverified_desktop_rebuild_child_is_blocked(monkeypatch):
+    import hermes_bootstrap
+
+    monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(
+            ["desktop", "--build-only"], entrypoint="cli"
+        )
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
+
+
 @pytest.mark.parametrize(
     "argv",
     [
