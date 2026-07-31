@@ -10,6 +10,8 @@ stack.
 """
 
 
+import threading
+
 import pytest
 
 
@@ -273,6 +275,9 @@ class TestContinuousLoopSimulation:
         monkeypatch.setattr(voice, "_continuous_on_status", None)
         monkeypatch.setattr(voice, "_continuous_on_silent_limit", None)
         monkeypatch.setattr(voice, "_continuous_auto_restart", True, raising=False)
+        monkeypatch.setattr(voice, "_continuous_stopping", False)
+        monkeypatch.setattr(voice, "_continuous_worker", None)
+        monkeypatch.setattr(voice, "_continuous_callbacks_active", 0)
         monkeypatch.setattr(voice, "_voice_busy_probe", None, raising=False)
         monkeypatch.setattr(voice, "_play_beep", lambda *_, **__: None)
 
@@ -315,6 +320,29 @@ class TestContinuousLoopSimulation:
         # Skip real file ops in the silence callback.
         monkeypatch.setattr(voice.os.path, "isfile", lambda _p: False)
         return rec
+
+    def test_update_probe_counts_callback_and_transcription_worker(
+        self,
+        fake_recorder,
+        monkeypatch,
+    ):
+        import hermes_cli.voice as voice
+
+        monkeypatch.setattr(voice, "_continuous_active", False)
+        monkeypatch.setattr(voice, "_continuous_callbacks_active", 1)
+        assert voice.has_active_voice_work() is True
+
+        monkeypatch.setattr(voice, "_continuous_callbacks_active", 0)
+        release = threading.Event()
+        worker = threading.Thread(target=lambda: release.wait(timeout=1))
+        monkeypatch.setattr(voice, "_continuous_worker", worker)
+        worker.start()
+        try:
+            assert voice.has_active_voice_work() is True
+        finally:
+            release.set()
+            worker.join(timeout=1)
+        assert voice.has_active_voice_work() is False
 
     def test_loop_auto_restarts_after_transcript(self, fake_recorder, monkeypatch):
         import hermes_cli.voice as voice
@@ -479,5 +507,3 @@ class TestSpeakTextStreamingDispatch:
         assert voice.speak_text("Hello streaming world") is None
         assert streamed == ["Hello streaming world"]
         assert synced == [], "sync whole-file path must be skipped when streaming"
-
-

@@ -355,6 +355,15 @@ def has_active_tui_work() -> bool:
             or _active_tui_maintenance
         ):
             return True
+    voice_module = sys.modules.get("hermes_cli.voice")
+    if voice_module is not None:
+        try:
+            if voice_module.has_active_voice_work():
+                return True
+        except Exception:
+            # A loaded voice runtime whose state cannot be inspected is not a
+            # safe idle attestation.
+            return True
     with _sessions_lock:
         if any(
             session.get("running")
@@ -1208,9 +1217,19 @@ def close_sessions_for_update() -> None:
         )
         for sid, session in session_items
     ]
+    deadline = time.monotonic() + 1.0
+    voice_module = sys.modules.get("hermes_cli.voice")
+    if voice_module is not None:
+        try:
+            voice_stopped = voice_module.stop_continuous_for_update(
+                timeout=max(deadline - time.monotonic(), 0.0)
+            )
+        except Exception as exc:
+            raise RuntimeError("Could not stop TUI voice work before update") from exc
+        if not voice_stopped:
+            raise RuntimeError("TUI voice work did not stop before update")
     _shutdown_sessions()
     current = threading.current_thread()
-    deadline = time.monotonic() + 1.0
     pollers = []
     for session in sessions:
         poller = session.get("_notif_thread")

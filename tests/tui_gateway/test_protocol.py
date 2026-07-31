@@ -562,6 +562,13 @@ def test_active_tui_work_includes_live_agent_build(server):
     assert server.has_active_tui_work() is False
 
 
+def test_active_tui_work_includes_loaded_voice_runtime(server, monkeypatch):
+    voice = types.SimpleNamespace(has_active_voice_work=lambda: True)
+    monkeypatch.setitem(sys.modules, "hermes_cli.voice", voice)
+
+    assert server.has_active_tui_work() is True
+
+
 def test_update_quiesce_defers_scheduled_agent_build(server, monkeypatch):
     built = threading.Event()
     server._sessions["deferred"] = {}
@@ -733,6 +740,20 @@ def test_close_sessions_for_update_releases_workers(server, monkeypatch):
 
     assert server._sessions == {}
     assert closed == {"agent": 1, "worker": 1, "joined": 1}
+
+
+def test_close_sessions_for_update_stops_voice_runtime(server, monkeypatch):
+    stopped = []
+    voice = types.SimpleNamespace(
+        stop_continuous_for_update=lambda **kwargs: stopped.append(kwargs) or True,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.voice", voice)
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: None)
+
+    server.close_sessions_for_update()
+
+    assert len(stopped) == 1
+    assert 0 <= stopped[0]["timeout"] <= 1.0
 
 
 def test_close_sessions_for_update_rejects_live_poller(server, monkeypatch):

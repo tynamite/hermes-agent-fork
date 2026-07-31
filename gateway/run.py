@@ -5629,6 +5629,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cleanup threads. A cleanup may not appear immediately after a
         # persisted zero and become invisible until the next watcher tick.
         self._update_idle_admission_lock = threading.RLock()
+        # The housekeeping thread is permanent and therefore cannot itself be
+        # counted as active work. Count only the finite phase currently using
+        # the managed runtime; phase admission shares the updater-idle lock so
+        # no phase can start after a strict drain publishes zero.
+        self._active_housekeeping_phases = 0
         self._deferred_agent_cleanup_calls: list[
             tuple[Callable[..., Any], tuple[Any, ...], str]
         ] = []
@@ -6936,12 +6941,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapters but never queued after a travel network outage). Run the real
         work in a detached task that adapter teardown cannot cancel.
         """
-        tasks = getattr(self, "_fatal_handler_tasks", None)
-        if tasks is None:
-            tasks = self._fatal_handler_tasks = set()
-        task = asyncio.create_task(self._handle_adapter_fatal_error_detached(adapter))
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
+        lock = getattr(self, "_update_idle_admission_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._update_idle_admission_lock = lock
+        with lock:
+            if getattr(self, "_external_drain_blocks_internal", False):
+                logger.info(
+                    "Skipping %s fatal-error recovery during updater drain",
+                    adapter.platform.value,
+                )
+                return
+            tasks = getattr(self, "_fatal_handler_tasks", None)
+            if tasks is None:
+                tasks = self._fatal_handler_tasks = set()
+            task = asyncio.create_task(
+                self._handle_adapter_fatal_error_detached(adapter)
+            )
+            tasks.add(task)
+            if getattr(self, "_external_drain_active", False):
+                self._persist_active_agents()
+
+        def _discard(done_task: asyncio.Task) -> None:
+            with lock:
+                tasks.discard(done_task)
+                if getattr(self, "_external_drain_active", False):
+                    self._persist_active_agents()
+
+        task.add_done_callback(_discard)
         # Await so callers that expect completion still get it — but through
         # shield(): Task.cancel() on the caller also cancels the future it is
         # awaiting (_fut_waiter), so a plain `await task` would tunnel the
@@ -7124,6 +7151,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 return 1
         if getattr(self, "_detached_agent_cleanup_threads", ()):
+            return 1
+        if getattr(self, "_active_housekeeping_phases", 0):
             return 1
         try:
             from tools.async_delegation import active_count
@@ -25135,7 +25164,49 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _run_gateway_housekeeping_phase(
+    runner: Any,
+    name: str,
+    action: Callable[[], Any],
+) -> bool:
+    """Run one finite housekeeping phase behind the updater drain boundary."""
+    if runner is None:
+        action()
+        return True
+
+    lock = getattr(runner, "_update_idle_admission_lock", None)
+    if lock is None:
+        lock = threading.RLock()
+        runner._update_idle_admission_lock = lock
+    with lock:
+        if getattr(runner, "_external_drain_blocks_internal", False):
+            logger.debug("Housekeeping phase %s deferred by updater drain", name)
+            return False
+        runner._active_housekeeping_phases = (
+            getattr(runner, "_active_housekeeping_phases", 0) + 1
+        )
+        if getattr(runner, "_external_drain_active", False):
+            runner._persist_active_agents()
+    try:
+        action()
+        return True
+    finally:
+        with lock:
+            runner._active_housekeeping_phases = max(
+                getattr(runner, "_active_housekeeping_phases", 1) - 1,
+                0,
+            )
+            if getattr(runner, "_external_drain_active", False):
+                runner._persist_active_agents()
+
+
+def _start_gateway_housekeeping(
+    stop_event: threading.Event,
+    adapters=None,
+    loop=None,
+    interval: int = 60,
+    runner=None,
+):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -25182,7 +25253,10 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
                 from gateway.channel_directory import build_channel_directory
-                if loop is not None:
+
+                def _refresh_channel_directory() -> None:
+                    if loop is None:
+                        return
                     # build_channel_directory is async (Slack web calls), and
                     # this runs in a background thread. Schedule onto the
                     # gateway event loop and wait briefly for completion so
@@ -25194,26 +25268,54 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     )
                     if fut is not None:
                         fut.result(timeout=30)
+
+                _run_gateway_housekeeping_phase(
+                    runner,
+                    "channel-directory",
+                    _refresh_channel_directory,
+                )
             except Exception as e:
                 logger.debug("Channel directory refresh error: %s", e)
 
         if tick_count % IMAGE_CACHE_EVERY == 0:
             for cache_name, cleanup_fn in MEDIA_CACHE_CLEANUPS:
                 try:
-                    removed = cleanup_fn(max_age_hours=24)
-                    if removed:
-                        logger.info("%s cache cleanup: removed %d stale file(s)", cache_name, removed)
+                    def _cleanup_media(
+                        cleanup_fn=cleanup_fn,
+                        cache_name=cache_name,
+                    ) -> None:
+                        removed = cleanup_fn(max_age_hours=24)
+                        if removed:
+                            logger.info(
+                                "%s cache cleanup: removed %d stale file(s)",
+                                cache_name,
+                                removed,
+                            )
+
+                    _run_gateway_housekeeping_phase(
+                        runner,
+                        f"{cache_name.lower()}-cache",
+                        _cleanup_media,
+                    )
                 except Exception as e:
                     logger.debug("%s cache cleanup error: %s", cache_name, e)
 
         if tick_count % PASTE_SWEEP_EVERY == 0:
             try:
-                deleted, remaining = _sweep_expired_pastes()
-                if deleted:
-                    logger.info(
-                        "Paste sweep: deleted %d expired paste(s), %d pending",
-                        deleted, remaining,
-                    )
+                def _sweep_pastes() -> None:
+                    deleted, remaining = _sweep_expired_pastes()
+                    if deleted:
+                        logger.info(
+                            "Paste sweep: deleted %d expired paste(s), %d pending",
+                            deleted,
+                            remaining,
+                        )
+
+                _run_gateway_housekeeping_phase(
+                    runner,
+                    "paste-sweep",
+                    _sweep_pastes,
+                )
             except Exception as e:
                 logger.debug("Paste sweep error: %s", e)
 
@@ -25225,9 +25327,14 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         if tick_count % CURATOR_EVERY == 0:
             try:
                 from agent.curator import maybe_run_curator
-                maybe_run_curator(
-                    idle_for_seconds=float("inf"),
-                    on_summary=lambda msg: logger.info("curator: %s", msg),
+
+                _run_gateway_housekeeping_phase(
+                    runner,
+                    "curator",
+                    lambda: maybe_run_curator(
+                        idle_for_seconds=float("inf"),
+                        on_summary=lambda msg: logger.info("curator: %s", msg),
+                    ),
                 )
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
@@ -25237,7 +25344,12 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
             # configured; never raises.
             try:
                 from tools.skills_sync_client import maybe_pull_skills
-                maybe_pull_skills()
+
+                _run_gateway_housekeeping_phase(
+                    runner,
+                    "skills-sync",
+                    maybe_pull_skills,
+                )
             except Exception as e:
                 logger.debug("Sync pull tick error: %s", e)
 
@@ -25245,7 +25357,12 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
             # carry an org role), so a solo account never reaches the network.
             try:
                 from tools.skills_sync_client import maybe_pull_org_skills
-                maybe_pull_org_skills()
+
+                _run_gateway_housekeeping_phase(
+                    runner,
+                    "org-skills-sync",
+                    maybe_pull_org_skills,
+                )
             except Exception as e:
                 logger.debug("Org sync pull tick error: %s", e)
 
@@ -25256,18 +25373,30 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         # SQLite connections are thread-bound and this runs off-loop.
         if tick_count % AUTO_ARCHIVE_EVERY == 0:
             try:
-                from hermes_cli.config import load_config as _load_full_config
-                from hermes_state import SessionDB
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                if _sess_cfg.get("auto_archive", False):
-                    _adb = SessionDB()
-                    try:
-                        _adb.maybe_auto_archive(
-                            idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                            min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                        )
-                    finally:
-                        _adb.close()
+                def _auto_archive() -> None:
+                    from hermes_cli.config import load_config as _load_full_config
+                    from hermes_state import SessionDB
+
+                    _sess_cfg = _load_full_config().get("sessions") or {}
+                    if _sess_cfg.get("auto_archive", False):
+                        _adb = SessionDB()
+                        try:
+                            _adb.maybe_auto_archive(
+                                idle_days=float(
+                                    _sess_cfg.get("auto_archive_days", 3)
+                                ),
+                                min_interval_hours=int(
+                                    _sess_cfg.get("min_interval_hours", 24)
+                                ),
+                            )
+                        finally:
+                            _adb.close()
+
+                _run_gateway_housekeeping_phase(
+                    runner,
+                    "auto-archive",
+                    _auto_archive,
+                )
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
 
@@ -25913,7 +26042,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={
+            "adapters": runner.adapters,
+            "loop": asyncio.get_running_loop(),
+            "runner": runner,
+        },
         daemon=True,
         name="gateway-housekeeping",
     )

@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import gateway.drain_control as dc
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _run_gateway_housekeeping_phase
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -420,6 +420,42 @@ class TestDrainStateMachine:
         )
 
         assert runner._active_work_count() == 1
+
+    def test_housekeeping_phase_is_counted_and_strict_drain_rejects_next(self):
+        runner, _ = _drain_runner()
+        runner._active_housekeeping_phases = 0
+        observed = []
+
+        assert _run_gateway_housekeeping_phase(
+            runner,
+            "test-phase",
+            lambda: observed.append(runner._active_background_work_count()),
+        ) is True
+        assert observed == [1]
+        assert runner._active_housekeeping_phases == 0
+
+        runner._external_drain_blocks_internal = True
+        called = []
+        assert _run_gateway_housekeeping_phase(
+            runner,
+            "blocked-phase",
+            lambda: called.append(True),
+        ) is False
+        assert called == []
+
+    @pytest.mark.asyncio
+    async def test_strict_drain_rejects_fatal_handler_before_task_creation(self):
+        runner, adapter = _drain_runner()
+        runner._external_drain_active = True
+        runner._external_drain_blocks_internal = True
+        runner._fatal_handler_tasks = set()
+        detached = MagicMock()
+        runner._handle_adapter_fatal_error_detached = detached
+
+        await GatewayRunner._handle_adapter_fatal_error(runner, adapter)
+
+        detached.assert_not_called()
+        assert runner._fatal_handler_tasks == set()
 
 
 # ---------------------------------------------------------------------------

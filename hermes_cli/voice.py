@@ -26,6 +26,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Any, Callable, Optional
 
 # Modifier aliases mirrored from the TUI parser (``ui-tui/src/lib/platform.ts``)
@@ -289,6 +290,8 @@ _continuous_active = False
 _continuous_stopping = False
 _continuous_auto_restart: bool = True
 _continuous_recorder: Any = None
+_continuous_worker: Optional[threading.Thread] = None
+_continuous_callbacks_active = 0
 
 # ── TTS-vs-STT feedback guard ────────────────────────────────────────
 # When TTS plays the agent reply over the speakers, the live microphone
@@ -531,6 +534,7 @@ def stop_continuous(force_transcribe: bool = False) -> None:
     global _continuous_on_status, _continuous_on_silent_limit
     global _continuous_on_stop_phrase
     global _continuous_recorder, _continuous_no_speech_count
+    global _continuous_worker
 
     with _continuous_lock:
         if not _continuous_active:
@@ -570,6 +574,7 @@ def stop_continuous(force_transcribe: bool = False) -> None:
 
             def _transcribe_and_cleanup():
                 global _continuous_no_speech_count, _continuous_stopping
+                global _continuous_worker
                 transcript: Optional[str] = None
                 should_halt = False
 
@@ -649,7 +654,25 @@ def stop_continuous(force_transcribe: bool = False) -> None:
                         except Exception:
                             pass
 
-            threading.Thread(target=_transcribe_and_cleanup, daemon=True).start()
+                    with _continuous_lock:
+                        if _continuous_worker is threading.current_thread():
+                            _continuous_worker = None
+
+            worker = threading.Thread(
+                target=_transcribe_and_cleanup,
+                daemon=True,
+                name="voice-transcribe-cleanup",
+            )
+            with _continuous_lock:
+                _continuous_worker = worker
+            try:
+                worker.start()
+            except BaseException:
+                with _continuous_lock:
+                    if _continuous_worker is worker:
+                        _continuous_worker = None
+                    _continuous_stopping = False
+                raise
             return
         else:
             try:
@@ -679,7 +702,59 @@ def is_continuous_active() -> bool:
         return _continuous_active
 
 
+def has_active_voice_work() -> bool:
+    """Whether capture, a silence callback, or transcription still runs."""
+    with _continuous_lock:
+        worker = _continuous_worker
+        return bool(
+            _continuous_active
+            or _continuous_stopping
+            or _continuous_callbacks_active
+            or (worker is not None and worker.is_alive())
+        )
+
+
+def stop_continuous_for_update(timeout: float = 1.0) -> bool:
+    """Stop voice capture and wait until all managed-runtime work exits."""
+    stop_continuous(force_transcribe=False)
+    deadline = time.monotonic() + max(timeout, 0.0)
+    current = threading.current_thread()
+    while True:
+        with _continuous_lock:
+            worker = _continuous_worker
+            active = bool(
+                _continuous_active
+                or _continuous_stopping
+                or _continuous_callbacks_active
+                or (worker is not None and worker.is_alive())
+            )
+        if not active:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if worker is not None and worker is not current and worker.is_alive():
+            worker.join(timeout=min(remaining, 0.05))
+        else:
+            time.sleep(min(remaining, 0.01))
+
+
 def _continuous_on_silence() -> None:
+    """Track the recorder callback until its actual completion."""
+    global _continuous_callbacks_active
+    with _continuous_lock:
+        _continuous_callbacks_active += 1
+    try:
+        _continuous_on_silence_impl()
+    finally:
+        with _continuous_lock:
+            _continuous_callbacks_active = max(
+                _continuous_callbacks_active - 1,
+                0,
+            )
+
+
+def _continuous_on_silence_impl() -> None:
     """AudioRecorder silence callback — runs in a daemon thread.
 
     Stops the current capture, transcribes, delivers the text via
