@@ -15,6 +15,7 @@ import asyncio
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -442,6 +443,21 @@ class TestDrainStateMachine:
             lambda: called.append(True),
         ) is False
         assert called == []
+
+    @pytest.mark.asyncio
+    async def test_deferred_session_expiry_disables_session_finalization(self):
+        runner, _ = _drain_runner()
+        runner._external_drain_active = True
+        runner._external_drain_blocks_internal = True
+        agent = SimpleNamespace(_end_session_on_close=True)
+
+        await runner._cleanup_agent_resources_off_loop(
+            agent,
+            context="session expiry",
+        )
+
+        assert agent._end_session_on_close is False
+        assert len(runner._deferred_agent_cleanup_calls) == 1
 
     @pytest.mark.asyncio
     async def test_strict_drain_rejects_fatal_handler_before_task_creation(self):

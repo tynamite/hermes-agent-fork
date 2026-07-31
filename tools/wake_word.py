@@ -883,6 +883,7 @@ class WakeWordDetector:
         self.input_device = input_device
         self.input_device_details: Dict[str, Any] = {"selector": input_device}
         self._thread: Optional[threading.Thread] = None
+        self._callback_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._callback_inflight = threading.Event()
         self._last_fire = 0.0
@@ -927,18 +928,51 @@ class WakeWordDetector:
     def resume(self) -> None:
         self.start()
 
-    def stop(self) -> None:
-        self._halt_thread()
-        self.engine.close()
+    def stop(self, *, timeout: float = 2.0,
+             wait_for_callback: bool = False) -> bool:
+        """Stop owned workers, returning whether their exit was verified.
 
-    def _halt_thread(self) -> None:
+        Ordinary surface teardown only needs to release the microphone reader;
+        update teardown additionally waits for the wake callback because it can
+        import from, or launch work inside, the managed environment.
+        """
+        stopped = self._halt_thread(
+            timeout=timeout,
+            wait_for_callback=wait_for_callback,
+        )
+        if stopped:
+            self.engine.close()
+        return stopped
+
+    def _halt_thread(self, *, timeout: float = 2.0,
+                     wait_for_callback: bool = False) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
         with self._lock:
             self._stop.set()
-            t = self._thread
-            if t is not None and t is not threading.current_thread():
-                t.join(timeout=2.0)
-            if self._thread is t:
+            reader = self._thread
+            callback = self._callback_thread if wait_for_callback else None
+
+        current = threading.current_thread()
+        for worker in (reader, callback):
+            if worker is not None and worker is not current and worker.is_alive():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        with self._lock:
+            if self._thread is reader and (
+                reader is None or not reader.is_alive()
+            ):
                 self._thread = None
+            if self._callback_thread is callback and (
+                callback is None or not callback.is_alive()
+            ):
+                self._callback_thread = None
+            reader_live = self._thread is not None and self._thread.is_alive()
+            callback_live = (
+                wait_for_callback
+                and self._callback_thread is not None
+                and self._callback_thread.is_alive()
+            )
+        return not reader_live and not callback_live
 
     def _dispatch_wake(self) -> None:
         try:
@@ -947,6 +981,9 @@ class WakeWordDetector:
             logger.warning("wake word callback failed: %s", e)
         finally:
             self._callback_inflight.clear()
+            with self._lock:
+                if self._callback_thread is threading.current_thread():
+                    self._callback_thread = None
 
     def _run(self, ready: threading.Event,
              startup_errors: list[BaseException]) -> None:
@@ -1035,13 +1072,24 @@ class WakeWordDetector:
                     if now - self._last_fire >= self.cooldown:
                         self._last_fire = now
                         logger.info("wake word: phrase detected — firing callback")
-                        if not self._callback_inflight.is_set():
-                            self._callback_inflight.set()
-                            threading.Thread(
-                                target=self._dispatch_wake,
-                                daemon=True,
-                                name="wake-word-callback",
-                            ).start()
+                        with self._lock:
+                            if (
+                                not self._stop.is_set()
+                                and not self._callback_inflight.is_set()
+                            ):
+                                self._callback_inflight.set()
+                                callback = threading.Thread(
+                                    target=self._dispatch_wake,
+                                    daemon=True,
+                                    name="wake-word-callback",
+                                )
+                                self._callback_thread = callback
+                                try:
+                                    callback.start()
+                                except Exception:
+                                    self._callback_thread = None
+                                    self._callback_inflight.clear()
+                                    raise
                     else:
                         logger.debug("wake word: detection within cooldown — ignored")
         finally:
@@ -1213,14 +1261,38 @@ def stop_listening(*, owner: object) -> bool:
             return False
         det = _detector
         lock_handle = _detector_file_lock
+    # A wake callback may itself be inside pause_listening(), which also takes
+    # the singleton lock. Never hold that lock while joining detector workers.
+    if not det.stop():
+        return False
+    with _detector_lock:
+        if _detector is not det:
+            return True
         _detector = None
         _detector_owner = None
         _detector_file_lock = None
-        try:
-            det.stop()
-        finally:
-            _release_machine_lock(lock_handle)
-        return True
+    _release_machine_lock(lock_handle)
+    return True
+
+
+def stop_listening_for_update(*, timeout: float = 2.0) -> bool:
+    """Stop every wake worker and release its lease only after verified exit."""
+    global _detector, _detector_owner, _detector_file_lock
+    with _detector_lock:
+        if _detector is None:
+            return True
+        det = _detector
+        lock_handle = _detector_file_lock
+    if not det.stop(timeout=timeout, wait_for_callback=True):
+        return False
+    with _detector_lock:
+        if _detector is not det:
+            return True
+        _detector = None
+        _detector_owner = None
+        _detector_file_lock = None
+    _release_machine_lock(lock_handle)
+    return True
 
 
 def is_listening() -> bool:

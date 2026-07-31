@@ -756,6 +756,29 @@ def test_close_sessions_for_update_stops_voice_runtime(server, monkeypatch):
     assert 0 <= stopped[0]["timeout"] <= 1.0
 
 
+def test_close_sessions_for_update_stops_wake_runtime(server, monkeypatch):
+    stopped = []
+    wake = types.SimpleNamespace(
+        stop_listening_for_update=lambda **kwargs: stopped.append(kwargs) or True,
+    )
+    monkeypatch.setitem(sys.modules, "tools.wake_word", wake)
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: None)
+
+    server.close_sessions_for_update()
+
+    assert len(stopped) == 1
+    assert 0 <= stopped[0]["timeout"] <= 1.0
+
+
+def test_close_sessions_for_update_rejects_live_wake_worker(server, monkeypatch):
+    wake = types.SimpleNamespace(stop_listening_for_update=lambda **_kwargs: False)
+    monkeypatch.setitem(sys.modules, "tools.wake_word", wake)
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: None)
+
+    with pytest.raises(RuntimeError, match="wake-word work did not stop"):
+        server.close_sessions_for_update()
+
+
 def test_close_sessions_for_update_rejects_live_poller(server, monkeypatch):
     class _Poller:
         def is_alive(self):

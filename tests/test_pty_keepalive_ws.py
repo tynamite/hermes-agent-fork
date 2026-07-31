@@ -38,34 +38,63 @@ async def test_concurrent_attach_key_spawns_exactly_one_bridge():
     )
     spawn_started = threading.Event()
     release_spawn = threading.Event()
+    calls_lock = threading.Lock()
     calls = 0
+
+    class InstrumentedLock:
+        def __init__(self):
+            self.lock = asyncio.Lock()
+            self.attempts = 0
+            self.second_waiting = asyncio.Event()
+
+        async def __aenter__(self):
+            self.attempts += 1
+            if self.attempts == 2:
+                self.second_waiting.set()
+            await self.lock.acquire()
+
+        async def __aexit__(self, *_exc):
+            self.lock.release()
+
+    instrumented_lock = InstrumentedLock()
+    registry._lock = instrumented_lock
 
     def slow_spawn():
         nonlocal calls
-        calls += 1
+        with calls_lock:
+            calls += 1
         spawn_started.set()
         assert release_spawn.wait(timeout=2)
         return FakeBridge()
 
-    first = asyncio.create_task(
-        registry.attach_or_spawn("same", spawn=slow_spawn)
-    )
-    assert await asyncio.to_thread(spawn_started.wait, 1)
-    second = asyncio.create_task(
-        registry.attach_or_spawn("same", spawn=slow_spawn)
-    )
-    await asyncio.sleep(0.05)
-    release_spawn.set()
+    tasks = []
     try:
+        first = asyncio.create_task(
+            registry.attach_or_spawn("same", spawn=slow_spawn)
+        )
+        tasks.append(first)
+        assert await asyncio.to_thread(spawn_started.wait, 1)
+        second = asyncio.create_task(
+            registry.attach_or_spawn("same", spawn=slow_spawn)
+        )
+        tasks.append(second)
+        await asyncio.wait_for(instrumented_lock.second_waiting.wait(), timeout=1)
+        release_spawn.set()
         (first_session, first_created), (
             second_session,
             second_created,
         ) = await asyncio.gather(first, second)
-        assert calls == 1
+        with calls_lock:
+            assert calls == 1
         assert first_session is second_session
         assert (first_created, second_created) == (True, False)
     finally:
         release_spawn.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await registry.close_all()
 
 

@@ -64,6 +64,26 @@ class TestActiveCronJobCount:
 class TestDrainWaitsForCronWork:
 
     @pytest.mark.asyncio
+    async def test_shutdown_drain_does_not_force_interrupt_on_probe_failure(
+        self,
+        monkeypatch,
+    ):
+        import cron.scheduler as sched
+
+        runner, _adapter = make_restart_runner()
+        monkeypatch.setattr(
+            sched,
+            "get_running_job_ids",
+            MagicMock(side_effect=RuntimeError("unreadable")),
+        )
+
+        # Update-idle remains fail-closed, but a process already committed to
+        # shutdown must not manufacture live work from an unreadable probe.
+        assert runner._active_cron_job_count() == 1
+        _snapshot, timed_out = await runner._drain_active_agents(0.01)
+        assert timed_out is False
+
+    @pytest.mark.asyncio
     async def test_drain_waits_for_in_flight_cron_job(self):
         """Before this fix, a cron-only workload made active_at_start=0
         and the drain returned instantly -- this is the exact repro from

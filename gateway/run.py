@@ -7180,6 +7180,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 1
         return 0
 
+    def _active_cron_job_probe(self) -> tuple[int, bool]:
+        """Return ``(count, failed)`` for the cron runtime probe."""
+        try:
+            from cron.scheduler import get_running_job_ids
+
+            return len(get_running_job_ids()), False
+        except Exception:
+            logger.debug("cron work probe failed", exc_info=True)
+            return 0, True
+
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
         own in-flight tracking (``cron.scheduler._running_job_ids``).
@@ -7194,12 +7204,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         still running (#60432). Probe failures count as active: update
         quiescence must not publish an unverified zero.
         """
+        count, failed = self._active_cron_job_probe()
+        return 1 if failed else count
+
+    def _active_api_run_probe(self) -> tuple[int, bool]:
+        """Return ``(count, failed)`` for the API-server runtime probe."""
         try:
-            from cron.scheduler import get_running_job_ids
-            return len(get_running_job_ids())
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            helper = getattr(adapter, "active_agent_work_count", None)
+            return (max(0, int(helper())) if callable(helper) else 0), False
         except Exception:
-            logger.debug("cron work probe failed", exc_info=True)
-            return 1
+            logger.debug("API work probe failed", exc_info=True)
+            return 0, True
 
     def _active_api_run_count(self) -> int:
         """Count API-server work that is outside ``_running_agents``.
@@ -7208,13 +7224,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profiles cannot create an ``api_server`` adapter because it binds a port,
         so only the primary registry is a supported source of this work.
         """
-        try:
-            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
-            helper = getattr(adapter, "active_agent_work_count", None)
-            return max(0, int(helper())) if callable(helper) else 0
-        except Exception:
-            logger.debug("API work probe failed", exc_info=True)
-            return 1
+        count, failed = self._active_api_run_probe()
+        return 1 if failed else count
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -8983,18 +8994,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return True
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
+        # Shutdown has already committed to process exit, so an unreadable
+        # auxiliary probe is "unknown", not evidence of live work. Update-idle
+        # publication keeps using the fail-closed public count methods above.
+        def _shutdown_aux_counts() -> tuple[int, int]:
+            cron_count, _cron_failed = self._active_cron_job_probe()
+            api_count, _api_failed = self._active_api_run_probe()
+            return cron_count, api_count
+
         snapshot = self._snapshot_running_agents()
         last_active_count = self._running_agent_count()
-        last_cron_count = self._active_cron_job_count()
-        last_api_count = self._active_api_run_count()
+        last_cron_count, last_api_count = _shutdown_aux_counts()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
-            cron_count = self._active_cron_job_count()
-            api_count = self._active_api_run_count()
+            cron_count, api_count = _shutdown_aux_counts()
             if (
                 force
                 or active_count != last_active_count
@@ -9023,20 +9040,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return snapshot, True
 
         deadline = asyncio.get_running_loop().time() + timeout
-        while (
-            (
-                len(self._running_agents)
-                or self._active_cron_job_count()
-                or self._active_api_run_count()
-            )
-            and asyncio.get_running_loop().time() < deadline
-        ):
+        while asyncio.get_running_loop().time() < deadline:
+            cron_count, api_count = _shutdown_aux_counts()
+            if not (len(self._running_agents) or cron_count or api_count):
+                break
             _maybe_update_status()
             await asyncio.sleep(0.1)
+        cron_count, api_count = _shutdown_aux_counts()
         timed_out = (
             bool(len(self._running_agents))
-            or bool(self._active_cron_job_count())
-            or bool(self._active_api_run_count())
+            or bool(cron_count)
+            or bool(api_count)
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -9407,6 +9421,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if agent is None:
             return
+        if context.startswith("shutdown") or context == "session expiry":
+            try:
+                agent._end_session_on_close = False
+            except Exception:
+                pass
         if (
             getattr(self, "_external_drain_blocks_internal", False)
             and not context.startswith("shutdown")
@@ -9421,11 +9440,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 name=f"agent-deferred-update-{context[:24] or 'cleanup'}",
             )
             return
-        if context.startswith("shutdown") or context == "session expiry":
-            try:
-                agent._end_session_on_close = False
-            except Exception:
-                pass
         cleanup_task = asyncio.create_task(
             self._run_in_executor_with_context(
                 self._cleanup_agent_resources,

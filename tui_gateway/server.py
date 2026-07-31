@@ -1228,6 +1228,16 @@ def close_sessions_for_update() -> None:
             raise RuntimeError("Could not stop TUI voice work before update") from exc
         if not voice_stopped:
             raise RuntimeError("TUI voice work did not stop before update")
+    wake_module = sys.modules.get("tools.wake_word")
+    if wake_module is not None:
+        try:
+            wake_stopped = wake_module.stop_listening_for_update(
+                timeout=max(deadline - time.monotonic(), 0.0)
+            )
+        except Exception as exc:
+            raise RuntimeError("Could not stop TUI wake-word work before update") from exc
+        if not wake_stopped:
+            raise RuntimeError("TUI wake-word work did not stop before update")
     _shutdown_sessions()
     current = threading.current_thread()
     pollers = []
