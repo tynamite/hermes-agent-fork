@@ -4063,6 +4063,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     _posix_gateway_quiesce = None
     if not getattr(args, "force_venv", False):
         _venv_guard_exclude: set[int] = set()
+        _quiesced_gateway_pids: set[int] = set()
         try:
             _profile_gateway_pids: set[int] = set()
             if not _m()._is_windows():
@@ -4091,6 +4092,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _quiesced_gateway_pids
                     )
                 ):
+                    _m()._release_posix_gateway_quiesce(
+                        _posix_gateway_quiesce
+                    )
+                    _posix_gateway_quiesce = None
                     print(
                         "✗ Could not establish an updater-owned idle "
                         "boundary for every running gateway."
@@ -4149,6 +4154,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # boundary (psutil missing, AccessDenied, process exited, etc.).
             _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
             _posix_gateway_quiesce = None
+            _venv_guard_exclude.difference_update(
+                _quiesced_gateway_pids
+            )
+            _quiesced_gateway_pids.clear()
         _venv_holders = _m()._detect_venv_python_processes(
             exclude_pids=_venv_guard_exclude
         )

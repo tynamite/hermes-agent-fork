@@ -484,6 +484,7 @@ def _run_update_until_guard(
     detector=None,
     quiesce_token=None,
     quiesce=None,
+    release=None,
     profile_gateways=(),
 ):
     """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
@@ -508,6 +509,7 @@ def _run_update_until_guard(
     quiesce_effect = (
         quiesce if quiesce is not None else lambda _pids: quiesce_token
     )
+    release_effect = release or MagicMock()
 
     with patch.object(cli_main, "_is_windows", return_value=is_windows), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
@@ -520,7 +522,9 @@ def _run_update_until_guard(
         "_quiesce_posix_gateways_for_update",
         side_effect=quiesce_effect,
     ), patch.object(
-        cli_main, "_release_posix_gateway_quiesce"
+        cli_main,
+        "_release_posix_gateway_quiesce",
+        side_effect=release_effect,
     ), patch.object(
         cli_main,
         "_detect_venv_python_processes",
@@ -617,6 +621,67 @@ def test_direct_posix_update_aborts_when_any_mapped_gateway_cannot_quiesce(
     assert result == "exit_2"
     detector.assert_not_called()
     assert "Could not establish" in capsys.readouterr().out
+
+
+def test_partial_posix_quiescence_is_released_before_abort(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    token = {"pids": {666}, "created_markers": [{"pid": 666}]}
+    release = MagicMock()
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+        detector=MagicMock(return_value=[]),
+        quiesce=MagicMock(return_value=token),
+        release=release,
+        profile_gateways=[
+            SimpleNamespace(profile="default", path="/tmp/hermes", pid=666),
+            SimpleNamespace(profile="work", path="/tmp/work", pid=777),
+        ],
+    )
+
+    assert result == "exit_2", capsys.readouterr().out
+    release.assert_called_once_with(token)
+
+
+def test_released_quiescence_removes_gateway_pid_exclusions(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    seen = []
+    token = {"pids": {666}, "created_markers": [{"pid": 666}]}
+    release = MagicMock()
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(
+            parents=MagicMock(side_effect=PermissionError("denied"))
+        )
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return []
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce=MagicMock(return_value=token),
+            release=release,
+            profile_gateways=[
+                SimpleNamespace(
+                    profile="default",
+                    path="/tmp/hermes",
+                    pid=666,
+                )
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [set()]
+    release.assert_called_once_with(token)
 
 
 def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
