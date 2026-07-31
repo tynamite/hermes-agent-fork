@@ -586,6 +586,35 @@ def test_direct_posix_update_quiesces_mapped_gateways_without_supervisor(
     assert seen_holders == [{666}]
 
 
+@pytest.mark.parametrize(
+    "quiesce_token",
+    [
+        None,
+        {"pids": {666}, "created_markers": []},
+    ],
+)
+def test_direct_posix_update_aborts_when_any_mapped_gateway_cannot_quiesce(
+    monkeypatch, capsys, quiesce_token
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    detector = MagicMock(return_value=[])
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+        detector=detector,
+        quiesce=MagicMock(return_value=quiesce_token),
+        profile_gateways=[
+            SimpleNamespace(profile="default", path="/tmp/hermes", pid=666),
+            SimpleNamespace(profile="work", path="/tmp/work", pid=777),
+        ],
+    )
+
+    assert result == "exit_2"
+    detector.assert_not_called()
+    assert "Could not establish" in capsys.readouterr().out
+
+
 def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
@@ -857,7 +886,7 @@ def test_quiesce_posix_gateway_refreshes_stale_drain_marker(
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
-def test_quiesce_posix_gateway_preserves_active_operator_drain(
+def test_quiesce_posix_gateway_rejects_active_operator_drain(
     _winp, tmp_path
 ):
     from gateway.drain_control import drain_request_path
@@ -1072,3 +1101,75 @@ def test_release_posix_gateway_preserves_replacement_drain(
     body = read_drain_request(home=profile_home)
     assert body is not None
     assert body["principal"] == "operator"
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_finish_posix_quiesce_retains_drain_for_live_old_gateway(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    with patch("gateway.status._pid_exists", return_value=True), patch(
+        "gateway.status.get_process_start_time", return_value=111
+    ):
+        surviving = cli_main._finish_posix_gateway_quiesce(token)
+
+    assert surviving == {555}
+    assert token["retain_on_exit"] is True
+    assert drain_request_path(profile_home).exists()
+
+    cli_main._release_posix_gateway_quiesce_at_exit(token)
+    assert drain_request_path(profile_home).exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_finish_posix_quiesce_releases_drain_after_pid_reuse(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    with patch("gateway.status._pid_exists", return_value=True), patch(
+        "gateway.status.get_process_start_time", return_value=222
+    ):
+        surviving = cli_main._finish_posix_gateway_quiesce(token)
+
+    assert surviving == set()
+    assert not drain_request_path(profile_home).exists()

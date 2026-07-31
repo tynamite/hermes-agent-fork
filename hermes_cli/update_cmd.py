@@ -3294,7 +3294,11 @@ def _quiesce_posix_gateways_for_update(
                 # earlier machine epoch or terminated updater.
                 if owned_by_this_update:
                     created_markers.append(
-                        {"home": home, "marker": body}
+                        {
+                            "home": home,
+                            "marker": body,
+                            "pid": int(proc.pid),
+                        }
                     )
                     break
                 if (
@@ -3323,6 +3327,7 @@ def _quiesce_posix_gateways_for_update(
                         {
                             "home": home,
                             "marker": payload,
+                            "pid": int(proc.pid),
                         }
                     )
                     break
@@ -3372,11 +3377,19 @@ def _quiesce_posix_gateways_for_update(
 
     return {
         "pids": {int(proc.pid) for proc in processes},
+        "process_start_times": {
+            int(proc.pid): get_process_start_time(int(proc.pid))
+            for proc in processes
+        },
         "created_markers": created_markers,
     }
 
-def _release_posix_gateway_quiesce(token: dict | None) -> None:
-    """Clear only update-owned external-drain markers."""
+def _release_posix_gateway_quiesce(
+    token: dict | None,
+    *,
+    retain_pids: set[int] | None = None,
+) -> None:
+    """Clear update-owned drains except those protecting live old gateways."""
     if not token:
         return
     try:
@@ -3385,8 +3398,16 @@ def _release_posix_gateway_quiesce(token: dict | None) -> None:
         )
     except Exception:
         return
+    retained: list[dict] = []
     markers = token.pop("created_markers", [])
     for owned_marker in markers:
+        try:
+            marker_pid = int(owned_marker.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            marker_pid = 0
+        if retain_pids and marker_pid in retain_pids:
+            retained.append(owned_marker)
+            continue
         home = Path(owned_marker["home"])
         expected = owned_marker.get("marker")
         if not isinstance(expected, dict):
@@ -3408,6 +3429,55 @@ def _release_posix_gateway_quiesce(token: dict | None) -> None:
                 home,
                 exc_info=True,
             )
+    if retained:
+        token["created_markers"] = retained
+
+def _release_posix_gateway_quiesce_at_exit(token: dict | None) -> None:
+    """Release on ordinary exits, preserving drains deliberately retained."""
+    if token and token.get("retain_on_exit"):
+        return
+    _m()._release_posix_gateway_quiesce(token)
+
+def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
+    """Release drains only after every original gateway identity is gone."""
+    if not token:
+        return set()
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+    except Exception:
+        surviving = {
+            int(pid) for pid in token.get("pids", set())
+        }
+    else:
+        recorded = token.get("process_start_times", {})
+        surviving = set()
+        for raw_pid in token.get("pids", set()):
+            try:
+                pid = int(raw_pid)
+            except (TypeError, ValueError):
+                continue
+            if not _pid_exists(pid):
+                continue
+            before = recorded.get(pid)
+            if before is None:
+                before = recorded.get(str(pid))
+            current = get_process_start_time(pid)
+            if (
+                before is not None
+                and current is not None
+                and current != before
+            ):
+                continue
+            surviving.add(pid)
+
+    if surviving:
+        token["retain_on_exit"] = True
+    _m()._release_posix_gateway_quiesce(
+        token,
+        retain_pids=surviving,
+    )
+    return surviving
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -3968,18 +4038,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _profile_gateway_pids
                     )
                 )
-                _venv_guard_exclude.update(
-                    set(
-                        (_posix_gateway_quiesce or {}).get(
-                            "pids", set()
-                        )
+                _quiesced_gateway_pids = set(
+                    (_posix_gateway_quiesce or {}).get("pids", set())
+                )
+                if (
+                    _profile_gateway_pids
+                    and not _profile_gateway_pids.issubset(
+                        _quiesced_gateway_pids
                     )
+                ):
+                    print(
+                        "✗ Could not establish an updater-owned idle "
+                        "boundary for every running gateway."
+                    )
+                    print(
+                        "  Stop or restart the active gateways, then "
+                        "re-run: hermes update"
+                    )
+                    sys.exit(2)
+                _venv_guard_exclude.update(
+                    _quiesced_gateway_pids
                 )
                 if _posix_gateway_quiesce:
                     import atexit as _atexit
 
                     _atexit.register(
-                        _m()._release_posix_gateway_quiesce,
+                        _m()._release_posix_gateway_quiesce_at_exit,
                         _posix_gateway_quiesce,
                     )
 
@@ -5781,7 +5865,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
 
-        _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
+        _surviving_quiesced_pids = (
+            _m()._finish_posix_gateway_quiesce(
+                _posix_gateway_quiesce
+            )
+        )
+        if _surviving_quiesced_pids:
+            gateway_fleet_restart_incomplete = True
+            print()
+            print(
+                "  ⚠ Update drain retained for gateway PID(s) still "
+                "running the previous version: "
+                + ", ".join(
+                    str(pid)
+                    for pid in sorted(_surviving_quiesced_pids)
+                )
+            )
+            print(
+                "    Restart those gateways before cancelling their "
+                "update drain."
+            )
+            if gateway_mode:
+                _exit_code_path = get_hermes_home() / ".update_exit_code"
+                try:
+                    _exit_code_path.write_text("1", encoding="utf-8")
+                except OSError:
+                    pass
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
 
         # Warn if legacy Hermes gateway unit files are still installed.

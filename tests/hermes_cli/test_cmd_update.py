@@ -265,6 +265,29 @@ class TestCmdUpdateBranchFallback:
             assert "applying safe config migrations" in captured.out
             assert "API keys require manual entry" in captured.out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_fails_closed_when_old_gateway_survives_restart(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+        with patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+            return_value={555},
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_update(mock_args)
+
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+        assert "Update drain retained" in output
+        assert "555" in output
+
 
 class TestCmdUpdateMigrationPrompt:
     """The config-migration prompt names what changed and skips the prompt
