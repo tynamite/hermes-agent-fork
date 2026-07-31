@@ -953,8 +953,11 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
             from cron.scheduler import get_running_job_ids
 
             active_cron_jobs = get_running_job_ids()
-        except Exception:
-            active_cron_jobs = frozenset()
+        except Exception as exc:
+            _end_dashboard_update_quiesce()
+            raise RuntimeError(
+                "Could not verify cron job liveness"
+            ) from exc
         active_actions = [
             name
             for name, proc in tuple(_ACTION_PROCS.items())

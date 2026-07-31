@@ -1221,6 +1221,32 @@ async def test_dashboard_quiesce_fails_closed_when_tui_liveness_probe_raises(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_quiesce_fails_closed_when_cron_probe_raises(
+    monkeypatch,
+):
+    import cron.scheduler
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        cron.scheduler,
+        "get_running_job_ids",
+        MagicMock(side_effect=RuntimeError("unreadable cron state")),
+    )
+    close_ptys = AsyncMock()
+    monkeypatch.setattr(ws.PTY_REGISTRY, "close_all", close_ptys)
+    ws._end_dashboard_update_quiesce()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Could not verify cron job liveness",
+    ):
+        await ws._begin_dashboard_update_quiesce(timeout=0.05)
+
+    close_ptys.assert_not_awaited()
+    assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is False
+
+
+@pytest.mark.asyncio
 async def test_dashboard_quiesce_fails_closed_on_pty_shutdown(monkeypatch):
     import hermes_cli.web_server as ws
 

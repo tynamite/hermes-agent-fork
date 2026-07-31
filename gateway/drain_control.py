@@ -350,7 +350,10 @@ def _live_updater_owns_marker(marker: dict[str, Any]) -> bool:
 
         live_start_time = get_process_start_time(owner_pid)
     except Exception:
-        return False
+        # An updater-owned marker is a safety boundary. If process liveness
+        # cannot be inspected, protect the marker until its owner can be
+        # authoritatively shown dead rather than reopening gateway admission.
+        return True
     if owner_start_time > 0 and live_start_time is not None:
         return live_start_time == owner_start_time
     # Some supported hosts cannot read process start time. Preserve the
@@ -359,7 +362,7 @@ def _live_updater_owns_marker(marker: dict[str, Any]) -> bool:
     try:
         return bool(_pid_exists(owner_pid))
     except Exception:
-        return False
+        return True
 
 
 def _clear_drain_request_unlocked(*, home: Optional[Path] = None) -> bool:

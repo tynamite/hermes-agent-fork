@@ -134,6 +134,25 @@ class TestMarkerContract:
 
         assert dc._live_updater_owns_marker(marker) is False
 
+    def test_updater_marker_is_protected_when_liveness_is_unverifiable(
+        self,
+        monkeypatch,
+    ):
+        import gateway.status
+
+        marker = {
+            "principal": "hermes-update",
+            "owner_pid": 123,
+            "owner_start_time": 456,
+        }
+        monkeypatch.setattr(
+            gateway.status,
+            "get_process_start_time",
+            MagicMock(side_effect=PermissionError("denied")),
+        )
+
+        assert dc._live_updater_owns_marker(marker) is True
+
 
 class TestSuppressNotification:
     """The generic suppress_notification flag on the drain marker.
