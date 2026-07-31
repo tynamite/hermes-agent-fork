@@ -18,17 +18,49 @@ from __future__ import annotations
 
 import os
 import time
+from unittest.mock import Mock
 
 import pytest
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
+    UPDATE_EXIT_CONCURRENT,
     UPDATE_MARKER_MAX_AGE_SECONDS,
+    UpdateHolder,
     UpdateLock,
     describe_holder,
     read_live_update,
     update_marker_path,
 )
+
+
+def test_non_update_cli_launch_is_blocked_by_live_update(monkeypatch, capsys):
+    from hermes_cli import main as cli_main
+
+    holder = UpdateHolder(pid=4321, age_seconds=3)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: holder,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli_main._refuse_cli_launch_during_update(["chat"])
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
+    assert "Another Hermes update is already running" in capsys.readouterr().out
+
+
+def test_update_cli_launch_reaches_authoritative_lock(monkeypatch):
+    from hermes_cli import main as cli_main
+
+    read = Mock(side_effect=AssertionError("must not pre-read update lock"))
+    monkeypatch.setattr("hermes_cli.update_lock.read_live_update", read)
+
+    cli_main._refuse_cli_launch_during_update(
+        ["--profile", "work", "update", "--yes"]
+    )
+
+    read.assert_not_called()
 
 # A pid no live process owns. os.kill(pid, 0) must report it dead so a crashed
 # updater can never wedge every future update. Deliberately larger than any

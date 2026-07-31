@@ -3385,15 +3385,17 @@ def _quiesce_posix_gateways_for_update(
                 state = read_runtime_status(home / "gateway_state.json") or {}
                 try:
                     state_pid = int(state.get("pid", 0) or 0)
+                    state_start_time = int(state["start_time"])
                     active_agents = int(state.get("active_agents", 0) or 0)
-                except (TypeError, ValueError):
+                except (KeyError, TypeError, ValueError):
                     continue
+                live_start_time = get_process_start_time(pid)
                 if (
                     state_pid == pid
+                    and state_start_time == process_start_times[pid]
+                    and live_start_time == process_start_times[pid]
                     and state.get("gateway_state") == "draining"
                     and active_agents == 0
-                    and get_process_start_time(pid)
-                    == process_start_times[pid]
                 ):
                     remaining.pop(pid, None)
             if remaining:
@@ -3503,6 +3505,14 @@ def _mark_posix_gateway_mutation(token: dict | None) -> None:
     """Mark the update boundary as mutating before an irreversible operation."""
     _m()._begin_posix_gateway_mutation(token)
     _m()._complete_posix_gateway_mutation(token, mutated=True)
+
+
+def _complete_posix_gateway_noop(token: dict | None) -> None:
+    """Disarm retention after temporary mutations are fully reversed."""
+    if not token:
+        return
+    token.pop("mutation_started", None)
+    token["retain_on_exit"] = False
 
 
 def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
@@ -4324,6 +4334,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        _temporary_checkout_mutated = False
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -4332,6 +4343,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # fast-forward.
         if current_branch != branch:
             _m()._mark_posix_gateway_mutation(_posix_gateway_quiesce)
+            _temporary_checkout_mutated = True
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
@@ -4384,6 +4396,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _posix_gateway_quiesce,
                 mutated=auto_stash_ref is not None,
             )
+            _temporary_checkout_mutated = auto_stash_ref is not None
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -4403,6 +4416,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         if commit_count == 0:
             _invalidate_update_cache()
+            _fork_sync_mutated = False
 
             # Even if origin is up to date, the fork may be behind upstream
             if is_fork and branch == "main":
@@ -4426,23 +4440,45 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         or pre_sync_sha != post_sync_sha
                     ),
                 )
+                _fork_sync_mutated = (
+                    pre_sync_sha is None
+                    or post_sync_sha is None
+                    or pre_sync_sha != post_sync_sha
+                )
 
             # Restore stash and switch back to original branch if we moved
+            _stash_restored = auto_stash_ref is None
             if auto_stash_ref is not None:
-                _m()._restore_stashed_changes(
+                _stash_restored = _m()._restore_stashed_changes(
                     git_cmd,
                     _m().PROJECT_ROOT,
                     auto_stash_ref,
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
+            _checkout_restored = current_branch == branch
             if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
+                _restore_checkout = subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     check=False,
+                )
+                _checkout_restored = _restore_checkout.returncode == 0
+
+            # The target-branch checkout and autostash are temporary
+            # mutations. Once both are proven restored, and fork sync did not
+            # change HEAD, the original gateways can safely resume if the
+            # remaining runtime probes are also no-ops.
+            if (
+                _temporary_checkout_mutated
+                and _checkout_restored
+                and _stash_restored
+                and not _fork_sync_mutated
+            ):
+                _m()._complete_posix_gateway_noop(
+                    _posix_gateway_quiesce
                 )
 
             # "No new commits" does not mean the managed interpreter is safe.

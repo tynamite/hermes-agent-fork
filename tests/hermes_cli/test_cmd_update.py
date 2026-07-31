@@ -382,6 +382,54 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_no_commit_restored_checkout_disarms_gateway_drain(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.branch = "main"
+        mock_run.side_effect = _make_run_side_effect(
+            branch="feature",
+            verify_ok=True,
+            commit_count="0",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+        ) as finish:
+            cmd_update(mock_args)
+
+        finish.assert_not_called()
+        assert "mutation_started" not in token
+        assert token["retain_on_exit"] is False
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_same_branch_autostash_arms_mutation_guard_first(
         self,
         mock_run,

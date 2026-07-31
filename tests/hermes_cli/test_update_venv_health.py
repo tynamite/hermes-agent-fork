@@ -627,7 +627,7 @@ def test_partial_posix_quiescence_is_released_before_abort(
     monkeypatch, capsys
 ):
     monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
-    token = {"pids": {666}, "created_markers": [{"pid": 666}]}
+    token = {"pids": {666}, "created_markers": []}
     release = MagicMock()
 
     result = _run_update_until_guard(
@@ -651,7 +651,7 @@ def test_released_quiescence_removes_gateway_pid_exclusions(
 ):
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
     seen = []
-    token = {"pids": {666}, "created_markers": [{"pid": 666}]}
+    token = {"pids": {666}, "created_markers": []}
     release = MagicMock()
     fake_psutil = types.SimpleNamespace(
         Process=lambda: SimpleNamespace(
@@ -884,6 +884,7 @@ def test_quiesce_posix_gateway_confirms_live_drain_state_before_exclusion(
         assert marker.exists()
         return {
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         }
@@ -931,6 +932,7 @@ def test_quiesce_posix_gateway_refreshes_stale_drain_marker(
         )
         return {
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         }
@@ -986,6 +988,7 @@ def test_quiesce_posix_gateway_rejects_active_operator_drain(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -1031,6 +1034,7 @@ def test_quiesce_posix_gateway_reclaims_orphaned_update_marker(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -1083,6 +1087,7 @@ def test_quiesce_posix_gateway_reclaims_reused_owner_pid(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 333,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -1133,6 +1138,7 @@ def test_quiesce_posix_gateway_rejects_live_foreign_updater(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -1169,6 +1175,7 @@ def test_release_posix_gateway_preserves_replacement_drain(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -1246,6 +1253,47 @@ def test_quiesce_posix_gateway_rejects_pid_reuse_during_wait(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    ), patch.object(
+        cli_main._time,
+        "monotonic",
+        side_effect=lambda: next(monotonic_values, 4.0),
+    ), patch.object(cli_main._time, "sleep"):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is None
+    assert not marker.exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_rejects_stale_runtime_identity(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+    monotonic_values = iter((0.0, 0.0, 4.0))
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=0,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=222,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        return_value={
+            "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
