@@ -100,23 +100,33 @@ def test_zombie_owner_is_reclaimed_immediately(marker):
         os.waitpid(child_pid, 0)
 
 
-def test_posix_zombie_fallback_uses_ps_state(monkeypatch):
-    """Platforms without procfs recognize the standard ``ps`` zombie state."""
+def test_posix_zombie_fallback_reclaims_marker_without_procfs(
+    marker,
+    monkeypatch,
+):
+    """Linux without visible procfs still reclaims a zombie-owned marker."""
     import subprocess
 
     from hermes_cli import update_lock
 
-    monkeypatch.setattr(
-        update_lock.Path,
-        "read_text",
-        Mock(side_effect=FileNotFoundError),
-    )
-    monkeypatch.setattr(update_lock.sys, "platform", "darwin")
+    original_read_text = update_lock.Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == Path("/proc/4321/stat"):
+            raise FileNotFoundError
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(update_lock.Path, "read_text", read_text)
+    monkeypatch.setattr(update_lock.sys, "platform", "linux")
     run = Mock(return_value=Mock(returncode=0, stdout="Z+\n"))
     monkeypatch.setattr(subprocess, "run", run)
 
     assert update_lock._posix_pid_is_zombie(4321) is True
-    run.assert_called_once_with(
+    marker.write_text(f"4321\n{int(time.time())}\n", encoding="utf-8")
+    assert read_live_update(path=marker) is None
+    assert not marker.exists()
+    assert run.call_count == 2
+    run.assert_called_with(
         ["ps", "-o", "state=", "-p", "4321"],
         capture_output=True,
         text=True,

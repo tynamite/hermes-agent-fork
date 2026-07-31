@@ -98,12 +98,9 @@ def _posix_pid_is_zombie(pid: int) -> bool:
     try:
         raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except FileNotFoundError:
-        if sys.platform.startswith("linux"):
-            # A normal Linux procfs has no entry once the PID is gone. Let the
-            # non-signalling probe below decide the process-disappearance race
-            # without spawning ``ps`` for every stale marker.
-            return False
-        # macOS/BSD have no procfs. Ask their standard ``ps`` utility instead.
+        # macOS/BSD have no procfs, and Linux may run with procfs hidden or
+        # unmounted (for example in a restricted container or chroot). Ask the
+        # standard ``ps`` utility when procfs cannot provide the process state.
         try:
             import subprocess
 
