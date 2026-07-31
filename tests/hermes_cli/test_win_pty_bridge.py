@@ -125,6 +125,23 @@ def test_verify_closed_accepts_gone_tree_without_pid_reuse(monkeypatch):
     assert bridge.verify_closed() is True
 
 
+def test_verify_closed_fails_closed_after_tree_snapshot_error():
+    class _ExitedProc:
+        pid = 101
+
+        @staticmethod
+        def isalive():
+            return False
+
+    bridge = WinPtyBridge.__new__(WinPtyBridge)
+    bridge._proc = _ExitedProc()
+    bridge._closed = True
+    bridge._tree_identities = {101: 1001}
+    bridge._tree_snapshot_failed = True
+
+    assert bridge.verify_closed() is False
+
+
 def test_close_force_kills_and_records_the_windows_process_tree(
     monkeypatch,
 ):

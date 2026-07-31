@@ -115,6 +115,46 @@ def test_busy_interrupt_mode_ignores_completed_background_delegation(monkeypatch
 
 
 
+def test_busy_interrupt_worker_is_tracked(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    allow_interrupt = threading.Event()
+    started = threading.Event()
+
+    def interrupt():
+        started.set()
+        allow_interrupt.wait(timeout=1)
+
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=interrupt),
+        running=True,
+    )
+
+    server._handle_busy_submit("r1", "sid", session, "continue", "ws-1")
+    assert started.wait(timeout=1)
+    assert server.has_active_tui_work() is True
+
+    allow_interrupt.set()
+    deadline = time.monotonic() + 1
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.has_active_tui_work() is False
+
+
+def test_busy_interrupt_rejected_during_update_clears_pending(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_tui_update_quiesced", True)
+    calls = []
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=lambda: calls.append("interrupt")),
+        running=True,
+    )
+
+    server._handle_busy_submit("r1", "sid", session, "continue", "ws-1")
+
+    assert calls == []
+    assert session["_busy_interrupt_pending"] is False
+
+
 def test_busy_steer_mode_injects_when_accepted(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
     agent = types.SimpleNamespace(steer=lambda text: True, interrupt=lambda *a, **k: None)
@@ -297,7 +337,6 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     # Failure must not leave the session wedged as running.
     assert session["running"] is False
 
-
 def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
     session = _session(queued_prompt={"text": "B", "transport": None})
     monkeypatch.setattr(
@@ -359,3 +398,4 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert session.get("queued_prompts") is None
 
 
+=======

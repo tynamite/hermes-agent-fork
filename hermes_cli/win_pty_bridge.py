@@ -66,6 +66,7 @@ class WinPtyBridge:
         self._proc = proc
         self._closed = False
         self._tree_identities: dict[int, Optional[int]] = {}
+        self._tree_snapshot_failed = False
         try:
             from gateway.status import get_process_start_time
 
@@ -127,6 +128,8 @@ class WinPtyBridge:
 
     def verify_closed(self) -> bool:
         """Strict process-tree exit probe used by fail-closed update shutdown."""
+        if getattr(self, "_tree_snapshot_failed", False):
+            return False
         try:
             if self._proc.isalive():
                 return False
@@ -217,7 +220,10 @@ class WinPtyBridge:
                     child_pid
                 )
         except Exception:
-            pass
+            # taskkill /T and pywinpty are both best-effort below. Without an
+            # authoritative pre-kill tree snapshot, a surviving grandchild is
+            # unknowable, so update teardown must fail closed.
+            self._tree_snapshot_failed = True
         try:
             from gateway.status import terminate_pid
 

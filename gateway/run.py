@@ -5445,6 +5445,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _external_drain_blocks_internal: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -5624,6 +5625,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._external_drain_blocks_internal = False
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -7498,7 +7500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # with its lifecycle action, then (on cancel/abort) the marker is removed
     # and the gateway re-accepts turns.
     # ------------------------------------------------------------------
-    def _enter_external_drain(self) -> None:
+    def _enter_external_drain(self, *, block_internal: bool = False) -> None:
         """Begin external drain: stop accepting new turns, flip state.
 
         Idempotent — re-entering while already draining is a no-op beyond a
@@ -7506,8 +7508,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         whole point is to let them finish); only NEW turns are refused.
         """
         if self._external_drain_active:
+            # An updater-owned marker is stricter than an operator/NAS drain:
+            # once observed, no new module-loading work may enter.
+            self._external_drain_blocks_internal = (
+                self._external_drain_blocks_internal or block_internal
+            )
             return
         self._external_drain_active = True
+        self._external_drain_blocks_internal = block_internal
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.",
@@ -7528,6 +7536,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        self._external_drain_blocks_internal = False
         if self._draining or not self._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
@@ -7556,12 +7565,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the gateway into drain. Best-effort: any tick error is logged and the
         loop continues (a transient stat() failure must not wedge the gateway).
         """
-        from gateway.drain_control import drain_requested
+        from gateway.drain_control import drain_requested, read_drain_request
 
         while self._running:
             try:
                 if drain_requested():
-                    self._enter_external_drain()
+                    marker = read_drain_request() or {}
+                    self._enter_external_drain(
+                        block_internal=marker.get("principal") == "hermes-update"
+                    )
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
                     # external caller polls this reversible drain state.
@@ -14902,11 +14914,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the in-flight set can only fall to zero — eliminating the TOCTOU race
         # (D4a: stop accepting new turns FIRST, then NAS polls until
         # active_agents==0). In-flight turns are untouched; this only blocks the
-        # claim of a NEW session slot. Internal/system events (restart-recovery
-        # replays, background-process completions) bypass the gate — they are
-        # not user-initiated new work and must still flow during a drain.
+        # claim of a NEW session slot. Internal/system events normally bypass
+        # operator/NAS drains, but updater-owned drains block every event from
+        # starting module-loading work while files can mutate.
         # Reversible: once the marker is removed the gate opens again.
-        if self._external_drain_active and not is_internal:
+        if self._external_drain_active and (
+            not is_internal or self._external_drain_blocks_internal
+        ):
             logger.info(
                 "Refusing new turn for session %s — external drain active.",
                 _quick_key,

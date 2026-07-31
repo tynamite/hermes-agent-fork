@@ -7435,7 +7435,16 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
 
-    threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
+    worker = _start_tracked_tui_worker(
+        target=interrupt,
+        daemon=True,
+        name=f"busy-interrupt-{sid}",
+    )
+    if worker is None:
+        # Quiescence won the admission race, so the target never gets its
+        # finally block. Release the per-session coalescing flag here.
+        with session["history_lock"]:
+            session["_busy_interrupt_pending"] = False
 
 
 def _handle_busy_submit(

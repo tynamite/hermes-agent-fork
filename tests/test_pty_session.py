@@ -170,6 +170,60 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
 
 
 @pytest.mark.asyncio
+async def test_capacity_eviction_remains_registered_until_close_finishes():
+    reg = make_registry(max_sessions=1)
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class SlowIdleSession:
+        key = "old"
+        attached = False
+        last_detached_at = 1.0
+        alive = True
+
+        async def close(self):
+            close_started.set()
+            await allow_close.wait()
+
+    old = SlowIdleSession()
+    reg._sessions[old.key] = old
+    spawn_task = asyncio.create_task(
+        reg.attach_or_spawn("new", spawn=lambda: FakeBridge([]))
+    )
+
+    await close_started.wait()
+    assert reg._sessions == {"old": old}
+
+    allow_close.set()
+    session, created = await spawn_task
+    assert created is True
+    assert reg._sessions == {"new": session}
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_capacity_eviction_retains_session_when_close_fails():
+    reg = make_registry(max_sessions=1)
+
+    class StuckIdleSession:
+        key = "old"
+        attached = False
+        last_detached_at = 1.0
+        alive = True
+
+        async def close(self):
+            raise RuntimeError("still alive")
+
+    old = StuckIdleSession()
+    reg._sessions[old.key] = old
+
+    with pytest.raises(RuntimeError, match="still alive"):
+        await reg.attach_or_spawn("new", spawn=lambda: FakeBridge([]))
+
+    assert reg._sessions == {"old": old}
+
+
+@pytest.mark.asyncio
 async def test_reaper_loop_invokes_reap(monkeypatch):
     from hermes_cli.pty_session import run_reaper
     reg = make_registry()

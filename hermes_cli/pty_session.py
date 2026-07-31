@@ -181,7 +181,7 @@ class PtySessionRegistry:
             await existing.close()
             self._sessions.pop(key, None)
         if len(self._sessions) >= self._max:
-            self._reap_one_idle_or_raise()
+            await self._reap_one_idle_or_raise()
         # PTY spawn does blocking fork/exec work — keep it off the event
         # loop (#53227).
         bridge = await asyncio.to_thread(spawn)
@@ -211,14 +211,17 @@ class PtySessionRegistry:
             await session.close()
             self._sessions.pop(key, None)
 
-    def _reap_one_idle_or_raise(self) -> None:
+    async def _reap_one_idle_or_raise(self) -> None:
         idle = [s for s in self._sessions.values()
                 if not s.attached and s.last_detached_at is not None]
         if not idle:
             raise RegistryFull()
         oldest = min(idle, key=lambda s: s.last_detached_at or 0.0)
+        # Keep the session registered until its process tree has been verified
+        # closed. Update quiescence counts the registry, so removing it before
+        # close() finishes would make an evicted PTY invisible to the updater.
+        await oldest.close()
         self._sessions.pop(oldest.key, None)
-        asyncio.create_task(oldest.close())
 
     async def close_all(self) -> None:
         for key in list(self._sessions):

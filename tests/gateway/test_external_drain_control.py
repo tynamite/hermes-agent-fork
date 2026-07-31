@@ -215,6 +215,7 @@ class TestInstantiationEpoch:
 def _drain_runner():
     runner, adapter = make_restart_runner()
     runner._external_drain_active = False
+    runner._external_drain_blocks_internal = False
     # Bind the real methods under test.
     runner._enter_external_drain = GatewayRunner._enter_external_drain.__get__(
         runner, GatewayRunner
@@ -294,5 +295,41 @@ class TestNewTurnGate:
             message_id="m1",
         )
         result = await runner._handle_message(event)
+        assert result is not None
+        assert "draining" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_operator_drain_still_allows_internal_work(self, monkeypatch):
+        runner, _ = _drain_runner()
+        runner._external_drain_active = True
+        runner._external_drain_blocks_internal = False
+        event = MessageEvent(
+            text="[SYSTEM: Background process completed]",
+            source=make_restart_source(),
+            message_id="m1",
+            internal=True,
+        )
+
+        async def stop_after_gate(*_args, **_kwargs):
+            raise RuntimeError("passed gate")
+
+        monkeypatch.setattr(runner, "_handle_message_with_agent", stop_after_gate)
+        with pytest.raises(RuntimeError, match="passed gate"):
+            await runner._handle_message(event)
+
+    @pytest.mark.asyncio
+    async def test_updater_drain_refuses_internal_work(self):
+        runner, _ = _drain_runner()
+        runner._external_drain_active = True
+        runner._external_drain_blocks_internal = True
+        event = MessageEvent(
+            text="[SYSTEM: Background process completed]",
+            source=make_restart_source(),
+            message_id="m1",
+            internal=True,
+        )
+
+        result = await runner._handle_message(event)
+
         assert result is not None
         assert "draining" in result.lower()

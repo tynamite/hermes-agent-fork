@@ -7950,6 +7950,7 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
       clearTimeout(timer)
       resolve(true)
     }
+
     const timer = setTimeout(() => {
       child.off('exit', onExit)
       resolve(false)
@@ -7976,6 +7977,7 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
     isProcessAlive: pid => {
       try {
         process.kill(pid, 0)
+
         return true
       } catch (error: any) {
         return error?.code !== 'ESRCH'
@@ -8181,6 +8183,12 @@ async function spawnPoolBackend(profile, entry) {
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
+
+  // Runtime resolution may yield after the clearance wait. Close that final
+  // race immediately before creating the child.
+  if (updateInFlight) {
+    throw new Error('Hermes update started while resolving the profile backend')
+  }
 
   const child = spawn(
     backend.command,
@@ -8469,6 +8477,12 @@ async function startHermes() {
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
+
+    // Runtime resolution and boot-progress updates may yield after the startup
+    // gate. Recheck the in-process owner immediately before creating the child.
+    if (updateInFlight) {
+      throw new Error('Hermes update started while resolving the primary backend')
+    }
 
     const hermesProcess = spawn(
       backend.command,
