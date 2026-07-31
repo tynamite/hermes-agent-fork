@@ -2982,10 +2982,27 @@ def _detect_venv_python_processes(
                                 break
                     argv0 = resolved_argv0
             argv0_norm = os.path.abspath(argv0) if argv0 else ""
+            # PROJECT_ROOT is canonicalized during startup, but argv[0] can
+            # retain a symlinked checkout alias. Resolve only the launcher
+            # directory so ``<alias>/venv/bin/python`` maps back under the
+            # canonical venv without following the Python launcher symlink to
+            # its external base interpreter.
+            argv0_canonical_dir = (
+                os.path.join(
+                    os.path.realpath(os.path.dirname(argv0_norm)),
+                    os.path.basename(argv0_norm),
+                )
+                if argv0_norm
+                else ""
+            )
             exe_path_norm = os.path.abspath(exe_raw) if exe_raw else ""
             is_holder = any(
                 path.startswith(prefix)
-                for path in (argv0_norm, exe_path_norm)
+                for path in (
+                    argv0_norm,
+                    argv0_canonical_dir,
+                    exe_path_norm,
+                )
                 for prefix in posix_venv_prefixes
             )
             # setproctitle rewrites a Hermes process's argv to bare ``hermes``,

@@ -117,14 +117,16 @@ def test_detect_venv_python_finds_posix_venv_launcher(_winp, tmp_path):
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
-def test_detect_venv_python_matches_resolved_symlinked_project_root(
+def test_detect_venv_python_matches_logical_launcher_under_canonical_root(
     _winp, tmp_path
 ):
     real_root = tmp_path / "real-root"
     real_root.mkdir()
     logical_root = tmp_path / "logical-root"
     logical_root.symlink_to(real_root, target_is_directory=True)
-    venv_python = str(real_root / "venv" / "bin" / "python")
+    logical_venv_python = str(
+        logical_root / "venv" / "bin" / "python"
+    )
     venv_versioned_python = str(real_root / "venv" / "bin" / "python3.13")
     fake_psutil = types.SimpleNamespace(
         process_iter=lambda attrs: iter(
@@ -133,7 +135,7 @@ def test_detect_venv_python_matches_resolved_symlinked_project_root(
                     108,
                     "/usr/bin/python3",
                     "python3",
-                    [venv_python, "worker.py"],
+                    [logical_venv_python, "worker.py"],
                 ),
                 _proc(110, venv_versioned_python, "python3.13"),
             ]
@@ -141,7 +143,9 @@ def test_detect_venv_python_matches_resolved_symlinked_project_root(
         Process=MagicMock(),
     )
 
-    with patch.object(cli_main, "PROJECT_ROOT", logical_root), patch.dict(
+    # Production canonicalizes PROJECT_ROOT with Path.resolve(), while a
+    # process launched through the symlink can retain the logical argv[0].
+    with patch.object(cli_main, "PROJECT_ROOT", real_root), patch.dict(
         sys.modules, {"psutil": fake_psutil}
     ):
         matches = cli_main._detect_venv_python_processes()
