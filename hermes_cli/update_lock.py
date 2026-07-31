@@ -136,7 +136,7 @@ def _pid_alive(pid: int) -> bool:
         except (AttributeError, OSError, OverflowError):
             return False
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — reached only after os.name != "nt"
     except ProcessLookupError:
         return False
     except PermissionError:
