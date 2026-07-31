@@ -291,6 +291,14 @@ def _invokes_update(argv: list[str], entrypoint: str) -> bool:
     )
 
 
+def _invokes_updater_desktop_rebuild(
+    argv: list[str],
+    entrypoint: str,
+) -> bool:
+    """Whether this is Tauri's exact updater-owned desktop rebuild stage."""
+    return entrypoint == "cli" and argv == ["desktop", "--build-only"]
+
+
 def _invokes_managed_runtime(argv: list[str], entrypoint: str) -> bool:
     """Whether this process starts, rather than manages, a runtime."""
     if entrypoint == "gateway":
@@ -333,6 +341,10 @@ def enforce_update_launch_gate(
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     kind = entrypoint or _update_gate_entrypoint(sys.argv[0])
     invokes_update = _invokes_update(raw_argv, kind)
+    invokes_updater_rebuild = _invokes_updater_desktop_rebuild(
+        raw_argv,
+        kind,
+    )
     try:
         from hermes_cli.update_lock import (
             HANDOFF_PID_ENV,
@@ -349,11 +361,13 @@ def enforce_update_launch_gate(
         return
     if holder is None:
         return
-    if invokes_update:
+    if invokes_update or invokes_updater_rebuild:
         # A Tauri updater holds the marker while its Python child stage starts.
-        # Admit only that verified owner/child pairing before recovery; every
-        # foreign update is blocked here and then checked again atomically by
-        # UpdateLock.acquire() to close the read-to-acquire race.
+        # It invokes both ``hermes update`` and the exact
+        # ``hermes desktop --build-only`` follow-up under that claim. Admit
+        # only that verified owner/child pairing before recovery; every
+        # foreign command is blocked here, and the update is checked again
+        # atomically by UpdateLock.acquire() to close the read-to-acquire race.
         try:
             handoff_pid = int(os.environ.get(HANDOFF_PID_ENV, "").strip())
         except ValueError:

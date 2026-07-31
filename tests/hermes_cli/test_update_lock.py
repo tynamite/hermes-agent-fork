@@ -37,6 +37,67 @@ from hermes_cli.update_lock import (
 )
 
 
+def test_windows_pid_above_dword_range_is_not_probed(monkeypatch):
+    from hermes_cli import update_lock
+
+    monkeypatch.setattr(update_lock.os, "name", "nt")
+
+    assert update_lock._pid_alive(0x1_0000_0000) is False
+
+
+def test_windows_handoff_accepts_only_managed_launcher_ancestry(monkeypatch):
+    from hermes_cli import update_lock
+
+    monkeypatch.setenv(HANDOFF_PID_ENV, "4321")
+    monkeypatch.setattr(update_lock.os, "name", "nt")
+    monkeypatch.setattr(update_lock.os, "getppid", lambda: 7777)
+    monkeypatch.setattr(
+        update_lock.sys,
+        "executable",
+        r"C:\Hermes\venv\Scripts\python.exe",
+    )
+    monkeypatch.setattr(
+        update_lock,
+        "_windows_process_parent_and_image",
+        lambda pid: (4321, r"c:\hermes\VENV\scripts\HERMES.EXE")
+        if pid == 7777
+        else None,
+    )
+
+    assert update_lock.is_verified_handoff(4321) is True
+
+
+@pytest.mark.parametrize(
+    ("launcher_parent", "launcher_image"),
+    [
+        (9999, r"C:\Hermes\venv\Scripts\hermes.exe"),
+        (4321, r"C:\Other\hermes.exe"),
+    ],
+)
+def test_windows_handoff_rejects_wrong_launcher_identity(
+    monkeypatch,
+    launcher_parent,
+    launcher_image,
+):
+    from hermes_cli import update_lock
+
+    monkeypatch.setenv(HANDOFF_PID_ENV, "4321")
+    monkeypatch.setattr(update_lock.os, "name", "nt")
+    monkeypatch.setattr(update_lock.os, "getppid", lambda: 7777)
+    monkeypatch.setattr(
+        update_lock.sys,
+        "executable",
+        r"C:\Hermes\venv\Scripts\python.exe",
+    )
+    monkeypatch.setattr(
+        update_lock,
+        "_windows_process_parent_and_image",
+        lambda _pid: (launcher_parent, launcher_image),
+    )
+
+    assert update_lock.is_verified_handoff(4321) is False
+
+
 def test_non_update_cli_launch_is_blocked_by_live_update(monkeypatch, capsys):
     import hermes_bootstrap
 
@@ -99,6 +160,48 @@ def test_verified_update_handoff_passes_bootstrap_gate(monkeypatch):
     hermes_bootstrap.enforce_update_launch_gate(
         ["update", "--yes"], entrypoint="cli"
     )
+
+
+def test_verified_handoff_passes_exact_desktop_rebuild_stage(monkeypatch):
+    import hermes_bootstrap
+
+    monkeypatch.setenv(HANDOFF_PID_ENV, "4321")
+    monkeypatch.setattr(os, "getppid", lambda: 4321)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+
+    hermes_bootstrap.enforce_update_launch_gate(
+        ["desktop", "--build-only"], entrypoint="cli"
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["desktop"],
+        ["desktop", "--build-only", "--source"],
+        ["desktop", "--no-open"],
+    ],
+)
+def test_verified_handoff_does_not_admit_other_desktop_commands(
+    monkeypatch,
+    argv,
+):
+    import hermes_bootstrap
+
+    monkeypatch.setenv(HANDOFF_PID_ENV, "4321")
+    monkeypatch.setattr(os, "getppid", lambda: 4321)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(argv, entrypoint="cli")
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
 
 
 def test_matching_handoff_env_from_non_child_is_blocked(monkeypatch):

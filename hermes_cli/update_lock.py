@@ -43,7 +43,9 @@ cannot bypass the lock.
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,7 +103,7 @@ def _pid_alive(pid: int) -> bool:
     routes to ``GenerateConsoleCtrlEvent`` there and can interrupt the updater
     it is meant to inspect (bpo-14484).
     """
-    if pid <= 0:
+    if pid <= 0 or (os.name == "nt" and pid > 0xFFFFFFFF):
         return False
     if os.name == "nt":
         try:
@@ -157,15 +159,136 @@ def _handoff_pid() -> int | None:
     return pid if pid > 0 else None
 
 
+def _windows_process_parent_and_image(pid: int) -> tuple[int, str] | None:
+    """Return a Windows process's parent pid and executable path, fail-closed."""
+    if pid <= 0 or pid > 0xFFFFFFFF:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL(  # type: ignore[attr-defined]
+            "kernel32", use_last_error=True
+        )
+        kernel32.CreateToolhelp32Snapshot.argtypes = (
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32W),
+        )
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32W),
+        )
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snapshot == wintypes.HANDLE(-1).value:
+            return None
+        parent_pid = None
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            has_entry = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while has_entry:
+                if int(entry.th32ProcessID) == pid:
+                    parent_pid = int(entry.th32ParentProcessID)
+                    break
+                has_entry = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        if not parent_pid:
+            return None
+
+        process = kernel32.OpenProcess(
+            0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
+            False,
+            pid,
+        )
+        if not process:
+            return None
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(
+                process,
+                0,
+                buffer,
+                ctypes.byref(size),
+            ):
+                return None
+            return parent_pid, buffer.value
+        finally:
+            kernel32.CloseHandle(process)
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
+def _is_windows_launcher_handoff(holder_pid: int, launcher_pid: int) -> bool:
+    """Verify Tauri -> managed hermes.exe -> Python without trusting names."""
+    process_info = _windows_process_parent_and_image(launcher_pid)
+    if process_info is None:
+        return False
+    launcher_parent_pid, launcher_image = process_info
+    expected_launcher = ntpath.join(
+        ntpath.dirname(sys.executable),
+        "hermes.exe",
+    )
+    return (
+        launcher_parent_pid == holder_pid
+        and ntpath.normcase(ntpath.abspath(launcher_image))
+        == ntpath.normcase(ntpath.abspath(expected_launcher))
+    )
+
+
 def is_verified_handoff(holder_pid: int) -> bool:
-    """Whether the live marker owner is this process's declared parent."""
+    """Whether the live marker owner is our declared updater ancestor."""
     handoff_pid = _handoff_pid()
     if handoff_pid is None or handoff_pid != holder_pid:
         return False
     try:
-        return os.getppid() == holder_pid
+        parent_pid = os.getppid()
     except (AttributeError, OSError):
         return False
+    if parent_pid == holder_pid:
+        return True
+    return os.name == "nt" and _is_windows_launcher_handoff(
+        holder_pid,
+        parent_pid,
+    )
 
 
 @dataclass(frozen=True)

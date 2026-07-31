@@ -4347,6 +4347,10 @@ def _cmd_update_impl(
         # the same thing — get HEAD onto the requested branch first, then
         # fast-forward.
         if current_branch != branch:
+            pre_checkout_sha = _capture_head_sha(
+                git_cmd,
+                _m().PROJECT_ROOT,
+            )
             _m()._mark_posix_gateway_mutation(_posix_gateway_quiesce)
             _temporary_checkout_mutated = True
             label = (
@@ -4377,13 +4381,35 @@ def _cmd_update_impl(
                 if track_result.returncode != 0:
                     # Restore the user's prior branch + stash before bailing
                     # so we don't leave them stranded in a weird state.
+                    stash_restored = auto_stash_ref is None
                     if auto_stash_ref is not None:
-                        _m()._restore_stashed_changes(
+                        stash_restored = _m()._restore_stashed_changes(
                             git_cmd,
                             _m().PROJECT_ROOT,
                             auto_stash_ref,
                             prompt_user=False,
                             input_fn=gw_input_fn,
+                        )
+                    post_checkout_sha = _capture_head_sha(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                    )
+                    branch_result = subprocess.run(
+                        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                        check=False,
+                    )
+                    if (
+                        stash_restored
+                        and pre_checkout_sha is not None
+                        and post_checkout_sha == pre_checkout_sha
+                        and branch_result.returncode == 0
+                        and branch_result.stdout.strip() == current_branch
+                    ):
+                        _m()._complete_posix_gateway_noop(
+                            _posix_gateway_quiesce
                         )
                     print(f"✗ Branch '{branch}' does not exist locally or on origin.")
                     if track_result.stderr.strip():
@@ -4683,6 +4709,17 @@ def _cmd_update_impl(
                     if rollback_result.returncode == 0:
                         print("  ✓ Rollback complete — your install is unchanged.")
                         print("  Try ``hermes update`` again later once a fix lands.")
+                        if (
+                            not _temporary_checkout_mutated
+                            and _capture_head_sha(
+                                git_cmd,
+                                _m().PROJECT_ROOT,
+                            )
+                            == pre_pull_sha
+                        ):
+                            _m()._complete_posix_gateway_noop(
+                                _posix_gateway_quiesce
+                            )
                     else:
                         print("  ✗ Rollback failed. Recover manually with:")
                         print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
@@ -5382,6 +5419,14 @@ def _cmd_update_impl(
             authorize_runtime_restarts is not None
             and not authorize_runtime_restarts()
         ):
+            if gateway_mode:
+                try:
+                    (get_hermes_home() / ".update_exit_code").write_text(
+                        "1",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
             print(
                 "✗ Could not authorize post-update runtime restarts; "
                 "leaving existing processes untouched."
