@@ -288,6 +288,212 @@ class TestCmdUpdateBranchFallback:
         assert "Update drain retained" in output
         assert "555" in output
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_commit_repair_fails_when_old_gateway_survives(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+        capsys,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.gateway = True
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+            "mutation_started": True,
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        with patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+            return_value={555},
+        ), patch(
+            "hermes_cli.update_cmd.get_hermes_home",
+            return_value=tmp_path,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_update(mock_args)
+
+        assert exc.value.code == 1
+        assert (tmp_path / ".update_exit_code").read_text() == "1"
+        assert "Update drain retained" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_same_branch_autostash_arms_mutation_guard_first(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        events = []
+
+        def begin(_token):
+            events.append(("begin", None))
+
+        def stash(*_args, **_kwargs):
+            events.append(("stash", None))
+            return None
+
+        def complete(_token, *, mutated):
+            events.append(("complete", mutated))
+
+        with patch.object(
+            hm,
+            "_begin_posix_gateway_mutation",
+            side_effect=begin,
+        ), patch.object(
+            hm,
+            "_stash_local_changes_if_needed",
+            side_effect=stash,
+        ), patch.object(
+            hm,
+            "_complete_posix_gateway_mutation",
+            side_effect=complete,
+        ):
+            cmd_update(mock_args)
+
+        assert events[:3] == [
+            ("begin", None),
+            ("stash", None),
+            ("complete", False),
+        ]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_same_branch_autostash_exception_leaves_guard_armed(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        with patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch.object(
+            hm,
+            "_stash_local_changes_if_needed",
+            side_effect=RuntimeError("stash interrupted"),
+        ):
+            with pytest.raises(RuntimeError, match="stash interrupted"):
+                cmd_update(mock_args)
+
+        assert token["retain_on_exit"] is True
+        assert "mutation_started" not in token
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_foreground_gateway_supervisor_is_included_in_restart_fleet(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.gateway = True
+        monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="1",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        prepare_restart = patch(
+            "hermes_cli.gateway._prepare_profile_gateway_update_restart",
+            return_value="external-supervisor",
+        )
+        with patch("psutil.Process") as psutil_process, patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch(
+            "hermes_cli.gateway.find_gateway_pids",
+            return_value=[],
+        ), patch(
+            "hermes_cli.gateway._get_service_pids",
+            return_value=set(),
+        ), prepare_restart as prepare_mock, patch(
+            "hermes_cli.gateway._graceful_restart_via_sigusr1",
+            return_value=True,
+        ), patch(
+            "hermes_cli.gateway._wait_for_gateway_exit",
+        ), patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+            return_value=set(),
+        ):
+            psutil_process.return_value.parents.return_value = [
+                SimpleNamespace(pid=555)
+            ]
+            cmd_update(mock_args)
+
+        prepare_mock.assert_called_with("default", 555)
+
 
 class TestCmdUpdateMigrationPrompt:
     """The config-migration prompt names what changed and skips the prompt

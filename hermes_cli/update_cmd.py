@@ -3257,6 +3257,18 @@ def _quiesce_posix_gateways_for_update(
     if not processes:
         return None
 
+    process_start_times: dict[int, int] = {}
+    for proc in processes:
+        pid = int(proc.pid)
+        start_time = get_process_start_time(pid)
+        if start_time is None:
+            logger.debug(
+                "Could not capture gateway PID %s identity before drain",
+                pid,
+            )
+            return None
+        process_start_times[pid] = start_time
+
     created_markers: list[dict] = []
     try:
         for proc in processes:
@@ -3352,11 +3364,13 @@ def _quiesce_posix_gateways_for_update(
                 raise RuntimeError(
                     f"drain marker ownership kept changing for {home}"
                 )
-    except Exception as exc:
-        logger.debug("Could not request pre-update gateway drain: %s", exc)
+    except BaseException as exc:
         _m()._release_posix_gateway_quiesce(
             {"created_markers": created_markers}
         )
+        if not isinstance(exc, Exception):
+            raise
+        logger.debug("Could not request pre-update gateway drain: %s", exc)
         return None
 
     try:
@@ -3365,22 +3379,33 @@ def _quiesce_posix_gateways_for_update(
         timeout = 62.0
     deadline = _time.monotonic() + timeout
     remaining = {int(proc.pid): Path(proc.path) for proc in processes}
-    while remaining and _time.monotonic() < deadline:
-        for pid, home in list(remaining.items()):
-            state = read_runtime_status(home / "gateway_state.json") or {}
-            try:
-                state_pid = int(state.get("pid", 0) or 0)
-                active_agents = int(state.get("active_agents", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if (
-                state_pid == pid
-                and state.get("gateway_state") == "draining"
-                and active_agents == 0
-            ):
-                remaining.pop(pid, None)
-        if remaining:
-            _time.sleep(0.25)
+    try:
+        while remaining and _time.monotonic() < deadline:
+            for pid, home in list(remaining.items()):
+                state = read_runtime_status(home / "gateway_state.json") or {}
+                try:
+                    state_pid = int(state.get("pid", 0) or 0)
+                    active_agents = int(state.get("active_agents", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    state_pid == pid
+                    and state.get("gateway_state") == "draining"
+                    and active_agents == 0
+                    and get_process_start_time(pid)
+                    == process_start_times[pid]
+                ):
+                    remaining.pop(pid, None)
+            if remaining:
+                _time.sleep(0.25)
+    except BaseException as exc:
+        _m()._release_posix_gateway_quiesce(
+            {"created_markers": created_markers}
+        )
+        if not isinstance(exc, Exception):
+            raise
+        logger.debug("Could not confirm pre-update gateway drain: %s", exc)
+        return None
 
     if remaining:
         logger.warning(
@@ -3394,10 +3419,7 @@ def _quiesce_posix_gateways_for_update(
 
     return {
         "pids": {int(proc.pid) for proc in processes},
-        "process_start_times": {
-            int(proc.pid): get_process_start_time(int(proc.pid))
-            for proc in processes
-        },
+        "process_start_times": process_start_times,
         "created_markers": created_markers,
     }
 
@@ -4061,11 +4083,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # rather than race. Deliberately NOT bypassed by plain --force; only the
     # explicit --force-venv escape hatch skips this coherence boundary.
     _posix_gateway_quiesce = None
+    _profile_gateway_pids: set[int] = set()
+    _supervisor_pid = 0
     if not getattr(args, "force_venv", False):
         _venv_guard_exclude: set[int] = set()
         _quiesced_gateway_pids: set[int] = set()
         try:
-            _profile_gateway_pids: set[int] = set()
             if not _m()._is_windows():
                 from hermes_cli.gateway import find_profile_gateway_processes
 
@@ -4350,7 +4373,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            _m()._begin_posix_gateway_mutation(
+                _posix_gateway_quiesce
+            )
+            auto_stash_ref = _m()._stash_local_changes_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+            )
+            _m()._complete_posix_gateway_mutation(
+                _posix_gateway_quiesce,
+                mutated=auto_stash_ref is not None,
+            )
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -4507,6 +4540,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         "    Restart those gateways before cancelling their "
                         "update drain."
                     )
+                    if gateway_mode:
+                        _exit_code_path = (
+                            get_hermes_home() / ".update_exit_code"
+                        )
+                        try:
+                            _exit_code_path.write_text(
+                                "1",
+                                encoding="utf-8",
+                            )
+                        except OSError:
+                            pass
+                    _m()._resume_windows_gateways_after_update(
+                        _windows_gateway_resume
+                    )
+                    sys.exit(1)
             else:
                 _m()._release_posix_gateway_quiesce(
                     _posix_gateway_quiesce
@@ -5814,9 +5862,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
+            manual_pids = set(
+                find_gateway_pids(
+                    exclude_pids=service_pids,
+                    all_profiles=True,
+                )
             )
+            # Foreground `/update` runs beneath the gateway it must restart.
+            # Generic discovery intentionally excludes updater ancestors, so
+            # restore only the supervisor identity that was independently
+            # profile-mapped and quiesced before mutation.
+            if (
+                _supervisor_pid > 0
+                and _supervisor_pid in _profile_gateway_pids
+                and _supervisor_pid
+                in set(
+                    (_posix_gateway_quiesce or {}).get("pids", set())
+                )
+                and _supervisor_pid not in service_pids
+            ):
+                manual_pids.add(_supervisor_pid)
             profile_processes = {
                 proc.pid: proc
                 for proc in find_profile_gateway_processes(exclude_pids=service_pids)

@@ -895,6 +895,9 @@ def test_quiesce_posix_gateway_confirms_live_drain_state_before_exclusion(
         "hermes_cli.gateway._get_restart_drain_timeout",
         return_value=1,
     ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
+    ), patch(
         "gateway.status.read_runtime_status",
         side_effect=read_live_state,
     ):
@@ -902,6 +905,7 @@ def test_quiesce_posix_gateway_confirms_live_drain_state_before_exclusion(
 
     assert token is not None
     assert token["pids"] == {555}
+    assert token["process_start_times"] == {555: 111}
     assert marker.exists()
 
     cli_main._release_posix_gateway_quiesce(token)
@@ -940,6 +944,9 @@ def test_quiesce_posix_gateway_refreshes_stale_drain_marker(
     ), patch(
         "gateway.drain_control.drain_requested",
         return_value=False,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
     ), patch(
         "gateway.status.read_runtime_status",
         side_effect=read_live_state,
@@ -1008,6 +1015,9 @@ def test_quiesce_posix_gateway_reclaims_orphaned_update_marker(
         owner_pid=999999,
     )
 
+    def process_start_time(pid):
+        return None if pid == 999999 else 111
+
     with patch(
         "hermes_cli.gateway.find_profile_gateway_processes",
         return_value=[proc],
@@ -1016,7 +1026,7 @@ def test_quiesce_posix_gateway_reclaims_orphaned_update_marker(
         return_value=1,
     ), patch(
         "gateway.status.get_process_start_time",
-        return_value=None,
+        side_effect=process_start_time,
     ), patch(
         "gateway.status.read_runtime_status",
         return_value={
@@ -1153,6 +1163,9 @@ def test_release_posix_gateway_preserves_replacement_drain(
         "hermes_cli.gateway._get_restart_drain_timeout",
         return_value=1,
     ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
+    ), patch(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
@@ -1170,6 +1183,81 @@ def test_release_posix_gateway_preserves_replacement_drain(
     body = read_drain_request(home=profile_home)
     assert body is not None
     assert body["principal"] == "operator"
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_cleans_up_when_wait_is_interrupted(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=1,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        side_effect=KeyboardInterrupt,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert not marker.exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_rejects_pid_reuse_during_wait(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+    gateway_start_times = iter((111, 222))
+
+    def process_start_time(pid):
+        if pid == 555:
+            return next(gateway_start_times, 222)
+        return 333
+
+    monotonic_values = iter((0.0, 0.0, 4.0))
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=0,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        side_effect=process_start_time,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        return_value={
+            "pid": 555,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    ), patch.object(
+        cli_main._time,
+        "monotonic",
+        side_effect=lambda: next(monotonic_values, 4.0),
+    ), patch.object(cli_main._time, "sleep"):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is None
+    assert not marker.exists()
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
