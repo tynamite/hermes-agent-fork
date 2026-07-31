@@ -93,12 +93,50 @@ def update_marker_path() -> Path:
     return root / MARKER_NAME
 
 
+def _posix_pid_is_zombie(pid: int) -> bool:
+    """Return whether a POSIX process is defunct, without third-party imports."""
+    try:
+        raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if sys.platform.startswith("linux"):
+            # A normal Linux procfs has no entry once the PID is gone. Let the
+            # non-signalling probe below decide the process-disappearance race
+            # without spawning ``ps`` for every stale marker.
+            return False
+        # macOS/BSD have no procfs. Ask their standard ``ps`` utility instead.
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["ps", "-o", "state=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+            return result.returncode == 0 and result.stdout.strip().startswith("Z")
+        except Exception:
+            return False
+    except (PermissionError, OSError):
+        return False
+
+    # /proc/<pid>/stat wraps the command name in parentheses; the name itself
+    # may contain spaces or closing parentheses, so split after the final one.
+    _command, separator, fields = raw_stat.rpartition(")")
+    state_fields = fields.split()
+    return bool(separator and state_fields and state_fields[0] == "Z")
+
+
 def _pid_alive(pid: int) -> bool:
     """True when a process with ``pid`` currently exists.
 
     This must remain stdlib-only because the launch gate calls it from
     :mod:`hermes_bootstrap`, before interrupted-install recovery can repair
-    third-party packages. POSIX ``kill(pid, 0)`` is a non-signalling probe.
+    third-party packages. POSIX ``kill(pid, 0)`` is a non-signalling probe,
+    but it still succeeds for zombies, which are already dead and cannot own
+    a useful update claim. A stdlib-only procfs/``ps`` check rejects those.
     Windows must use ``OpenProcess`` instead: CPython's ``os.kill(pid, 0)``
     routes to ``GenerateConsoleCtrlEvent`` there and can interrupt the updater
     it is meant to inspect (bpo-14484).
@@ -132,6 +170,8 @@ def _pid_alive(pid: int) -> bool:
             return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED => alive
         except (AttributeError, OSError, OverflowError):
             return False
+    if _posix_pid_is_zombie(pid):
+        return False
     try:
         os.kill(pid, 0)  # windows-footgun: ok — reached only after os.name != "nt"
     except ProcessLookupError:

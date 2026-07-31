@@ -45,6 +45,58 @@ def test_windows_pid_above_dword_range_is_not_probed(monkeypatch):
     assert update_lock._pid_alive(0x1_0000_0000) is False
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires procfs")
+def test_zombie_owner_is_reclaimed_immediately(marker):
+    """A defunct updater must not block every entrypoint until marker expiry."""
+    from hermes_cli import update_lock
+
+    child_pid = os.fork()
+    if child_pid == 0:
+        os._exit(0)
+
+    try:
+        deadline = time.monotonic() + 5
+        while update_lock._pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert update_lock._pid_alive(child_pid) is False
+
+        marker.write_text(
+            f"{child_pid}\n{int(time.time())}\n",
+            encoding="utf-8",
+        )
+        assert read_live_update(path=marker) is None
+        assert not marker.exists()
+    finally:
+        os.waitpid(child_pid, 0)
+
+
+def test_posix_zombie_fallback_uses_ps_state(monkeypatch):
+    """Platforms without procfs recognize the standard ``ps`` zombie state."""
+    import subprocess
+
+    from hermes_cli import update_lock
+
+    monkeypatch.setattr(
+        update_lock.Path,
+        "read_text",
+        Mock(side_effect=FileNotFoundError),
+    )
+    monkeypatch.setattr(update_lock.sys, "platform", "darwin")
+    run = Mock(return_value=Mock(returncode=0, stdout="Z+\n"))
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert update_lock._posix_pid_is_zombie(4321) is True
+    run.assert_called_once_with(
+        ["ps", "-o", "state=", "-p", "4321"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5,
+        check=False,
+    )
+
+
 def test_windows_handoff_accepts_only_managed_launcher_ancestry(monkeypatch):
     from hermes_cli import update_lock
 
