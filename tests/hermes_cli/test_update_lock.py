@@ -90,6 +90,7 @@ def test_verified_update_handoff_passes_bootstrap_gate(monkeypatch):
     import hermes_bootstrap
 
     monkeypatch.setenv(HANDOFF_PID_ENV, "4321")
+    monkeypatch.setattr(os, "getppid", lambda: 4321)
     monkeypatch.setattr(
         "hermes_cli.update_lock.read_live_update",
         lambda: UpdateHolder(pid=4321, age_seconds=3),
@@ -98,6 +99,24 @@ def test_verified_update_handoff_passes_bootstrap_gate(monkeypatch):
     hermes_bootstrap.enforce_update_launch_gate(
         ["update", "--yes"], entrypoint="cli"
     )
+
+
+def test_matching_handoff_env_from_non_child_is_blocked(monkeypatch):
+    import hermes_bootstrap
+
+    monkeypatch.setenv(HANDOFF_PID_ENV, "4321")
+    monkeypatch.setattr(os, "getppid", lambda: 9999)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(
+            ["update", "--yes"], entrypoint="cli"
+        )
+
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
 
 
 @pytest.mark.parametrize(
@@ -148,6 +167,30 @@ def test_restart_phase_does_not_admit_general_cli(monkeypatch):
         )
 
     assert exc.value.code == UPDATE_EXIT_CONCURRENT
+
+
+def test_restart_phase_admits_only_dashboard_owned_tui_gateway(monkeypatch):
+    import hermes_bootstrap
+
+    holder = UpdateHolder(
+        pid=4321,
+        age_seconds=3,
+        runtime_restarts_authorized=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: holder,
+    )
+    monkeypatch.delenv("HERMES_TUI_DASHBOARD", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_bootstrap.enforce_update_launch_gate(
+            [], entrypoint="dashboard"
+        )
+    assert exc.value.code == UPDATE_EXIT_CONCURRENT
+
+    monkeypatch.setenv("HERMES_TUI_DASHBOARD", "1")
+    hermes_bootstrap.enforce_update_launch_gate([], entrypoint="dashboard")
 
 
 @pytest.mark.parametrize(
@@ -214,6 +257,7 @@ def test_restart_phase_does_not_admit_sibling_entrypoints(
         "hermes_cli.main",
         "run_agent",
         "acp_adapter.entry",
+        "cron.scheduler",
     ],
 )
 def test_fresh_entrypoint_import_is_blocked_in_bootstrap(
@@ -258,6 +302,25 @@ def test_marker_path_is_shared_across_profiles(tmp_path, monkeypatch):
     profile.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile))
     assert update_marker_path() == root / ".hermes-update-in-progress"
+
+
+def test_marker_path_preserves_arbitrary_nested_custom_home(
+    tmp_path,
+    monkeypatch,
+):
+    """Only the explicit profiles/<name> shape is install-wide."""
+    import hermes_constants
+
+    native = tmp_path / ".hermes"
+    custom = native / "team"
+    monkeypatch.setattr(
+        hermes_constants,
+        "_get_platform_default_hermes_home",
+        lambda: native,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(custom))
+
+    assert update_marker_path() == custom / ".hermes-update-in-progress"
 
 
 def test_runtime_restart_phase_is_live_claim_metadata(marker):
@@ -409,7 +472,7 @@ class TestHandoffFromOrchestratingUpdater:
     The regression: the child saw its own parent's live marker and exited 2,
     so every GUI update failed with "Hermes is still running" and retrying
     just re-ran the same self-deadlock. The parent names its pid in
-    HANDOFF_PID_ENV; a live holder matching it is our own orchestrator.
+    HANDOFF_PID_ENV; the live holder must also be the child's actual parent.
     """
 
     def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch):
@@ -419,6 +482,7 @@ class TestHandoffFromOrchestratingUpdater:
             encoding="utf-8",
         )
         monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
+        monkeypatch.setattr(os, "getppid", lambda: os.getpid())
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True
@@ -437,6 +501,20 @@ class TestHandoffFromOrchestratingUpdater:
         assert read_live_update(
             path=marker
         ).runtime_restarts_authorized is False
+
+    def test_matching_holder_without_parent_relationship_is_refused(
+        self,
+        marker,
+        monkeypatch,
+    ):
+        marker.write_text(
+            f"{os.getpid()}\n{int(time.time())}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
+        monkeypatch.setattr(os, "getppid", lambda: os.getpid() + 1)
+
+        assert UpdateLock(path=marker).acquire() is False
 
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(self, marker, monkeypatch):
         """The env var alone must not bypass the lock."""

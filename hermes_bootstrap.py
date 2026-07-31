@@ -277,6 +277,8 @@ def _update_gate_entrypoint(argv0: str) -> str:
         return "gateway"
     if normalized.endswith("/tui_gateway/entry.py"):
         return "dashboard"
+    if normalized.endswith("/cron/scheduler.py"):
+        return "cron"
     return "other"
 
 
@@ -291,8 +293,12 @@ def _invokes_update(argv: list[str], entrypoint: str) -> bool:
 
 def _invokes_managed_runtime(argv: list[str], entrypoint: str) -> bool:
     """Whether this process starts, rather than manages, a runtime."""
-    if entrypoint in {"gateway", "dashboard"}:
+    if entrypoint == "gateway":
         return True
+    if entrypoint == "dashboard":
+        # tui_gateway.entry is shared by the dashboard and the standalone
+        # native TUI. Only the dashboard restart is updater-owned.
+        return os.environ.get("HERMES_TUI_DASHBOARD", "").strip() == "1"
     if entrypoint != "cli":
         return False
     command_path = _raw_cli_command_path(argv)
@@ -332,6 +338,7 @@ def enforce_update_launch_gate(
             HANDOFF_PID_ENV,
             UPDATE_EXIT_CONCURRENT,
             describe_holder,
+            is_verified_handoff,
             read_live_update,
         )
 
@@ -351,7 +358,11 @@ def enforce_update_launch_gate(
             handoff_pid = int(os.environ.get(HANDOFF_PID_ENV, "").strip())
         except ValueError:
             handoff_pid = -1
-        if handoff_pid > 0 and holder.pid == handoff_pid:
+        if (
+            handoff_pid > 0
+            and holder.pid == handoff_pid
+            and is_verified_handoff(holder.pid)
+        ):
             return
     if (
         holder.runtime_restarts_authorized

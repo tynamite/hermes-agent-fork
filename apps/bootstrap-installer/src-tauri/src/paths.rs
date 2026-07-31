@@ -25,7 +25,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 pub fn hermes_home() -> PathBuf {
     if let Ok(override_path) = std::env::var("HERMES_HOME") {
         if !override_path.trim().is_empty() {
-            return PathBuf::from(override_path);
+            return normalize_hermes_home_root(PathBuf::from(override_path));
         }
     }
 
@@ -46,6 +46,25 @@ pub fn hermes_home() -> PathBuf {
     // Last resort — current dir, almost certainly wrong but at least
     // doesn't panic.
     PathBuf::from(".hermes")
+}
+
+/// Collapse only the explicit `<root>/profiles/<name>` layout.
+///
+/// Electron applies the same rule before launching this updater and Python's
+/// update marker does likewise. Arbitrary nested custom homes such as
+/// `~/.hermes/team` are deliberately preserved.
+fn normalize_hermes_home_root(home: PathBuf) -> PathBuf {
+    let Some(parent) = home.parent() else {
+        return home;
+    };
+    let is_profile_home = parent
+        .file_name()
+        .map(|name| name.to_string_lossy().eq_ignore_ascii_case("profiles"))
+        .unwrap_or(false);
+    if is_profile_home {
+        return parent.parent().unwrap_or(parent).to_path_buf();
+    }
+    home
 }
 
 pub fn log_dir() -> PathBuf {
@@ -207,4 +226,25 @@ pub fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_hermes_home_root;
+    use std::path::PathBuf;
+
+    #[test]
+    fn profile_home_maps_to_install_root() {
+        let root = PathBuf::from("root");
+        assert_eq!(
+            normalize_hermes_home_root(root.join("profiles").join("work")),
+            root
+        );
+    }
+
+    #[test]
+    fn arbitrary_nested_custom_home_is_preserved() {
+        let custom = PathBuf::from("root").join("team");
+        assert_eq!(normalize_hermes_home_root(custom.clone()), custom);
+    }
 }
