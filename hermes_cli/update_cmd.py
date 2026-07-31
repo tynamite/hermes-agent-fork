@@ -3950,6 +3950,39 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if not getattr(args, "force_venv", False):
         _venv_guard_exclude: set[int] = set()
         try:
+            _profile_gateway_pids: set[int] = set()
+            if not _m()._is_windows():
+                from hermes_cli.gateway import find_profile_gateway_processes
+
+                _profile_gateway_pids = {
+                    int(proc.pid)
+                    for proc in find_profile_gateway_processes()
+                }
+                # A direct terminal update has no supervisor environment
+                # claim, but it must still drain every profile-mapped gateway
+                # before the venv-holder guard decides whether mutation is
+                # safe. Unmapped holders remain visible to the guard and abort
+                # the update rather than being trusted without an idle proof.
+                _posix_gateway_quiesce = (
+                    _m()._quiesce_posix_gateways_for_update(
+                        _profile_gateway_pids
+                    )
+                )
+                _venv_guard_exclude.update(
+                    set(
+                        (_posix_gateway_quiesce or {}).get(
+                            "pids", set()
+                        )
+                    )
+                )
+                if _posix_gateway_quiesce:
+                    import atexit as _atexit
+
+                    _atexit.register(
+                        _m()._release_posix_gateway_quiesce,
+                        _posix_gateway_quiesce,
+                    )
+
             _raw_supervisor_pid = os.environ.get(
                 "_HERMES_UPDATE_SUPERVISOR_PID", ""
             ).strip()
@@ -3965,39 +3998,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     int(parent.pid) for parent in psutil.Process().parents()
                 }
                 if _supervisor_pid in _ancestor_pids:
-                    # A dashboard/gateway-triggered update has an explicit
-                    # supervised lifecycle, but gateway processes are safe to
-                    # exclude only after they refuse new work and report zero
-                    # active work. The post-install path restarts the fleet.
-                    from hermes_cli.gateway import (
-                        find_gateway_pids,
-                        find_profile_gateway_processes,
-                    )
-
-                    _gateway_pids = {
-                        int(pid) for pid in find_gateway_pids(all_profiles=True)
-                    }
-                    # Process-table discovery intentionally excludes the
-                    # caller's ancestor chain so management commands are not
-                    # mistaken for gateways. For a foreground gateway's
-                    # `/update`, however, that ancestor is the live gateway
-                    # supervisor itself. Admit it only when the profile PID
-                    # registry independently validates the exact PID; an
-                    # arbitrary ancestor supplied through the environment
-                    # must never gain a venv-guard exclusion.
-                    _profile_gateway_pids = {
-                        int(proc.pid)
-                        for proc in find_profile_gateway_processes()
-                    }
-                    if _supervisor_pid in _profile_gateway_pids:
-                        _gateway_pids.add(_supervisor_pid)
-                    _posix_gateway_quiesce = (
-                        _m()._quiesce_posix_gateways_for_update(_gateway_pids)
-                    )
-                    _quiesced_pids = set(
-                        (_posix_gateway_quiesce or {}).get("pids", set())
-                    )
-                    _venv_guard_exclude.update(_quiesced_pids)
                     # A dashboard supervisor is not a gateway and has no
                     # gateway drain state. Exclude it only when the dashboard
                     # launcher attests that its HTTP/WebSocket admission gate
@@ -4011,20 +4011,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         == "dashboard"
                     )
                     if (
-                        _supervisor_pid not in _gateway_pids
+                        _supervisor_pid not in _profile_gateway_pids
                         and _dashboard_quiesced
                     ):
                         _venv_guard_exclude.add(_supervisor_pid)
-                    if _posix_gateway_quiesce:
-                        import atexit as _atexit
-
-                        _atexit.register(
-                            _m()._release_posix_gateway_quiesce,
-                            _posix_gateway_quiesce,
-                        )
         except Exception:
-            # A supervisor claim is never trusted when ancestry cannot be
-            # verified (psutil missing, AccessDenied, process exited, etc.).
+            # Gateway discovery/quiescence and supervisor ancestry validation
+            # both fail closed: no PID is excluded without a verified idle
+            # boundary (psutil missing, AccessDenied, process exited, etc.).
             _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
             _posix_gateway_quiesce = None
         _venv_holders = _m()._detect_venv_python_processes(
