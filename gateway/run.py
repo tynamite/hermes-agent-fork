@@ -4457,12 +4457,11 @@ class TurnRunner:
         # the session-expiry watcher needs (#52197).
         if _xproc_evicted_agent is not None:
             try:
-                threading.Thread(
+                self._runner._start_tracked_agent_cleanup_thread(
                     target=self._runner._release_evicted_agent_soft,
                     args=(_xproc_evicted_agent,),
-                    daemon=True,
                     name=f"agent-xproc-evict-{str(ctx.session_key)[:24]}",
-                ).start()
+                )
             except Exception:
                 # Interpreter shutdown or thread-spawn failure — release
                 # inline as a best-effort fallback.
@@ -5761,6 +5760,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Strong refs to detached fatal-error handler tasks (see
         # _handle_adapter_fatal_error) so the event loop can't GC them mid-run.
         self._fatal_handler_tasks: set = set()
+        # Timeout-detached adapter coroutines and daemonized agent eviction
+        # workers still execute code from this managed install. Keep them
+        # visible to update-idle accounting until their real completion.
+        self._detached_adapter_tasks: set = set()
+        self._detached_agent_cleanup_threads: set = set()
 
         # Pending /update prompt flags live on
         # SessionState.persistent.update_prompt_pending.
@@ -6154,15 +6158,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
             task.cancel()
-            task.add_done_callback(consume_detached_task_result)
+            self._track_detached_adapter_task(task)
             raise
         if task in done:
             await task
             return True
 
         task.cancel()
-        task.add_done_callback(consume_detached_task_result)
+        self._track_detached_adapter_task(task)
         return False
+
+    def _track_detached_adapter_task(self, task: asyncio.Task) -> None:
+        """Retain a timed-out adapter task until it actually finishes."""
+        tasks = getattr(self, "_detached_adapter_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._detached_adapter_tasks = tasks
+        tasks.add(task)
+
+        def _discard_and_consume(done_task: asyncio.Task) -> None:
+            tasks.discard(done_task)
+            consume_detached_task_result(done_task)
+
+        task.add_done_callback(_discard_and_consume)
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
         """Call adapter.disconnect() defensively, swallowing any error.
@@ -6304,13 +6322,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
             task.cancel()
-            task.add_done_callback(consume_detached_task_result)
+            self._track_detached_adapter_task(task)
             raise
         if task in done:
             result = await task
             return bool(result)
         task.cancel()
-        task.add_done_callback(consume_detached_task_result)
+        self._track_detached_adapter_task(task)
         raise TimeoutError(
             f"{platform.value} connect timed out after {timeout:g}s"
         )
@@ -7074,6 +7092,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 1
         for registry_name in (
             "_deferred_agent_cleanup_tasks",
+            "_detached_adapter_tasks",
             "_fatal_handler_tasks",
         ):
             if any(
@@ -7081,6 +7100,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for task in getattr(self, registry_name, ())
             ):
                 return 1
+        if getattr(self, "_detached_agent_cleanup_threads", ()):
+            return 1
         try:
             from tools.async_delegation import active_count
 
@@ -22511,12 +22532,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         try:
-            threading.Thread(
+            self._start_tracked_agent_cleanup_thread(
                 target=self._release_evicted_agent_soft,
                 args=(agent,),
-                daemon=True,
                 name=f"agent-evict-{str(session_key)[:24]}",
-            ).start()
+            )
         except Exception:
             # If we can't spawn a thread (interpreter shutdown), release
             # inline as a best-effort fallback.
@@ -22524,6 +22544,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_evicted_agent_soft(agent)
             except Exception:
                 pass
+
+    def _start_tracked_agent_cleanup_thread(
+        self,
+        *,
+        target: Callable[..., Any],
+        args: tuple[Any, ...],
+        name: str,
+    ) -> threading.Thread:
+        """Start daemon cleanup while retaining it in update-idle state."""
+        workers = getattr(
+            self,
+            "_detached_agent_cleanup_threads",
+            None,
+        )
+        if workers is None:
+            workers = set()
+            self._detached_agent_cleanup_threads = workers
+
+        def _run_tracked() -> None:
+            try:
+                target(*args)
+            finally:
+                workers.discard(threading.current_thread())
+
+        worker = threading.Thread(
+            target=_run_tracked,
+            daemon=True,
+            name=name,
+        )
+        workers.add(worker)
+        try:
+            worker.start()
+        except BaseException:
+            workers.discard(worker)
+            raise
+        return worker
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
@@ -22719,12 +22775,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # only fires for finalizable-not-yet-expired sessions whose
                 # agent would otherwise vanish before the expiry watcher can
                 # fire on_session_end (#11205, LRU-cap variant).
-                threading.Thread(
+                self._start_tracked_agent_cleanup_thread(
                     target=self._commit_then_release_soft,
                     args=(agent, key),
-                    daemon=True,
                     name=f"agent-cache-evict-{key[:24]}",
-                ).start()
+                )
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.
@@ -22806,12 +22861,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Agent cache idle-TTL evict: session=%s (idle=%.0fs)",
                 key, now - getattr(agent, "_last_activity_ts", now),
             )
-            threading.Thread(
+            self._start_tracked_agent_cleanup_thread(
                 target=self._release_evicted_agent_soft,
                 args=(agent,),
-                daemon=True,
                 name=f"agent-cache-idle-{key[:24]}",
-            ).start()
+            )
         return len(to_evict)
 
     # ------------------------------------------------------------------

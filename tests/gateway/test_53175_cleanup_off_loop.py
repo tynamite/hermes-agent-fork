@@ -152,23 +152,57 @@ async def test_timed_out_cleanup_remains_tracked_until_worker_finishes():
         close_started.set()
         release.wait(timeout=5)
 
-    await runner._cleanup_agent_resources_off_loop(
-        _agent_with_close(slow_close),
-        context="session expiry",
+    cleanup_call = asyncio.create_task(
+        runner._cleanup_agent_resources_off_loop(
+            _agent_with_close(slow_close),
+            context="session expiry",
+        )
     )
+    try:
+        assert await asyncio.to_thread(close_started.wait, 1)
+        await cleanup_call
+        cleanup_tasks = runner._deferred_agent_cleanup_tasks
+        assert any(not task.done() for task in cleanup_tasks)
 
-    assert close_started.is_set()
-    cleanup_tasks = runner._deferred_agent_cleanup_tasks
-    assert any(not task.done() for task in cleanup_tasks)
+        release.set()
+        for _ in range(200):
+            if not cleanup_tasks:
+                break
+            await asyncio.sleep(0.005)
 
-    release.set()
-    for _ in range(200):
-        if not cleanup_tasks:
-            break
-        await asyncio.sleep(0.005)
+        assert not cleanup_tasks
+    finally:
+        release.set()
+        await asyncio.gather(cleanup_call, return_exceptions=True)
+        executor.shutdown(wait=False)
 
-    assert not cleanup_tasks
-    executor.shutdown(wait=False)
+
+def test_detached_agent_cleanup_thread_counts_as_active_work():
+    runner, executor = _make_runner()
+    started = threading.Event()
+    release = threading.Event()
+    worker = None
+
+    def slow_cleanup():
+        started.set()
+        release.wait(timeout=5)
+
+    try:
+        worker = runner._start_tracked_agent_cleanup_thread(
+            target=slow_cleanup,
+            args=(),
+            name="agent-test-evict",
+        )
+        assert started.wait(timeout=1)
+        assert runner._detached_agent_cleanup_threads == {worker}
+        assert runner._active_background_work_count() == 1
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(timeout=1)
+        executor.shutdown(wait=False)
+
+    assert not runner._detached_agent_cleanup_threads
 
 
 @pytest.mark.asyncio
@@ -196,4 +230,3 @@ async def test_cleanup_off_loop_swallows_executor_failure(caplog):
     assert any(
         "failed" in r.message and "#53175" in r.message for r in caplog.records
     ), "expected the cleanup-failure warning to be logged"
-
