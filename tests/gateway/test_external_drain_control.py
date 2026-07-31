@@ -12,6 +12,7 @@ Q-B, exercises a real `hermes gateway run`); these lock the unit contract.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from pathlib import Path
@@ -21,7 +22,12 @@ from unittest.mock import MagicMock
 import pytest
 
 import gateway.drain_control as dc
-from gateway.run import GatewayRunner, _run_gateway_housekeeping_phase
+from gateway.run import (
+    GatewayRunner,
+    _gateway_cron_dispatch_scope,
+    _run_gateway_housekeeping_phase,
+    _wait_for_gateway_housekeeping_future,
+)
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -443,6 +449,68 @@ class TestDrainStateMachine:
             lambda: called.append(True),
         ) is False
         assert called == []
+
+    def test_timed_out_housekeeping_future_stays_counted_until_done(self):
+        runner, _ = _drain_runner()
+        future = concurrent.futures.Future()
+        assert future.set_running_or_notify_cancel() is True
+
+        with pytest.raises(TimeoutError):
+            _run_gateway_housekeeping_phase(
+                runner,
+                "timed-out-loop-future",
+                lambda: _wait_for_gateway_housekeeping_future(
+                    runner,
+                    future,
+                    timeout=0,
+                ),
+            )
+
+        assert runner._active_housekeeping_phases == 0
+        assert runner._active_background_work_count() == 1
+        future.set_result(None)
+        assert runner._active_background_work_count() == 0
+
+    def test_cron_dispatch_scope_is_atomic_with_strict_idle_publication(self):
+        import cron.scheduler as sched
+
+        runner, _ = _drain_runner()
+        dispatch_entered = threading.Event()
+        release_dispatch = threading.Event()
+        published_counts = []
+        runner._update_runtime_status = lambda _state: published_counts.append(
+            runner._active_work_count()
+        )
+
+        def dispatch() -> None:
+            with _gateway_cron_dispatch_scope(runner) as admitted:
+                assert admitted is True
+                dispatch_entered.set()
+                assert release_dispatch.wait(timeout=2)
+                with sched._running_lock:
+                    sched._running_job_ids.add("atomic-dispatch")
+
+        dispatch_thread = threading.Thread(target=dispatch)
+        drain_thread = threading.Thread(
+            target=lambda: runner._enter_external_drain(block_internal=True)
+        )
+        dispatch_thread.start()
+        assert dispatch_entered.wait(timeout=1)
+        drain_thread.start()
+        assert published_counts == []
+        release_dispatch.set()
+        dispatch_thread.join(timeout=1)
+        drain_thread.join(timeout=1)
+
+        try:
+            assert not dispatch_thread.is_alive()
+            assert not drain_thread.is_alive()
+            assert published_counts == [1]
+            with _gateway_cron_dispatch_scope(runner) as admitted:
+                assert admitted is False
+        finally:
+            with sched._running_lock:
+                sched._running_job_ids.discard("atomic-dispatch")
 
     @pytest.mark.asyncio
     async def test_deferred_session_expiry_disables_session_finalization(self):

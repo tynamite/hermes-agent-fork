@@ -11,6 +11,7 @@ stack.
 
 
 import threading
+import time
 
 import pytest
 
@@ -278,6 +279,9 @@ class TestContinuousLoopSimulation:
         monkeypatch.setattr(voice, "_continuous_stopping", False)
         monkeypatch.setattr(voice, "_continuous_worker", None)
         monkeypatch.setattr(voice, "_continuous_callbacks_active", 0)
+        monkeypatch.setattr(voice, "_continuous_startups_active", 0)
+        monkeypatch.setattr(voice, "_continuous_update_quiesced", False)
+        monkeypatch.setattr(voice, "_continuous_generation", 0)
         monkeypatch.setattr(voice, "_voice_busy_probe", None, raising=False)
         monkeypatch.setattr(voice, "_play_beep", lambda *_, **__: None)
 
@@ -320,6 +324,52 @@ class TestContinuousLoopSimulation:
         # Skip real file ops in the silence callback.
         monkeypatch.setattr(voice.os.path, "isfile", lambda _p: False)
         return rec
+
+    def test_update_shutdown_wins_blocked_recorder_start(
+        self,
+        fake_recorder,
+    ):
+        import hermes_cli.voice as voice
+
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        original_start = fake_recorder.start
+
+        def blocking_start(on_silence_stop=None):
+            start_entered.set()
+            assert release_start.wait(timeout=2)
+            original_start(on_silence_stop=on_silence_stop)
+
+        fake_recorder.start = blocking_start
+        start_result = []
+        stop_result = []
+        starter = threading.Thread(
+            target=lambda: start_result.append(
+                voice.start_continuous(on_transcript=lambda _text: None)
+            )
+        )
+        starter.start()
+        assert start_entered.wait(timeout=1)
+
+        stopper = threading.Thread(
+            target=lambda: stop_result.append(
+                voice.stop_continuous_for_update(timeout=1)
+            )
+        )
+        stopper.start()
+        deadline = time.monotonic() + 1
+        while not voice._continuous_update_quiesced and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_start.set()
+        starter.join(timeout=1)
+        stopper.join(timeout=1)
+
+        assert not starter.is_alive()
+        assert not stopper.is_alive()
+        assert start_result == [False]
+        assert stop_result == [True]
+        assert fake_recorder.is_recording is False
+        assert voice.has_active_voice_work() is False
 
     def test_update_probe_counts_callback_and_transcription_worker(
         self,

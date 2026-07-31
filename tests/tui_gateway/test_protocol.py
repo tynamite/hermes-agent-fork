@@ -588,6 +588,23 @@ def test_update_quiesce_defers_scheduled_agent_build(server, monkeypatch):
     assert built.wait(timeout=0.5) is True
 
 
+def test_update_quiesce_gates_and_releases_loaded_voice_runtime(
+    server,
+    monkeypatch,
+):
+    calls = []
+    voice = types.SimpleNamespace(
+        begin_continuous_update_quiesce=lambda: calls.append("begin"),
+        end_continuous_update_quiesce=lambda: calls.append("end"),
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.voice", voice)
+
+    server.begin_update_quiesce()
+    server.end_update_quiesce()
+
+    assert calls == ["begin", "end"]
+
+
 def test_update_quiesce_defers_auto_continue_kickoff(server):
     kicked_off = threading.Event()
 

@@ -395,6 +395,14 @@ def begin_update_quiesce() -> None:
 
     with _update_quiesce_lock:
         _tui_update_quiesced = True
+    voice_module = sys.modules.get("hermes_cli.voice")
+    begin_voice_quiesce = getattr(
+        voice_module,
+        "begin_continuous_update_quiesce",
+        None,
+    )
+    if callable(begin_voice_quiesce):
+        begin_voice_quiesce()
 
 
 def end_update_quiesce() -> None:
@@ -414,6 +422,17 @@ def end_update_quiesce() -> None:
         _scheduled_agent_builds.clear()
         _scheduled_auto_continues.clear()
         _deferred_ws_orphan_reaps.clear()
+    voice_module = sys.modules.get("hermes_cli.voice")
+    end_voice_quiesce = getattr(
+        voice_module,
+        "end_continuous_update_quiesce",
+        None,
+    )
+    if callable(end_voice_quiesce):
+        try:
+            end_voice_quiesce()
+        except Exception:
+            logger.debug("failed to release voice update quiesce", exc_info=True)
     for sid in pending_builds:
         _schedule_agent_build(sid, delay=0.0)
     for sid, target in pending_continues:

@@ -5634,6 +5634,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the managed runtime; phase admission shares the updater-idle lock so
         # no phase can start after a strict drain publishes zero.
         self._active_housekeeping_phases = 0
+        self._detached_housekeeping_futures: set[Any] = set()
         self._deferred_agent_cleanup_calls: list[
             tuple[Callable[..., Any], tuple[Any, ...], str]
         ] = []
@@ -7133,26 +7134,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Probe failures also return one: update quiescence must not attest idle
         when delegation or process-registry liveness is unreadable.
         """
-        supervised_tasks = getattr(self, "_supervised_tasks", ())
+        lock = _update_idle_lock_for(self)
+        with lock:
+            supervised_tasks = set(getattr(self, "_supervised_tasks", ()))
+            background_tasks = tuple(getattr(self, "_background_tasks", ()))
+            tracked_registries = tuple(
+                tuple(getattr(self, registry_name, ()))
+                for registry_name in (
+                    "_deferred_agent_cleanup_tasks",
+                    "_detached_adapter_tasks",
+                    "_fatal_handler_tasks",
+                    "_detached_housekeeping_futures",
+                )
+            )
+            cleanup_threads_active = bool(
+                getattr(self, "_detached_agent_cleanup_threads", ())
+            )
+            housekeeping_active = bool(
+                getattr(self, "_active_housekeeping_phases", 0)
+            )
         if any(
             not task.done()
-            for task in getattr(self, "_background_tasks", ())
+            for task in background_tasks
             if task not in supervised_tasks
         ):
             return 1
-        for registry_name in (
-            "_deferred_agent_cleanup_tasks",
-            "_detached_adapter_tasks",
-            "_fatal_handler_tasks",
-        ):
-            if any(
-                not task.done()
-                for task in getattr(self, registry_name, ())
-            ):
+        for registry in tracked_registries:
+            if any(not task.done() for task in registry):
                 return 1
-        if getattr(self, "_detached_agent_cleanup_threads", ()):
+        if cleanup_threads_active:
             return 1
-        if getattr(self, "_active_housekeeping_phases", 0):
+        if housekeeping_active:
             return 1
         try:
             from tools.async_delegation import active_count
@@ -9401,12 +9413,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._cleanup_agent_resources_off_loop(agent, context=context)
 
         task = asyncio.create_task(_cleanup_when_done())
-        tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
-        if tasks is None:
-            tasks = set()
-            self._deferred_agent_cleanup_tasks = tasks
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
+        registry_lock = _update_idle_lock_for(self)
+        with registry_lock:
+            tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._deferred_agent_cleanup_tasks = tasks
+            tasks.add(task)
+
+        def _discard_deferred_cleanup(done_task: asyncio.Task) -> None:
+            with registry_lock:
+                tasks.discard(done_task)
+
+        task.add_done_callback(_discard_deferred_cleanup)
 
     async def _cleanup_agent_resources_off_loop(
         self, agent: Any, *, context: str = ""
@@ -9446,18 +9465,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 agent,
             )
         )
-        cleanup_tasks = getattr(
-            self,
-            "_deferred_agent_cleanup_tasks",
-            None,
-        )
-        if cleanup_tasks is None:
-            cleanup_tasks = set()
-            self._deferred_agent_cleanup_tasks = cleanup_tasks
-        cleanup_tasks.add(cleanup_task)
+        registry_lock = _update_idle_lock_for(self)
+        with registry_lock:
+            cleanup_tasks = getattr(
+                self,
+                "_deferred_agent_cleanup_tasks",
+                None,
+            )
+            if cleanup_tasks is None:
+                cleanup_tasks = set()
+                self._deferred_agent_cleanup_tasks = cleanup_tasks
+            cleanup_tasks.add(cleanup_task)
 
         def _discard_cleanup_task(task):
-            cleanup_tasks.discard(task)
+            with registry_lock:
+                cleanup_tasks.discard(task)
             if task.cancelled():
                 return
             # Retrieve any exception even when a timed-out caller is no
@@ -10343,8 +10365,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            registry_lock = _update_idle_lock_for(self)
+            with registry_lock:
+                self._background_tasks.add(task)
+
+            def _discard_startup_resume(done_task: asyncio.Task) -> None:
+                with registry_lock:
+                    self._background_tasks.discard(done_task)
+
+            task.add_done_callback(_discard_startup_resume)
             if getattr(self, "_startup_restore_in_progress", False):
                 tasks = getattr(self, "_startup_restore_tasks", None)
                 if tasks is None:
@@ -11128,20 +11157,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _bg = getattr(self, "_background_tasks", None)
                 if _bg is not None:
-                    _bg.add(self._loop_heartbeat_task)
-                    _supervised = getattr(
-                        self,
-                        "_supervised_tasks",
-                        None,
-                    )
-                    if _supervised is None:
-                        _supervised = set()
-                        self._supervised_tasks = _supervised
-                    _supervised.add(self._loop_heartbeat_task)
+                    registry_lock = _update_idle_lock_for(self)
+                    with registry_lock:
+                        _bg.add(self._loop_heartbeat_task)
+                        _supervised = getattr(
+                            self,
+                            "_supervised_tasks",
+                            None,
+                        )
+                        if _supervised is None:
+                            _supervised = set()
+                            self._supervised_tasks = _supervised
+                        _supervised.add(self._loop_heartbeat_task)
 
                     def _discard_loop_heartbeat(task):
-                        _bg.discard(task)
-                        _supervised.discard(task)
+                        with registry_lock:
+                            _bg.discard(task)
+                            _supervised.discard(task)
 
                     self._loop_heartbeat_task.add_done_callback(
                         _discard_loop_heartbeat
@@ -11372,10 +11404,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         external handle, so ``_ensure_...`` later sees the stale/done handle
         and spawns a SECOND concurrent watcher (double reconnect attempts).
         """
-        if getattr(self, "_background_tasks", None) is None:
-            self._background_tasks = set()
-        if getattr(self, "_supervised_tasks", None) is None:
-            self._supervised_tasks = set()
+        registry_lock = _update_idle_lock_for(self)
+        with registry_lock:
+            if getattr(self, "_external_drain_blocks_internal", False):
+                logger.debug("Supervised task %s deferred by updater drain", name)
+                return None
+            if getattr(self, "_background_tasks", None) is None:
+                self._background_tasks = set()
+            if getattr(self, "_supervised_tasks", None) is None:
+                self._supervised_tasks = set()
 
         # Monotonic spawn timestamp captured per spawn: the ``_done`` callback
         # uses it to distinguish a rapid crash-loop from a healthy-run-then-crash.
@@ -11383,9 +11420,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Deliberately do NOT pass name= to create_task — some test doubles mock
         # create_task with a signature that rejects the name kwarg.
-        task = asyncio.create_task(coro_factory())
-        self._background_tasks.add(task)
-        self._supervised_tasks.add(task)
+        with registry_lock:
+            task = asyncio.create_task(coro_factory())
+            self._background_tasks.add(task)
+            self._supervised_tasks.add(task)
         if on_spawn is not None:
             # Record the live handle NOW so an external tracker (e.g.
             # _reconnect_watcher_task) always points at the current task, not a
@@ -11396,8 +11434,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("on_spawn callback for %s raised", name, exc_info=True)
 
         def _done(t):
-            self._background_tasks.discard(t)
-            self._supervised_tasks.discard(t)
+            with registry_lock:
+                self._background_tasks.discard(t)
+                self._supervised_tasks.discard(t)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -11430,7 +11469,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 async def _respawn():
                     await asyncio.sleep(backoff)
-                    if self._running:
+                    with registry_lock:
+                        can_respawn = self._running and not getattr(
+                            self,
+                            "_external_drain_blocks_internal",
+                            False,
+                        )
+                    if can_respawn:
                         self._spawn_supervised(
                             coro_factory,
                             name,
@@ -11439,13 +11484,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_spawn=on_spawn,
                         )
 
-                respawn_task = asyncio.create_task(_respawn())
-                self._background_tasks.add(respawn_task)
-                self._supervised_tasks.add(respawn_task)
+                with registry_lock:
+                    if getattr(self, "_external_drain_blocks_internal", False):
+                        return
+                    respawn_task = asyncio.create_task(_respawn())
+                    self._background_tasks.add(respawn_task)
+                    self._supervised_tasks.add(respawn_task)
 
                 def _discard_respawn(t):
-                    self._background_tasks.discard(t)
-                    self._supervised_tasks.discard(t)
+                    with registry_lock:
+                        self._background_tasks.discard(t)
+                        self._supervised_tasks.discard(t)
 
                 respawn_task.add_done_callback(_discard_respawn)
 
@@ -12498,7 +12547,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
-            for _task in list(self._background_tasks):
+            registry_lock = _update_idle_lock_for(self)
+            with registry_lock:
+                background_tasks = list(self._background_tasks)
+                self._background_tasks.clear()
+                supervised_tasks = getattr(
+                    self,
+                    "_supervised_tasks",
+                    None,
+                )
+                if supervised_tasks is not None:
+                    supervised_tasks.clear()
+            for _task in background_tasks:
                 if _task is self._stop_task:
                     continue
                 if _task is self._restart_task:
@@ -12508,14 +12568,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # _exit_code = 75 (#12875).  It self-terminates anyway.
                     continue
                 _task.cancel()
-            self._background_tasks.clear()
-            supervised_tasks = getattr(
-                self,
-                "_supervised_tasks",
-                None,
-            )
-            if supervised_tasks is not None:
-                supervised_tasks.clear()
 
             self.adapters.clear()
             for _session_key in list(self._running_agents):
@@ -13058,11 +13110,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         profile_pending[platform] = task
         background_tasks = getattr(self, "_background_tasks", None)
-        if not isinstance(background_tasks, set):
-            background_tasks = set()
-            self._background_tasks = background_tasks
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
+        registry_lock = _update_idle_lock_for(self)
+        with registry_lock:
+            if not isinstance(background_tasks, set):
+                background_tasks = set()
+                self._background_tasks = background_tasks
+            background_tasks.add(task)
+
+        def _discard_secondary_reconnect(done_task: asyncio.Task) -> None:
+            with registry_lock:
+                background_tasks.discard(done_task)
+
+        task.add_done_callback(_discard_secondary_reconnect)
 
     def _make_profile_fatal_error_handler(
         self, profile_name: str, platform: Platform
@@ -17198,10 +17257,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     watcher_task = asyncio.create_task(
                         self._run_process_watcher(watcher)
                     )
-                    self._background_tasks.add(watcher_task)
-                    watcher_task.add_done_callback(
-                        self._background_tasks.discard
-                    )
+                    registry_lock = _update_idle_lock_for(self)
+                    with registry_lock:
+                        self._background_tasks.add(watcher_task)
+
+                    def _discard_process_watcher(
+                        done_task: asyncio.Task,
+                        lock=registry_lock,
+                    ) -> None:
+                        with lock:
+                            self._background_tasks.discard(done_task)
+
+                    watcher_task.add_done_callback(_discard_process_watcher)
                     if i % 100 == 99:
                         await asyncio.sleep(0)
             except Exception as e:
@@ -25178,6 +25245,60 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
+def _update_idle_lock_for(runner: Any) -> threading.RLock:
+    lock = getattr(runner, "_update_idle_admission_lock", None)
+    if lock is None:
+        lock = threading.RLock()
+        runner._update_idle_admission_lock = lock
+    return lock
+
+
+def _track_gateway_housekeeping_future(runner: Any, future: Any) -> None:
+    """Retain a timed-out loop future until its coroutine actually exits."""
+    lock = _update_idle_lock_for(runner)
+    with lock:
+        futures = getattr(runner, "_detached_housekeeping_futures", None)
+        if futures is None:
+            futures = set()
+            runner._detached_housekeeping_futures = futures
+        futures.add(future)
+
+    def _release(done_future: Any) -> None:
+        with lock:
+            futures.discard(done_future)
+            if getattr(runner, "_external_drain_active", False):
+                runner._persist_active_agents()
+
+    future.add_done_callback(_release)
+
+
+def _wait_for_gateway_housekeeping_future(
+    runner: Any,
+    future: Any,
+    *,
+    timeout: float,
+) -> Any:
+    """Wait briefly, retaining an already-running future after a timeout."""
+    try:
+        return future.result(timeout=timeout)
+    except TimeoutError:
+        if not future.cancel():
+            _track_gateway_housekeeping_future(runner, future)
+        raise
+
+
+@_contextmanager
+def _gateway_cron_dispatch_scope(runner: Any):
+    """Atomically gate cron dispatch against updater-idle publication."""
+    lock = _update_idle_lock_for(runner)
+    with lock:
+        admitted = not (
+            getattr(runner, "_draining", False)
+            or getattr(runner, "_external_drain_active", False)
+        )
+        yield admitted
+
+
 def _run_gateway_housekeeping_phase(
     runner: Any,
     name: str,
@@ -25188,10 +25309,7 @@ def _run_gateway_housekeeping_phase(
         action()
         return True
 
-    lock = getattr(runner, "_update_idle_admission_lock", None)
-    if lock is None:
-        lock = threading.RLock()
-        runner._update_idle_admission_lock = lock
+    lock = _update_idle_lock_for(runner)
     with lock:
         if getattr(runner, "_external_drain_blocks_internal", False):
             logger.debug("Housekeeping phase %s deferred by updater drain", name)
@@ -25281,7 +25399,11 @@ def _start_gateway_housekeeping(
                         log_message="Channel directory refresh scheduling error",
                     )
                     if fut is not None:
-                        fut.result(timeout=30)
+                        _wait_for_gateway_housekeeping_future(
+                            runner,
+                            fut,
+                            timeout=30,
+                        )
 
                 _run_gateway_housekeeping_phase(
                     runner,
@@ -26040,6 +26162,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active
+        )
+        cron_start_kwargs["dispatch_scope"] = (
+            lambda: _gateway_cron_dispatch_scope(runner)
         )
     cron_thread = threading.Thread(
         target=cron_provider.start,

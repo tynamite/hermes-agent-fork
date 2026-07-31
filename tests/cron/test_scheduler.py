@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import get_running_job_ids
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1355,13 +1356,25 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        # 1. cancel() was attempted (returned False = in flight).
-        assert cancel_calls == [True], "future.cancel() should be attempted on TimeoutError"
-        # 2. Delivery is reported successful (no error string returned).
-        assert result is None, f"expected successful delivery, got error: {result!r}"
-        # 3. The standalone fallback must NOT run — that is the #38922 fix:
-        #    an in-flight confirmation timeout is assume-delivered, not a resend.
-        standalone_send.assert_not_awaited()
+        try:
+            # 1. cancel() was attempted (returned False = in flight).
+            assert cancel_calls == [True], (
+                "future.cancel() should be attempted on TimeoutError"
+            )
+            # 2. Delivery is reported successful (no error string returned).
+            assert result is None, f"expected successful delivery, got error: {result!r}"
+            # 3. The standalone fallback must NOT run — that is the #38922 fix:
+            #    an in-flight confirmation timeout is assume-delivered, not a resend.
+            standalone_send.assert_not_awaited()
+            assert "timeout-job" in get_running_job_ids()
+        finally:
+            # Always release module-global tracking, even if an assertion fails.
+            if not captured_future.done():
+                captured_future.set_result(MagicMock(success=True))
+
+        # The job remains visible to updater/shutdown drains until the live
+        # adapter coroutine reaches actual completion.
+        assert "timeout-job" not in get_running_job_ids()
 
 
 class TestDeliverResultLiveAdapterUnconfirmed:
@@ -1899,5 +1912,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-
