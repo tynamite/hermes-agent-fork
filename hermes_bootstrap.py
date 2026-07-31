@@ -264,8 +264,33 @@ def _raw_cli_command_path(argv: list[str]) -> list[str]:
     return positionals
 
 
+def _module_invocation_entrypoint() -> str:
+    """Classify ``python -m`` before the target package finishes importing.
+
+    During a module launch, CPython temporarily exposes ``sys.argv[0]`` as
+    ``-m`` while it imports the target package's ``__init__.py``.  The original
+    interpreter arguments retain the requested module name, so package-level
+    gates can still identify the runtime before any package re-exports load
+    managed dependencies.
+    """
+    original = getattr(sys, "orig_argv", ())
+    try:
+        module_flag = original.index("-m")
+        module = original[module_flag + 1]
+    except (AttributeError, IndexError, ValueError):
+        return "other"
+    return {
+        "hermes_cli.main": "cli",
+        "gateway.run": "gateway",
+        "tui_gateway.entry": "dashboard",
+        "cron.scheduler": "cron",
+    }.get(module, "other")
+
+
 def _update_gate_entrypoint(argv0: str) -> str:
     """Classify entry points that may start an updater-managed runtime."""
+    if argv0 == "-m":
+        return _module_invocation_entrypoint()
     normalized = os.path.abspath(argv0).replace("\\", "/").lower()
     name = os.path.basename(normalized)
     if (

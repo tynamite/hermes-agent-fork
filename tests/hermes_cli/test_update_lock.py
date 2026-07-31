@@ -378,6 +378,7 @@ def test_restart_phase_does_not_admit_sibling_entrypoints(
         "run_agent",
         "acp_adapter.entry",
         "cron.scheduler",
+        "gateway.run",
     ],
 )
 def test_fresh_entrypoint_import_is_blocked_in_bootstrap(
@@ -392,7 +393,7 @@ def test_fresh_entrypoint_import_is_blocked_in_bootstrap(
     env["HERMES_HOME"] = str(tmp_path)
 
     result = subprocess.run(
-        [sys.executable, "-c", f"import {module}"],
+        [sys.executable, "-S", "-m", module],
         cwd=str(Path(__file__).resolve().parents[2]),
         env=env,
         capture_output=True,
