@@ -658,6 +658,9 @@ def test_active_tui_work_tracks_and_quiesce_rejects_detached_workers(server):
         worker.join(timeout=0.5)
 
     assert worker.is_alive() is False
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert server.has_active_tui_work() is False
 
 
