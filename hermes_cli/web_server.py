@@ -1956,7 +1956,11 @@ async def _status_active_sessions() -> int:
     loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, _count_status_active_sessions),
+            loop.run_in_executor(
+                None,
+                _run_dashboard_background_call,
+                _count_status_active_sessions,
+            ),
             timeout=_STATUS_ACTIVE_SESSIONS_TIMEOUT,
         )
     except asyncio.TimeoutError:

@@ -1097,6 +1097,46 @@ async def test_dashboard_quiesce_waits_for_detached_worker():
         ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
 
 
+@pytest.mark.asyncio
+async def test_timed_out_status_worker_remains_in_quiesce_accounting(
+    monkeypatch,
+):
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+    started = threading.Event()
+    release = threading.Event()
+    quiesce_task = None
+
+    def _blocked_count():
+        started.set()
+        release.wait(timeout=2)
+        return 1
+
+    monkeypatch.setattr(ws, "_count_status_active_sessions", _blocked_count)
+    monkeypatch.setattr(ws, "_STATUS_ACTIVE_SESSIONS_TIMEOUT", 0.01)
+    try:
+        assert await ws._status_active_sessions() == 0
+        assert started.is_set()
+        assert ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND == 1
+
+        quiesce_task = asyncio.create_task(
+            ws._begin_dashboard_update_quiesce(timeout=0.5)
+        )
+        await asyncio.sleep(0.05)
+        assert quiesce_task.done() is False
+        release.set()
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND == 0
+    finally:
+        release.set()
+        if quiesce_task is not None and not quiesce_task.done():
+            quiesce_task.cancel()
+        ws._end_dashboard_update_quiesce()
+        ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+
+
 def test_dashboard_detached_worker_rejected_after_quiesce(monkeypatch):
     import hermes_cli.web_server as ws
 

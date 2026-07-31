@@ -5625,6 +5625,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # request -> poll -> proceed loop.
         self._external_drain_active = False
         self._external_drain_blocks_internal = False
+        # Serialize updater-drain idle publication with admission of detached
+        # cleanup threads. A cleanup may not appear immediately after a
+        # persisted zero and become invisible until the next watcher tick.
+        self._update_idle_admission_lock = threading.RLock()
+        self._deferred_agent_cleanup_calls: list[
+            tuple[Callable[..., Any], tuple[Any, ...], str]
+        ] = []
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -6149,35 +6156,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         block recovery forever. Keep ownership of the old task through its done
         callback, but release the runner at the deadline.
         """
-        if timeout <= 0:
-            await awaitable
-            return True
-
         task = asyncio.ensure_future(awaitable)
+        self._track_detached_adapter_task(task)
+        if timeout <= 0:
+            await task
+            return True
         try:
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
             task.cancel()
-            self._track_detached_adapter_task(task)
             raise
         if task in done:
             await task
             return True
 
         task.cancel()
-        self._track_detached_adapter_task(task)
         return False
 
     def _track_detached_adapter_task(self, task: asyncio.Task) -> None:
-        """Retain a timed-out adapter task until it actually finishes."""
-        tasks = getattr(self, "_detached_adapter_tasks", None)
-        if tasks is None:
-            tasks = set()
-            self._detached_adapter_tasks = tasks
-        tasks.add(task)
+        """Retain adapter work from creation until it actually finishes."""
+        lock = getattr(self, "_update_idle_admission_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._update_idle_admission_lock = lock
+        with lock:
+            tasks = getattr(self, "_detached_adapter_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._detached_adapter_tasks = tasks
+            tasks.add(task)
+            if getattr(self, "_external_drain_active", False):
+                self._persist_active_agents()
 
         def _discard_and_consume(done_task: asyncio.Task) -> None:
-            tasks.discard(done_task)
+            with lock:
+                tasks.discard(done_task)
             consume_detached_task_result(done_task)
 
         task.add_done_callback(_discard_and_consume)
@@ -6307,8 +6320,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rather than silently dropped — #46621).
         """
         timeout = self._platform_connect_timeout_secs(platform)
-        if timeout <= 0:
-            return await adapter.connect(is_reconnect=is_reconnect)
+        lock = getattr(self, "_update_idle_admission_lock", None)
+        if lock is not None:
+            with lock:
+                if getattr(
+                    self,
+                    "_external_drain_blocks_internal",
+                    False,
+                ):
+                    raise RuntimeError(
+                        "Adapter connect deferred during Hermes update drain"
+                    )
         # Use the detach-on-timeout pattern instead of plain asyncio.wait_for:
         # asyncio.wait_for cancels the overdue task but then waits for it to
         # exit. An adapter connect() that catches CancelledError can therefore
@@ -6318,17 +6340,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task = asyncio.ensure_future(
             adapter.connect(is_reconnect=is_reconnect)
         )
+        self._track_detached_adapter_task(task)
+        if timeout <= 0:
+            return bool(await task)
         try:
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
             task.cancel()
-            self._track_detached_adapter_task(task)
             raise
         if task in done:
             result = await task
             return bool(result)
         task.cancel()
-        self._track_detached_adapter_task(task)
         raise TimeoutError(
             f"{platform.value} connect timed out after {timeout:g}s"
         )
@@ -7139,14 +7162,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Without this, the shutdown drain is structurally blind to in-flight
         cron work: it can report ``active_at_start=0`` and proceed straight
         to killing tool subprocesses while a cron job's terminal command is
-        still running (#60432). Best-effort: returns 0 if the cron module
-        can't be imported (e.g. a minimal test double for this class).
+        still running (#60432). Probe failures count as active: update
+        quiescence must not publish an unverified zero.
         """
         try:
             from cron.scheduler import get_running_job_ids
             return len(get_running_job_ids())
         except Exception:
-            return 0
+            logger.debug("cron work probe failed", exc_info=True)
+            return 1
 
     def _active_api_run_count(self) -> int:
         """Count API-server work that is outside ``_running_agents``.
@@ -7160,7 +7184,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             helper = getattr(adapter, "active_agent_work_count", None)
             return max(0, int(helper())) if callable(helper) else 0
         except Exception:
-            return 0
+            logger.debug("API work probe failed", exc_info=True)
+            return 1
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -7542,11 +7567,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``draining`` / …).  Passing ``gateway_state=None`` here would clobber it.
         Best-effort: a failed status write must never disrupt a turn.
         """
-        try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._active_work_count())
-        except Exception:
-            pass
+        def _write() -> None:
+            try:
+                from gateway.status import write_runtime_status
+                write_runtime_status(active_agents=self._active_work_count())
+            except Exception:
+                pass
+
+        lock = getattr(self, "_update_idle_admission_lock", None)
+        if lock is None:
+            _write()
+        else:
+            with lock:
+                _write()
 
     # ------------------------------------------------------------------
     # External drain control (NAS-driven quiesce-without-restart, Phase 2).
@@ -7565,24 +7598,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         best-effort status re-write. In-flight turns are NOT interrupted (the
         whole point is to let them finish); only NEW turns are refused.
         """
-        if self._external_drain_active:
-            # An updater-owned marker is stricter than an operator/NAS drain:
-            # once observed, no new module-loading work may enter.
-            self._external_drain_blocks_internal = (
-                self._external_drain_blocks_internal or block_internal
+        lock = getattr(self, "_update_idle_admission_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._update_idle_admission_lock = lock
+        with lock:
+            if self._external_drain_active:
+                # An updater-owned marker is stricter than an operator/NAS
+                # drain: once observed, no new module-loading cleanup work may
+                # enter after the active count is published.
+                became_strict = (
+                    block_internal
+                    and not self._external_drain_blocks_internal
+                )
+                self._external_drain_blocks_internal = (
+                    self._external_drain_blocks_internal or block_internal
+                )
+                if became_strict:
+                    self._persist_active_agents()
+                return
+            self._external_drain_active = True
+            self._external_drain_blocks_internal = block_internal
+            logger.info(
+                "External drain ENGAGED (.drain_request.json present) — refusing "
+                "new turns; %d in-flight turn(s) will finish. Process stays up.",
+                self._active_work_count(),
             )
-            return
-        self._external_drain_active = True
-        self._external_drain_blocks_internal = block_internal
-        logger.info(
-            "External drain ENGAGED (.drain_request.json present) — refusing "
-            "new turns; %d in-flight turn(s) will finish. Process stays up.",
-            self._active_work_count(),
-        )
-        # Flip the persisted lifecycle state so /api/status.gateway_busy /
-        # gateway_drainable track the drain. Preserve active_agents (the
-        # read-merge keeps the live count); only the state changes.
-        self._update_runtime_status("draining")
+            # Publish state and the active count while cleanup admission is
+            # closed by the same lock.
+            self._update_runtime_status("draining")
 
     def _exit_external_drain(self) -> None:
         """Cancel external drain: revert state, re-accept new turns.
@@ -7591,23 +7635,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         AND not also shutting down (a real shutdown ``_draining`` must win —
         never resurrect a stopping gateway to ``running``).
         """
-        if not self._external_drain_active:
-            return
-        self._external_drain_active = False
-        self._external_drain_blocks_internal = False
-        if self._draining or not self._running:
-            # A shutdown drain is in progress / the loop has stopped — do not
-            # clobber the terminal state back to running.
-            logger.info(
-                "External drain marker cleared during shutdown — not reverting "
-                "to running (shutdown takes precedence)."
+        lock = getattr(self, "_update_idle_admission_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._update_idle_admission_lock = lock
+        deferred: list[tuple[Callable[..., Any], tuple[Any, ...], str]] = []
+        with lock:
+            if not self._external_drain_active:
+                return
+            self._external_drain_active = False
+            self._external_drain_blocks_internal = False
+            if self._draining or not self._running:
+                # A shutdown drain is in progress / the loop has stopped — do
+                # not resurrect it or start deferred cleanup during teardown.
+                getattr(self, "_deferred_agent_cleanup_calls", []).clear()
+                logger.info(
+                    "External drain marker cleared during shutdown — not reverting "
+                    "to running (shutdown takes precedence)."
+                )
+                return
+            deferred = list(
+                getattr(self, "_deferred_agent_cleanup_calls", ())
             )
-            return
-        logger.info(
-            "External drain RELEASED (.drain_request.json removed) — "
-            "re-accepting new turns; gateway_state -> running."
-        )
-        self._update_runtime_status("running")
+            getattr(self, "_deferred_agent_cleanup_calls", []).clear()
+            logger.info(
+                "External drain RELEASED (.drain_request.json removed) — "
+                "re-accepting new turns; gateway_state -> running."
+            )
+            self._update_runtime_status("running")
+        for target, args, name in deferred:
+            self._start_tracked_agent_cleanup_thread(
+                target=target,
+                args=args,
+                name=name,
+            )
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
@@ -9316,6 +9377,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         update cannot attest idle while cleanup still uses the runtime.
         """
         if agent is None:
+            return
+        if (
+            getattr(self, "_external_drain_blocks_internal", False)
+            and not context.startswith("shutdown")
+        ):
+            # Session-expiry/hygiene cleanup discovered after updater idle was
+            # published must not begin in the mutation window. Queue the same
+            # tracked cleanup for a canceled drain; a successful update
+            # restarts this process and releases the old resources by exit.
+            self._start_tracked_agent_cleanup_thread(
+                target=self._cleanup_agent_resources,
+                args=(agent,),
+                name=f"agent-deferred-update-{context[:24] or 'cleanup'}",
+            )
             return
         if context.startswith("shutdown") or context == "session expiry":
             try:
@@ -22551,34 +22626,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         target: Callable[..., Any],
         args: tuple[Any, ...],
         name: str,
-    ) -> threading.Thread:
-        """Start daemon cleanup while retaining it in update-idle state."""
-        workers = getattr(
-            self,
-            "_detached_agent_cleanup_threads",
-            None,
-        )
-        if workers is None:
-            workers = set()
-            self._detached_agent_cleanup_threads = workers
+    ) -> Optional[threading.Thread]:
+        """Admit tracked cleanup atomically with update-idle publication."""
+        lock = getattr(self, "_update_idle_admission_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._update_idle_admission_lock = lock
 
-        def _run_tracked() -> None:
+        with lock:
+            if getattr(self, "_external_drain_blocks_internal", False):
+                deferred = getattr(
+                    self,
+                    "_deferred_agent_cleanup_calls",
+                    None,
+                )
+                if deferred is None:
+                    deferred = []
+                    self._deferred_agent_cleanup_calls = deferred
+                deferred.append((target, args, name))
+                return None
+            workers = getattr(
+                self,
+                "_detached_agent_cleanup_threads",
+                None,
+            )
+            if workers is None:
+                workers = set()
+                self._detached_agent_cleanup_threads = workers
+
+            def _run_tracked() -> None:
+                try:
+                    target(*args)
+                finally:
+                    with lock:
+                        workers.discard(threading.current_thread())
+
+            worker = threading.Thread(
+                target=_run_tracked,
+                daemon=True,
+                name=name,
+            )
+            workers.add(worker)
             try:
-                target(*args)
-            finally:
-                workers.discard(threading.current_thread())
-
-        worker = threading.Thread(
-            target=_run_tracked,
-            daemon=True,
-            name=name,
-        )
-        workers.add(worker)
-        try:
-            worker.start()
-        except BaseException:
-            workers.discard(worker)
-            raise
+                worker.start()
+                # Make a newly admitted worker visible immediately; the updater
+                # polls faster than the one-second drain watcher cadence.
+                if getattr(self, "_external_drain_active", False):
+                    self._persist_active_agents()
+            except BaseException:
+                workers.discard(worker)
+                raise
         return worker
 
     @staticmethod

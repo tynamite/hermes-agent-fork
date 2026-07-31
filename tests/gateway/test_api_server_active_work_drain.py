@@ -63,6 +63,17 @@ class TestActiveApiRunCount:
         runner.adapters = {}
         assert runner._active_api_run_count() == 0
 
+    def test_probe_failure_counts_as_active(self):
+        runner, _adapter = make_restart_runner()
+        api = SimpleNamespace(
+            active_agent_work_count=MagicMock(
+                side_effect=RuntimeError("unreadable")
+            )
+        )
+        runner.adapters = {Platform.API_SERVER: api}
+
+        assert runner._active_api_run_count() == 1
+
 
 class TestAPIServerAdapterWorkCount:
 
@@ -165,5 +176,4 @@ class TestDrainAdmission:
                     assert response.status == 503
                     assert response.headers["Retry-After"] == "1"
                     assert payload["error"]["code"] == "gateway_draining"
-
 

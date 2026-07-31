@@ -266,6 +266,57 @@ class TestDrainStateMachine:
         assert runner._external_drain_active is False
         runner._update_runtime_status.assert_not_called()
 
+    def test_updater_idle_publication_closes_cleanup_admission_atomically(self):
+        runner, _ = _drain_runner()
+        publication_started = threading.Event()
+        release_publication = threading.Event()
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+        cleanup_result = []
+
+        def publish(_state):
+            publication_started.set()
+            assert release_publication.wait(timeout=2)
+
+        runner._update_runtime_status = publish
+        enter = threading.Thread(
+            target=lambda: runner._enter_external_drain(
+                block_internal=True
+            )
+        )
+        enter.start()
+        assert publication_started.wait(timeout=1)
+
+        def try_cleanup():
+            cleanup_result.append(
+                runner._start_tracked_agent_cleanup_thread(
+                    target=lambda: (
+                        cleanup_started.set(),
+                        release_cleanup.wait(timeout=2),
+                    ),
+                    args=(),
+                    name="drain-race-cleanup",
+                )
+            )
+
+        admit = threading.Thread(target=try_cleanup)
+        admit.start()
+        assert cleanup_started.wait(timeout=0.05) is False
+        release_publication.set()
+        enter.join(timeout=1)
+        admit.join(timeout=1)
+
+        assert cleanup_result == [None]
+        assert cleanup_started.is_set() is False
+        assert len(runner._deferred_agent_cleanup_calls) == 1
+
+        runner._update_runtime_status = MagicMock()
+        runner._exit_external_drain()
+        assert cleanup_started.wait(timeout=1)
+        release_cleanup.set()
+        for worker in tuple(runner._detached_agent_cleanup_threads):
+            worker.join(timeout=1)
+
     def test_active_work_count_includes_async_delegations(
         self,
         monkeypatch,

@@ -1,8 +1,11 @@
+import asyncio
 import json
+import threading
 
 import pytest
 
 from hermes_cli import web_server
+from hermes_cli.pty_session import PtySessionRegistry
 
 
 class FakeBridge:
@@ -23,6 +26,47 @@ class FakeBridge:
 
     def is_alive(self):
         return self.alive
+
+
+@pytest.mark.asyncio
+async def test_concurrent_attach_key_spawns_exactly_one_bridge():
+    registry = PtySessionRegistry(
+        ttl=60,
+        max_sessions=4,
+        buffer_cap=1024,
+        read_timeout=0.01,
+    )
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+    calls = 0
+
+    def slow_spawn():
+        nonlocal calls
+        calls += 1
+        spawn_started.set()
+        assert release_spawn.wait(timeout=2)
+        return FakeBridge()
+
+    first = asyncio.create_task(
+        registry.attach_or_spawn("same", spawn=slow_spawn)
+    )
+    assert await asyncio.to_thread(spawn_started.wait, 1)
+    second = asyncio.create_task(
+        registry.attach_or_spawn("same", spawn=slow_spawn)
+    )
+    await asyncio.sleep(0.05)
+    release_spawn.set()
+    try:
+        (first_session, first_created), (
+            second_session,
+            second_created,
+        ) = await asyncio.gather(first, second)
+        assert calls == 1
+        assert first_session is second_session
+        assert (first_created, second_created) == (True, False)
+    finally:
+        release_spawn.set()
+        await registry.close_all()
 
 
 @pytest.fixture

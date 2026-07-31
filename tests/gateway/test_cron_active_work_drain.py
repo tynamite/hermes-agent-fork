@@ -48,6 +48,18 @@ class TestActiveCronJobCount:
         runner, _adapter = make_restart_runner()
         assert runner._active_cron_job_count() == 0
 
+    def test_probe_failure_counts_as_active(self, monkeypatch):
+        import cron.scheduler as sched
+
+        runner, _adapter = make_restart_runner()
+        monkeypatch.setattr(
+            sched,
+            "get_running_job_ids",
+            MagicMock(side_effect=RuntimeError("unreadable")),
+        )
+
+        assert runner._active_cron_job_count() == 1
+
 
 class TestDrainWaitsForCronWork:
 
@@ -109,4 +121,3 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
-

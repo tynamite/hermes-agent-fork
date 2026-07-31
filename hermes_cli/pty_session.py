@@ -170,26 +170,32 @@ class PtySessionRegistry:
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
+        # Lookup, blocking spawn, and insertion must be one registry
+        # transaction. Without this, concurrent reconnects for one attach key
+        # can each spawn a bridge and overwrite one another in ``_sessions``.
+        self._lock = asyncio.Lock()
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
                               ) -> Tuple[PtySession, bool]:
-        await self.reap_idle()
-        existing = self._sessions.get(key)
-        if existing is not None and existing.alive:
-            return existing, False
-        if existing is not None:                       # dead remnant
-            await existing.close()
-            self._sessions.pop(key, None)
-        if len(self._sessions) >= self._max:
-            await self._reap_one_idle_or_raise()
-        # PTY spawn does blocking fork/exec work — keep it off the event
-        # loop (#53227).
-        bridge = await asyncio.to_thread(spawn)
-        session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
-                             read_timeout=self._read_timeout)
-        await session.start()
-        self._sessions[key] = session
-        return session, True
+        async with self._lock:
+            await self._reap_idle_locked()
+            existing = self._sessions.get(key)
+            if existing is not None and existing.alive:
+                return existing, False
+            if existing is not None:                   # dead remnant
+                await existing.close()
+                self._sessions.pop(key, None)
+            if len(self._sessions) >= self._max:
+                await self._reap_one_idle_or_raise()
+            # PTY spawn does blocking fork/exec work — keep it off the event
+            # loop (#53227). Keep the registry lock across spawn and insertion
+            # so no second caller can create an unregistered losing bridge.
+            bridge = await asyncio.to_thread(spawn)
+            session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
+                                 read_timeout=self._read_timeout)
+            await session.start()
+            self._sessions[key] = session
+            return session, True
 
     def detach(self, key: str, ws) -> None:
         s = self._sessions.get(key)
@@ -197,6 +203,10 @@ class PtySessionRegistry:
             s.detach(ws)
 
     async def reap_idle(self, now: Optional[float] = None) -> None:
+        async with self._lock:
+            await self._reap_idle_locked(now)
+
+    async def _reap_idle_locked(self, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
         doomed = [
             key for key, s in self._sessions.items()
@@ -224,9 +234,10 @@ class PtySessionRegistry:
         self._sessions.pop(oldest.key, None)
 
     async def close_all(self) -> None:
-        for key in list(self._sessions):
-            session = self._sessions.get(key)
-            if session is None:
-                continue
-            await session.close()
-            self._sessions.pop(key, None)
+        async with self._lock:
+            for key in list(self._sessions):
+                session = self._sessions.get(key)
+                if session is None:
+                    continue
+                await session.close()
+                self._sessions.pop(key, None)
