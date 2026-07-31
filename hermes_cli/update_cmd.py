@@ -4420,7 +4420,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 _m()._complete_posix_gateway_mutation(
                     _posix_gateway_quiesce,
-                    mutated=pre_sync_sha != post_sync_sha,
+                    mutated=(
+                        pre_sync_sha is None
+                        or post_sync_sha is None
+                        or pre_sync_sha != post_sync_sha
+                    ),
                 )
 
             # Restore stash and switch back to original branch if we moved

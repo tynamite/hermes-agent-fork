@@ -235,6 +235,43 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_unknown_fork_sync_head_identity_fails_closed(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(
+            hm,
+            "_capture_head_sha",
+            return_value=None,
+        ), patch.object(
+            hm,
+            "_sync_with_upstream_if_needed",
+        ), patch.object(
+            hm,
+            "_complete_posix_gateway_mutation",
+        ) as complete:
+            cmd_update(mock_args)
+
+        assert any(
+            call.kwargs.get("mutated") is True
+            for call in complete.call_args_list
+        )
+
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
@@ -318,6 +355,10 @@ class TestCmdUpdateBranchFallback:
             pid=555,
         )
         with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
             hm,
             "_quiesce_posix_gateways_for_update",
             return_value=token,
@@ -415,6 +456,10 @@ class TestCmdUpdateBranchFallback:
         )
         with patch.object(
             hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
             "_quiesce_posix_gateways_for_update",
             return_value=token,
         ), patch(
@@ -476,6 +521,10 @@ class TestCmdUpdateBranchFallback:
             return_value="external-supervisor",
         )
         with patch("psutil.Process") as psutil_process, patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
             hm,
             "_quiesce_posix_gateways_for_update",
             return_value=token,
