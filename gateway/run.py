@@ -9290,9 +9290,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Safe to await from coroutines on the gateway event loop: a slow or
         wedged teardown (memory provider IO, subprocess close) can no longer
-        block message processing. On timeout the await is cancelled and the
-        worker thread is left to finish (or leak) on its own — the caller
-        proceeds regardless, exactly as the /new reset path does (#35994).
+        block message processing. On timeout the caller proceeds, but the
+        executor task remains tracked until the worker really finishes so an
+        update cannot attest idle while cleanup still uses the runtime.
         """
         if agent is None:
             return
@@ -9301,11 +9301,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 agent._end_session_on_close = False
             except Exception:
                 pass
+        cleanup_task = asyncio.create_task(
+            self._run_in_executor_with_context(
+                self._cleanup_agent_resources,
+                agent,
+            )
+        )
+        cleanup_tasks = getattr(
+            self,
+            "_deferred_agent_cleanup_tasks",
+            None,
+        )
+        if cleanup_tasks is None:
+            cleanup_tasks = set()
+            self._deferred_agent_cleanup_tasks = cleanup_tasks
+        cleanup_tasks.add(cleanup_task)
+
+        def _discard_cleanup_task(task):
+            cleanup_tasks.discard(task)
+            if task.cancelled():
+                return
+            # Retrieve any exception even when a timed-out caller is no
+            # longer awaiting this task; the caller's non-timeout path still
+            # receives and logs the same exception below.
+            task.exception()
+
+        cleanup_task.add_done_callback(_discard_cleanup_task)
         try:
             await asyncio.wait_for(
-                self._run_in_executor_with_context(
-                    self._cleanup_agent_resources, agent
-                ),
+                asyncio.shield(cleanup_task),
                 timeout=self._CLEANUP_TIMEOUT_S,
             )
         except asyncio.TimeoutError:

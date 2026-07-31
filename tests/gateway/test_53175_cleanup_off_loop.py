@@ -140,6 +140,38 @@ async def test_cleanup_off_loop_times_out_gracefully(caplog):
 
 
 @pytest.mark.asyncio
+async def test_timed_out_cleanup_remains_tracked_until_worker_finishes():
+    """The bounded caller may return, but update-idle accounting must retain
+    the executor phase until the underlying cleanup actually exits."""
+    runner, executor = _make_runner()
+    runner._CLEANUP_TIMEOUT_S = 0.01
+    close_started = threading.Event()
+    release = threading.Event()
+
+    def slow_close():
+        close_started.set()
+        release.wait(timeout=5)
+
+    await runner._cleanup_agent_resources_off_loop(
+        _agent_with_close(slow_close),
+        context="session expiry",
+    )
+
+    assert close_started.is_set()
+    cleanup_tasks = runner._deferred_agent_cleanup_tasks
+    assert any(not task.done() for task in cleanup_tasks)
+
+    release.set()
+    for _ in range(200):
+        if not cleanup_tasks:
+            break
+        await asyncio.sleep(0.005)
+
+    assert not cleanup_tasks
+    executor.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
 async def test_cleanup_off_loop_swallows_executor_failure(caplog):
     """If the offloaded cleanup raises, the helper logs and returns — a
     teardown failure must never abort the loop coroutine that triggered it."""
@@ -164,5 +196,4 @@ async def test_cleanup_off_loop_swallows_executor_failure(caplog):
     assert any(
         "failed" in r.message and "#53175" in r.message for r in caplog.records
     ), "expected the cleanup-failure warning to be logged"
-
 
