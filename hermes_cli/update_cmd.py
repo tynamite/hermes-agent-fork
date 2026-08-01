@@ -199,6 +199,11 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
     Returns ``(ok, failing_module, error_message)``.
     """
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
+    from hermes_cli.update_lock import (
+        IMPORT_PROBE_MARKER_PID_ENV,
+        IMPORT_PROBE_PARENT_PID_ENV,
+        read_live_update,
+    )
 
     probe = (
         "import importlib, sys\n"
@@ -232,9 +237,20 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
+        probe_env = os.environ.copy()
+        # The bootstrap launch gate sees the live marker held by this updater.
+        # Attest the probe as our direct child so its intentional imports are
+        # admitted without weakening the gate for arbitrary ``python -c``
+        # processes.
+        probe_env.pop(IMPORT_PROBE_MARKER_PID_ENV, None)
+        probe_env[IMPORT_PROBE_PARENT_PID_ENV] = str(os.getpid())
+        marker_holder = read_live_update()
+        if marker_holder is not None and marker_holder.pid > 0:
+            probe_env[IMPORT_PROBE_MARKER_PID_ENV] = str(marker_holder.pid)
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
+            env=probe_env,
             capture_output=True,
             text=True,
             encoding="utf-8",

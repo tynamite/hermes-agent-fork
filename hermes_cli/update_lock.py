@@ -74,6 +74,18 @@ MARKER_OPERATION_LOCK_STALE_SECONDS = 30
 # in apps/bootstrap-installer/src-tauri/src/update.rs — keep the name in sync.
 HANDOFF_PID_ENV = "HERMES_UPDATE_HANDOFF_PID"
 
+# Set only on the short-lived ``python -c`` child used by the updater's
+# post-update cross-module import probe.  The bootstrap gate admits that child
+# only when this names its actual parent and the attested marker-owner pid;
+# an arbitrary process cannot bypass the gate by setting the variable on its
+# own.
+IMPORT_PROBE_PARENT_PID_ENV = "HERMES_UPDATE_IMPORT_PROBE_PARENT_PID"
+# In the desktop handoff chain the Python updater is the probe's direct
+# parent, while the Tauri process one level above it owns the marker. This
+# second attestation carries that already-verified marker-owner identity to
+# the probe child.
+IMPORT_PROBE_MARKER_PID_ENV = "HERMES_UPDATE_IMPORT_PROBE_MARKER_PID"
+
 # Exit code meaning "another updater/instance owns this install right now".
 # Already the de-facto contract: the Windows shim + venv-holder guards in
 # _cmd_update_impl exit 2, and the Tauri updater matches on it
@@ -201,6 +213,42 @@ def _pid_alive(pid: int) -> bool:
 def _marker_operation_lock_path(marker: Path) -> Path:
     """Stable sidecar path used to serialize marker check/claim/reclaim."""
     return marker.with_name(MARKER_OPERATION_LOCK_NAME)
+
+
+def _live_marker_operation_holder(marker: Path) -> tuple[int, float] | None:
+    """Return a live sidecar owner while marker publication is in progress.
+
+    The sidecar is deliberately part of the reader protocol as well as the
+    writer protocol.  A writer creates the directory before publishing the
+    marker, so treating an absent marker as clear during that interval would
+    let a runtime start in the middle of an update.  A missing/malformed owner
+    file is considered active for the short stale-lock window: that covers the
+    tiny create-directory → owner-file write interval without trusting a
+    crashed lock forever.
+    """
+    lock_dir = _marker_operation_lock_path(marker)
+    try:
+        stat = lock_dir.stat()
+    except OSError:
+        return None
+
+    owner_pid: int | None = None
+    try:
+        lines = (lock_dir / "owner").read_text(encoding="utf-8").splitlines()
+        parsed = int(lines[0].strip())
+        if parsed > 0:
+            owner_pid = parsed
+    except (FileNotFoundError, IndexError, ValueError, OSError):
+        pass
+
+    age = max(0.0, time.time() - stat.st_mtime)
+    if owner_pid is not None:
+        if not _pid_alive(owner_pid):
+            return None
+        return owner_pid, age
+    if age < MARKER_OPERATION_LOCK_STALE_SECONDS:
+        return -1, age
+    return None
 
 
 def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
@@ -481,6 +529,40 @@ def is_verified_handoff(holder_pid: int) -> bool:
     )
 
 
+def is_verified_import_probe(holder_pid: int) -> bool:
+    """Whether a ``python -c`` import probe is our updater's child.
+
+    The caller additionally requires the exact ``-c`` interpreter shape.  The
+    parent-pid attestation here prevents a copied environment variable from
+    opening the launch gate for an unrelated process.
+    """
+    raw = os.environ.get(IMPORT_PROBE_PARENT_PID_ENV, "").strip()
+    try:
+        parent_pid = int(raw)
+    except ValueError:
+        return False
+    marker_raw = os.environ.get(IMPORT_PROBE_MARKER_PID_ENV, "").strip()
+    try:
+        marker_pid = int(marker_raw) if marker_raw else parent_pid
+    except ValueError:
+        return False
+    if (
+        parent_pid <= 0
+        or marker_pid <= 0
+        or marker_pid != holder_pid
+    ):
+        return False
+    try:
+        if os.getppid() != parent_pid or not _pid_alive(parent_pid):
+            return False
+        # In a direct CLI update the probe's parent owns the marker. In the
+        # Tauri handoff chain, the inherited HANDOFF_PID_ENV names the live
+        # marker owner one level above the Python updater.
+        return holder_pid == parent_pid or _handoff_pid() == holder_pid
+    except (AttributeError, OSError):
+        return False
+
+
 @dataclass(frozen=True)
 class UpdateHolder:
     """A confirmed-live update currently holding the lock."""
@@ -488,6 +570,7 @@ class UpdateHolder:
     pid: int
     age_seconds: float
     runtime_restarts_authorized: bool = False
+    operation_lock: bool = False
 
 
 def read_live_update(
@@ -495,15 +578,26 @@ def read_live_update(
 ) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
-    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
-    unreadable, malformed, dead-pid, and past-the-ceiling all mean "no live
-    update", and a stale marker file is deleted so it can't strand future runs.
-    Never raises.
+    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``:
+    absent/unreadable state means "no live update" only when the marker
+    operation sidecar is also clear. A live sidecar is reported as an active
+    operation while the replacement marker is being published. Malformed,
+    dead-pid, and past-the-ceiling markers are reclaimed so they can't strand
+    future runs. Never raises.
     """
     marker = path or update_marker_path()
     try:
         raw = marker.read_text(encoding="utf-8")
     except OSError:
+        if not _lock_held:
+            operation = _live_marker_operation_holder(marker)
+            if operation is not None:
+                pid, age = operation
+                return UpdateHolder(
+                    pid=pid,
+                    age_seconds=age,
+                    operation_lock=True,
+                )
         return None  # absent or unreadable => no live update
 
     lines = raw.splitlines()
@@ -533,6 +627,15 @@ def read_live_update(
                     path=marker,
                     _lock_held=_lock_held,
                 )
+            if not _lock_held:
+                operation = _live_marker_operation_holder(marker)
+                if operation is not None:
+                    operation_pid, operation_age = operation
+                    return UpdateHolder(
+                        pid=operation_pid,
+                        age_seconds=operation_age,
+                        operation_lock=True,
+                    )
         return None
 
     runtime_restarts_authorized = (
@@ -547,6 +650,13 @@ def read_live_update(
 
 def describe_holder(holder: UpdateHolder) -> str:
     """One-line, user-facing explanation of who holds the update lock."""
+    if holder.operation_lock:
+        return (
+            "✗ Another Hermes update is already starting (the update-operation "
+            "lock is held).\n"
+            "\n"
+            "  Wait for that update to finish publishing its lock, then retry."
+        )
     minutes, seconds = divmod(int(max(holder.age_seconds, 0)), 60)
     elapsed = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
     return (
@@ -597,54 +707,72 @@ class UpdateLock:
         for _attempt in range(8):
             try:
                 with _marker_operation_lock(self.path):
-                    try:
-                        _write_marker_exclusive(self.path, body)
-                    except FileExistsError:
-                        existing = read_live_update(
-                            path=self.path,
-                            _lock_held=True,
-                        )
-                        if existing is not None:
-                            if is_verified_handoff(existing.pid):
+                    # Keep the sidecar across stale-marker reclamation and the
+                    # replacement publication.  Leaving this context between
+                    # those two operations creates a marker-free window in
+                    # which readers can start a runtime before this claimant
+                    # has published its lock.
+                    for _claim_attempt in range(8):
+                        try:
+                            _write_marker_exclusive(self.path, body)
+                        except FileExistsError:
+                            existing = read_live_update(
+                                path=self.path,
+                                _lock_held=True,
+                            )
+                            if existing is not None:
+                                if is_verified_handoff(existing.pid):
+                                    self.holder = existing
+                                    self._claim_pid = existing.pid
+                                    # A previous child stage may have crashed during
+                                    # the narrow restart phase. Close that phase
+                                    # before this retry performs mutation under the
+                                    # parent's claim.
+                                    if not self.deauthorize_runtime_restarts(
+                                        _lock_held=True
+                                    ):
+                                        self._claim_pid = None
+                                        return False
+                                    return True
                                 self.holder = existing
-                                self._claim_pid = existing.pid
-                                # A previous child stage may have crashed during
-                                # the narrow restart phase. Close that phase
-                                # before this retry performs mutation under the
-                                # parent's claim.
-                                if not self.deauthorize_runtime_restarts(
-                                    _lock_held=True
-                                ):
-                                    self._claim_pid = None
-                                    return False
-                                return True
-                            self.holder = existing
-                            return False
-                        # The stale/malformed marker was atomically reclaimed,
-                        # or a competing claimant won the race. Retry the
-                        # exclusive create after releasing the sidecar lock.
-                        continue
-                    except OSError as exc:
-                        # Best-effort, exactly like the Rust guard: an unwritable
-                        # marker must not block the update itself. Degrade to
-                        # pre-lock behavior rather than claiming a path we could
-                        # not publish.
-                        logger.debug(
-                            "Could not write update marker %s: %s",
-                            self.path,
-                            exc,
-                        )
+                                return False
+                            # The stale/malformed marker was atomically reclaimed
+                            # under this same sidecar. Retry the exclusive create
+                            # before releasing it, so no sibling reader sees an
+                            # unlocked install.
+                            continue
+                        except OSError as exc:
+                            # Best-effort, exactly like the Rust guard: an unwritable
+                            # marker must not block the update itself. Degrade to
+                            # pre-lock behavior rather than claiming a path we could
+                            # not publish.
+                            logger.debug(
+                                "Could not write update marker %s: %s",
+                                self.path,
+                                exc,
+                            )
+                            return True
+                        self.acquired = True
+                        self._claim_pid = pid
+                        self._claim_started_at = started_at
                         return True
-                    self.acquired = True
-                    self._claim_pid = pid
-                    self._claim_started_at = started_at
-                    return True
             except TimeoutError:
                 logger.debug(
                     "Could not acquire marker operation lock %s",
                     self.path,
                 )
-                break
+                # A live sidecar is itself an in-flight update operation. Do
+                # not fall through to the historical best-effort success path:
+                # the marker may not have been published yet, but mutation can
+                # already be imminent.
+                self.holder = read_live_update(path=self.path)
+                if self.holder is None:
+                    self.holder = UpdateHolder(
+                        pid=-1,
+                        age_seconds=0,
+                        operation_lock=True,
+                    )
+                return False
 
         existing = read_live_update(path=self.path)
         if existing is not None:

@@ -16,6 +16,7 @@ and the syntax guard reported the update as successful.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,7 @@ def test_import_guard_prefers_the_project_venv_interpreter(monkeypatch, tmp_path
 
     def fake_run(cmd, **kwargs):
         seen["interpreter"] = cmd[0]
+        seen["env"] = kwargs["env"]
 
         class R:
             returncode = 0
@@ -152,6 +154,28 @@ def test_import_guard_prefers_the_project_venv_interpreter(monkeypatch, tmp_path
     update_cmd._validate_critical_modules_import(tmp_path)
 
     assert seen["interpreter"] == str(venv_python)
+    assert seen["env"]["HERMES_UPDATE_IMPORT_PROBE_PARENT_PID"]
+
+
+def test_import_probe_preserves_tauri_marker_owner_attestation(monkeypatch, tmp_path):
+    """The probe's parent may be Python while Tauri owns the marker above it."""
+    marker_pid = 4321
+    monkeypatch.setenv("HERMES_UPDATE_HANDOFF_PID", str(marker_pid))
+    monkeypatch.setenv("HERMES_UPDATE_IMPORT_PROBE_PARENT_PID", str(os.getpid()))
+    monkeypatch.setenv("HERMES_UPDATE_IMPORT_PROBE_MARKER_PID", str(marker_pid))
+    monkeypatch.setattr(os, "getppid", lambda: os.getpid())
+    monkeypatch.setattr("hermes_cli.update_lock._pid_alive", lambda _pid: True)
+
+    import hermes_bootstrap
+    from hermes_cli.update_lock import UpdateHolder
+
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=marker_pid, age_seconds=1),
+    )
+    monkeypatch.setattr("hermes_bootstrap.sys.argv", ["-c"])
+
+    hermes_bootstrap.enforce_update_launch_gate([], entrypoint="other")
 
 
 def test_import_guard_ignores_missing_third_party_dependency(monkeypatch, tmp_path):

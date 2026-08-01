@@ -51,6 +51,18 @@ test('absent marker => no live update', () => {
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
 })
 
+test('live operation sidecar blocks readers before marker publication', () => {
+  const home = tmpHome('operation-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n`)
+
+  const res = readLiveUpdateMarker(home, { kill: ALIVE })
+
+  assert.ok(res, 'a live sidecar is an in-flight update even before marker publish')
+  assert.equal(res.pid, process.pid)
+})
+
 test('live pid within age ceiling => live update reported', () => {
   const home = tmpHome('live')
   const now = 1_000_000_000_000

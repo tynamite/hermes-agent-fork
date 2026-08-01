@@ -27,6 +27,7 @@ import pytest
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
+    IMPORT_PROBE_PARENT_PID_ENV,
     MARKER_OPERATION_LOCK_NAME,
     UPDATE_EXIT_CONCURRENT,
     UPDATE_MARKER_MAX_AGE_SECONDS,
@@ -652,8 +653,77 @@ def test_crashed_marker_operation_lock_is_reclaimed(marker):
     assert not operation_lock.exists(), "a dead sidecar owner must not wedge claims"
 
 
+def test_live_operation_sidecar_blocks_readers_before_marker_is_published(marker):
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    (operation_lock / "owner").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    holder = read_live_update(path=marker)
+
+    assert holder is not None
+    assert holder.operation_lock is True
+    assert holder.pid == os.getpid()
+
+
+def test_marker_replacement_is_published_before_sidecar_release(marker, monkeypatch):
+    """A reclaimed marker never leaves a reader-visible unlocked interval."""
+    marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+    from hermes_cli import update_lock
+
+    original = update_lock._write_marker_exclusive
+    marker_attempts = 0
+    sidecar_seen = False
+
+    def wrapped(path, body):
+        nonlocal marker_attempts, sidecar_seen
+        if path == marker:
+            marker_attempts += 1
+            if marker_attempts == 2:
+                sidecar_seen = marker.with_name(MARKER_OPERATION_LOCK_NAME).exists()
+        return original(path, body)
+
+    monkeypatch.setattr(update_lock, "_write_marker_exclusive", wrapped)
+    assert UpdateLock(path=marker).acquire() is True
+    assert marker_attempts >= 2
+    assert sidecar_seen is True
+
+
+def test_sidecar_timeout_refuses_instead_of_falling_through_to_update(marker, monkeypatch):
+    from contextlib import contextmanager
+
+    from hermes_cli import update_lock
+
+    @contextmanager
+    def timed_out(_marker):
+        raise TimeoutError("sidecar is held")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(update_lock, "_marker_operation_lock", timed_out)
+    lock = UpdateLock(path=marker)
+
+    assert lock.acquire() is False
+    assert lock.holder is not None
+    assert lock.holder.operation_lock is True
+    assert not marker.exists()
+
+
 def test_absent_marker_reports_no_live_update(marker):
     assert read_live_update(path=marker) is None
+
+
+def test_attested_import_probe_passes_only_as_direct_python_c_child(monkeypatch):
+    import hermes_bootstrap
+
+    holder = UpdateHolder(pid=os.getpid(), age_seconds=1)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: holder,
+    )
+    monkeypatch.setenv(IMPORT_PROBE_PARENT_PID_ENV, str(os.getpid()))
+    monkeypatch.setattr(os, "getppid", lambda: os.getpid())
+    monkeypatch.setattr(sys, "argv", ["-c"])
+
+    hermes_bootstrap.enforce_update_launch_gate([], entrypoint="other")
 
 
 def test_context_manager_releases_even_on_exception(marker):

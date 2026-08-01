@@ -85,6 +85,38 @@ function reapStaleMarkerOperationLock(lockDir) {
   }
 }
 
+function liveMarkerOperationLock(file, { kill, now }) {
+  const lockDir = markerOperationLockPath(file)
+  let lockStat
+
+  try {
+    lockStat = fs.statSync(lockDir)
+  } catch {
+    return null
+  }
+
+  let ownerPid = null
+
+  try {
+    const [pidLine] = fs.readFileSync(path.join(lockDir, 'owner'), 'utf8').split('\n')
+    const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
+    ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+  } catch {
+    // The owner file is written immediately after mkdir. Treat that tiny
+    // interval as active, but only until the stale-lock ceiling expires.
+  }
+
+  const ageMs = Math.max(0, now() - lockStat.mtimeMs)
+
+  if (ownerPid !== null) {
+    return isPidAlive(ownerPid, kill) ? { pid: ownerPid, ageMs } : null
+  }
+
+  return ageMs < MARKER_OPERATION_LOCK_STALE_MS
+    ? { pid: -1, ageMs }
+    : null
+}
+
 function withMarkerOperationLock(file, operation) {
   const lockDir = markerOperationLockPath(file)
   const ownerFile = path.join(lockDir, 'owner')
@@ -197,9 +229,10 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
 /**
  * Read + interpret the marker.
  *
- * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling). Returns `null` for
- * every "no live update" case — absent, unreadable, malformed, dead pid, or
+ * Returns `{ pid, ageMs }` when an update is GENUINELY still running
+ * (parseable pid that is alive, within the age ceiling), or while the marker
+ * operation sidecar is held during publication. Returns `null` for every
+ * other "no live update" case — absent, unreadable, malformed, dead pid, or
  * past the ceiling — and, when a stale marker file exists, deletes it so it
  * cannot strand future launches.
  *
@@ -226,7 +259,7 @@ export function readLiveUpdateMarker(
   try {
     raw = fs.readFileSync(file, 'utf8')
   } catch {
-    return null // absent or unreadable => no live update
+    return liveMarkerOperationLock(file, { kill, now })
   }
 
   const [pidLine, startedLine] = String(raw).split('\n')
@@ -258,7 +291,7 @@ export function readLiveUpdateMarker(
       }
     }
 
-    return null
+    return liveMarkerOperationLock(file, { kill, now })
   }
 
   return { pid, ageMs }

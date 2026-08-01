@@ -140,6 +140,9 @@ const UPDATE_MARKER_OPERATION_LOCK_STALE_SECS: u64 = 30;
 struct MarkerOwner {
     pid: u32,
     age_secs: u64,
+    /// True when the short-lived marker-operation sidecar is held before the
+    /// marker itself has been published.
+    operation_lock: bool,
 }
 
 /// Read the marker and report a live owner, including this process. `None` for
@@ -165,7 +168,11 @@ fn marker_info(path: &Path) -> Option<MarkerOwner> {
     if age_secs > UPDATE_MARKER_MAX_AGE_SECS || !pid_is_alive(pid) {
         return None;
     }
-    Some(MarkerOwner { pid, age_secs })
+    Some(MarkerOwner {
+        pid,
+        age_secs,
+        operation_lock: false,
+    })
 }
 
 /// Read a live foreign owner, excluding the desktop's pre-written self claim.
@@ -176,6 +183,35 @@ fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
 
 fn marker_operation_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(".hermes-update-in-progress.lock")
+}
+
+fn marker_operation_lock_owner(path: &Path) -> Option<MarkerOwner> {
+    let dir = marker_operation_lock_path(path);
+    let metadata = std::fs::metadata(&dir).ok()?;
+    let age_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let owner_pid = std::fs::read_to_string(dir.join("owner"))
+        .ok()
+        .and_then(|raw| raw.lines().next()?.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0);
+    match owner_pid {
+        Some(pid) if pid_is_alive(pid) => Some(MarkerOwner {
+            pid,
+            age_secs,
+            operation_lock: true,
+        }),
+        Some(_) => None,
+        None if age_secs < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS => Some(MarkerOwner {
+            pid: 0,
+            age_secs,
+            operation_lock: true,
+        }),
+        None => None,
+    }
 }
 
 struct MarkerOperationLock {
@@ -345,10 +381,12 @@ fn pid_is_alive(pid: u32) -> bool {
 impl UpdateMarkerGuard {
     /// Claim the marker, or report the live updater that already owns it.
     ///
-    /// Writing is best-effort: a write failure must NOT abort the update (the
-    /// gate degrades to "no marker => proceed", i.e. exactly the pre-marker
-    /// behavior), so we log and carry on with a guard that still attempts
-    /// cleanup of whatever may exist at the path.
+    /// Writing the marker itself is best-effort: a write failure must NOT
+    /// abort the update (the gate degrades to "no marker => proceed", i.e.
+    /// exactly the pre-marker behavior), so we log and carry on with a guard
+    /// that still attempts cleanup of whatever may exist at the path. A
+    /// timeout acquiring the operation sidecar is different: another writer
+    /// is already in the claim/publication window, so acquisition fails closed.
     fn acquire(path: PathBuf) -> Result<Self, MarkerOwner> {
         let pid = std::process::id();
         let started_at = std::time::SystemTime::now()
@@ -361,6 +399,14 @@ impl UpdateMarkerGuard {
         }
         let _operation_lock = match acquire_marker_operation_lock(&path) {
             Ok(lock) => Some(lock),
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                tracing::debug!(?path, %err, "another update is publishing its marker");
+                return Err(marker_operation_lock_owner(&path).unwrap_or(MarkerOwner {
+                    pid: 0,
+                    age_secs: 0,
+                    operation_lock: true,
+                }));
+            }
             Err(err) => {
                 tracing::warn!(?path, %err, "could not acquire marker operation lock");
                 None
@@ -414,6 +460,9 @@ impl UpdateMarkerGuard {
         }
 
         if let Some(owner) = live_marker_owner(&path) {
+            return Err(owner);
+        }
+        if let Some(owner) = marker_operation_lock_owner(&path) {
             return Err(owner);
         }
         tracing::warn!(?path, "could not atomically claim update-in-progress marker");
@@ -494,12 +543,18 @@ async fn run_update(app: AppHandle) -> Result<()> {
             } else {
                 format!("{secs}s")
             };
-            let msg = format!(
-                "Another Hermes update is already running (PID {}, started {} ago). \
-                 Wait for it to finish, or close the window or dashboard tab that \
-                 started it, then try again.",
-                owner.pid, elapsed
-            );
+            let msg = if owner.operation_lock {
+                "Another Hermes update is already starting (the update-operation lock is held). \
+                 Wait for it to finish publishing its lock, then try again."
+                    .to_string()
+            } else {
+                format!(
+                    "Another Hermes update is already running (PID {}, started {} ago). \
+                     Wait for it to finish, or close the window or dashboard tab that \
+                     started it, then try again.",
+                    owner.pid, elapsed
+                )
+            };
             emit(
                 &app,
                 BootstrapEvent::Failed {

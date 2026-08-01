@@ -376,6 +376,7 @@ def enforce_update_launch_gate(
             UPDATE_EXIT_CONCURRENT,
             describe_holder,
             is_verified_handoff,
+            is_verified_import_probe,
             read_live_update,
         )
 
@@ -385,6 +386,15 @@ def enforce_update_launch_gate(
         # permanently wedge every Hermes command.
         return
     if holder is None:
+        return
+    # The post-update skew probe is deliberately run as ``python -c`` while
+    # its updater parent owns the marker.  Admit only that exact interpreter
+    # shape plus a parent-pid attestation; ordinary sibling imports remain
+    # blocked until the updater explicitly authorizes runtime restarts.
+    if (
+        sys.argv[0] == "-c"
+        and is_verified_import_probe(holder.pid)
+    ):
         return
     if invokes_update or invokes_updater_rebuild:
         # A Tauri updater holds the marker while its Python child stage starts.
