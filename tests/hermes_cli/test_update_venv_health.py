@@ -747,13 +747,13 @@ def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
         Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
     )
 
-    def detect(*, exclude_pids=None):
-        seen.append(exclude_pids)
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
         return []
 
     with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
         "hermes_cli.gateway.find_gateway_pids", return_value=[555, 666]
-    ):
+    ), patch("gateway.status.get_process_start_time", return_value=111):
         result = _run_update_until_guard(
             _update_args(force=False, force_venv=False),
             is_windows=False,
@@ -762,7 +762,7 @@ def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
         )
 
     assert result == "past_guard", capsys.readouterr().out
-    assert seen == [{555, 666}]
+    assert seen == [({555, 666}, {555: 111})]
 
 
 def test_venv_holder_guard_quiesces_mapped_foreground_gateway_supervisor(
@@ -775,8 +775,8 @@ def test_venv_holder_guard_quiesces_mapped_foreground_gateway_supervisor(
         Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
     )
 
-    def detect(*, exclude_pids=None):
-        seen.append(exclude_pids)
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
         return []
 
     # find_gateway_pids deliberately omits ancestors, matching the real
@@ -784,19 +784,23 @@ def test_venv_holder_guard_quiesces_mapped_foreground_gateway_supervisor(
     # mapping must restore the gateway to the drain set before exclusion.
     with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
         "hermes_cli.gateway.find_gateway_pids", return_value=[]
-    ):
+    ), patch("gateway.status.get_process_start_time", return_value=111):
         result = _run_update_until_guard(
             _update_args(force=False, force_venv=False),
             is_windows=False,
             detector=detect,
-            quiesce_token={"pids": {555}, "created_markers": []},
+            quiesce_token={
+                "pids": {555},
+                "process_start_times": {555: 111},
+                "created_markers": [],
+            },
             profile_gateways=[
                 SimpleNamespace(profile="default", path="/tmp/hermes", pid=555)
             ],
         )
 
     assert result == "past_guard", capsys.readouterr().out
-    assert seen == [{555}]
+    assert seen == [({555}, {555: 111})]
 
 
 def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
@@ -810,8 +814,8 @@ def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
         Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
     )
 
-    def detect(*, exclude_pids=None):
-        seen.append(exclude_pids)
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
         # A profile-scoped dashboard TUI can have a slash worker or compute
         # host that intentionally called setsid(). It is not the attested
         # dashboard supervisor or a drained gateway and must still block.
@@ -825,7 +829,7 @@ def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
 
     with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
         "hermes_cli.gateway.find_gateway_pids", return_value=[]
-    ):
+    ), patch("gateway.status.get_process_start_time", return_value=111):
         result = _run_update_until_guard(
             _update_args(force=False, force_venv=False),
             is_windows=False,
@@ -834,7 +838,66 @@ def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
         )
 
     assert result == "exit_2", capsys.readouterr().out
-    assert seen == [{555}]
+    assert seen == [({555}, {555: 111})]
+
+
+def test_venv_holder_guard_binds_attested_dashboard_to_process_identity(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        # PID 555 was attested at start time 111, then reused by this holder.
+        return [(555, "python", "venv/bin/python -m replacement")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=111):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
+
+
+def test_venv_holder_guard_keeps_dashboard_visible_without_process_identity(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return []
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=None):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [set()]
 
 
 def test_venv_holder_guard_does_not_trust_unquiesced_dashboard_supervisor(

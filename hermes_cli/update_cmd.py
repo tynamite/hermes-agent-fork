@@ -4253,7 +4253,26 @@ def _cmd_update_impl(
                         _supervisor_pid not in _profile_gateway_pids
                         and _dashboard_quiesced
                     ):
-                        _venv_guard_exclude.add(_supervisor_pid)
+                        try:
+                            from gateway.status import get_process_start_time
+
+                            _supervisor_start_time = get_process_start_time(
+                                _supervisor_pid
+                            )
+                        except Exception:
+                            _supervisor_start_time = None
+                        if _supervisor_start_time is not None:
+                            _venv_guard_exclude.add(_supervisor_pid)
+                            _quiesced_gateway_start_times[
+                                _supervisor_pid
+                            ] = int(_supervisor_start_time)
+                        else:
+                            logger.debug(
+                                "Could not capture dashboard supervisor PID "
+                                "%s identity; leaving it visible to the "
+                                "venv-holder guard",
+                                _supervisor_pid,
+                            )
         except Exception:
             # Gateway discovery/quiescence and supervisor ancestry validation
             # both fail closed: no PID is excluded without a verified idle
