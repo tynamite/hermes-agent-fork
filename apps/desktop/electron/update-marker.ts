@@ -8,7 +8,8 @@
  * this reader intentionally ignores additional lines.
  * A short-lived `.hermes-update-in-progress.lock` sidecar serializes stale-
  * marker cleanup with replacement claims across the Python, Rust, and Electron
- * writers.
+ * writers. Its owner file also carries a process-start identity, so a
+ * suspended live updater remains authoritative without trusting a recycled PID.
  *
  * Why: if the user relaunches the desktop mid-update — the window vanished with
  * no progress and looks crashed — a fresh instance must NOT spawn its own local
@@ -25,6 +26,7 @@
  */
 
 import fs from 'fs'
+import { execFileSync } from 'node:child_process'
 import path from 'path'
 
 // Even with a live-looking PID, never treat a marker older than this as a live
@@ -33,6 +35,72 @@ import path from 'path'
 // recycled the pid onto an unrelated process), so the gate self-heals.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 const MARKER_OPERATION_LOCK_STALE_MS = 30 * 1000
+
+/**
+ * Return a stable per-process start identity when the host exposes one.
+ *
+ * Sidecar readers must not expire a suspended live updater. Pairing the PID
+ * with this identity preserves that safety while rejecting a recycled PID.
+ * The helper intentionally uses only OS facilities available to the desktop
+ * process; an unavailable probe is treated conservatively by the caller.
+ */
+export function getProcessStartIdentity(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null
+  }
+
+  if (process.platform === 'linux') {
+    try {
+      const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const fields = raw.slice(raw.lastIndexOf(')') + 1).trim().split(/\s+/)
+
+      // After the command name, field 22 (starttime) is index 19.
+      return fields[19] || null
+    } catch {
+      return null
+    }
+  }
+
+  if (process.platform !== 'win32') {
+    try {
+      const output = execFileSync(
+        'ps',
+        ['-o', 'lstart=', '-p', String(pid)],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, LC_ALL: 'C' },
+          stdio: ['ignore', 'pipe', 'ignore']
+        }
+      )
+
+      return output.trim() || null
+    } catch {
+      return null
+    }
+  }
+
+  try {
+    const output = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToFileTimeUtc()`
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 2_000,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore']
+      }
+    )
+
+    return output.trim() || null
+  } catch {
+    return null
+  }
+}
 
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
@@ -45,12 +113,14 @@ function markerOperationLockPath(file) {
 function reapStaleMarkerOperationLock(lockDir) {
   const ownerFile = path.join(lockDir, 'owner')
   let ownerPid = null
+  let ownerIdentity = null
   let ownerIsMalformed = false
 
   try {
-    const [pidLine] = fs.readFileSync(ownerFile, 'utf8').split('\n')
+    const [pidLine, , identityLine] = fs.readFileSync(ownerFile, 'utf8').split('\n')
     const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
     ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+    ownerIdentity = (identityLine || '').trim() || null
     ownerIsMalformed = ownerPid === null
   } catch {
     ownerIsMalformed = true
@@ -70,15 +140,18 @@ function reapStaleMarkerOperationLock(lockDir) {
     }
   }
 
-  // Sidecar operations are intentionally short-lived. A live PID after the
-  // stale ceiling may have been recycled from a crashed owner, so it must not
-  // wedge every future update indefinitely.
-  if (
-    ownerPid !== null &&
-    isPidAlive(ownerPid) &&
-    lockAgeMs < MARKER_OPERATION_LOCK_STALE_MS
-  ) {
-    return false
+  if (ownerPid !== null && isPidAlive(ownerPid)) {
+    if (ownerIdentity) {
+      const currentIdentity = getProcessStartIdentity(ownerPid)
+
+      // Keep the sidecar when identity inspection is unavailable; opening a
+      // concurrent-update window is worse than conservatively waiting.
+      if (currentIdentity === null || currentIdentity === ownerIdentity) {
+        return false
+      }
+    } else if (lockAgeMs < MARKER_OPERATION_LOCK_STALE_MS) {
+      return false
+    }
   }
 
   try {
@@ -107,11 +180,13 @@ function liveMarkerOperationLock(file, { kill, now }) {
   }
 
   let ownerPid = null
+  let ownerIdentity = null
 
   try {
-    const [pidLine] = fs.readFileSync(path.join(lockDir, 'owner'), 'utf8').split('\n')
+    const [pidLine, , identityLine] = fs.readFileSync(path.join(lockDir, 'owner'), 'utf8').split('\n')
     const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
     ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+    ownerIdentity = (identityLine || '').trim() || null
   } catch {
     // The owner file is written immediately after mkdir. Treat that tiny
     // interval as active, but only until the stale-lock ceiling expires.
@@ -120,9 +195,21 @@ function liveMarkerOperationLock(file, { kill, now }) {
   const ageMs = Math.max(0, now() - lockStat.mtimeMs)
 
   if (ownerPid !== null) {
-    return ageMs < MARKER_OPERATION_LOCK_STALE_MS && isPidAlive(ownerPid, kill)
-      ? { pid: ownerPid, ageMs }
-      : null
+    if (!isPidAlive(ownerPid, kill)) {
+      return null
+    }
+
+    if (ownerIdentity) {
+      const currentIdentity = getProcessStartIdentity(ownerPid)
+
+      if (currentIdentity === null || currentIdentity === ownerIdentity) {
+        return { pid: ownerPid, ageMs }
+      }
+
+      return null
+    }
+
+    return ageMs < MARKER_OPERATION_LOCK_STALE_MS ? { pid: ownerPid, ageMs } : null
   }
 
   return ageMs < MARKER_OPERATION_LOCK_STALE_MS
@@ -149,11 +236,16 @@ function withMarkerOperationLock(file, operation) {
     }
 
     try {
-      fs.writeFileSync(ownerFile, `${process.pid}\n${Math.floor(Date.now() / 1000)}\n`, {
-        encoding: 'utf8',
-        flag: 'wx',
-        mode: 0o644
-      })
+      const identity = getProcessStartIdentity(process.pid) || ''
+      fs.writeFileSync(
+        ownerFile,
+        `${process.pid}\n${Math.floor(Date.now() / 1000)}\n${identity}\n`,
+        {
+          encoding: 'utf8',
+          flag: 'wx',
+          mode: 0o644
+        }
+      )
 
       return { acquired: true, value: operation() }
     } finally {

@@ -20,6 +20,7 @@ import path from 'path'
 import { test } from 'vitest'
 
 import {
+  getProcessStartIdentity,
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
@@ -72,6 +73,39 @@ test('old live-pid sidecar is bounded by the stale ceiling', () => {
   const now = old + 30 * 1000 + 1
 
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
+})
+
+test('old live sidecar with matching process identity stays active', () => {
+  const identity = getProcessStartIdentity(process.pid)
+
+  if (!identity) {
+    return
+  }
+
+  const home = tmpHome('old-live-identity-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n0\n${identity}\n`)
+  const old = fs.statSync(operationLock).mtimeMs
+  const now = old + 60 * 60 * 1000
+
+  const res = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+
+  assert.ok(res, 'a verified live owner remains active after the age ceiling')
+  assert.equal(res.pid, process.pid)
+})
+
+test('recycled live-pid sidecar is not treated as active', () => {
+  if (!getProcessStartIdentity(process.pid)) {
+    return
+  }
+
+  const home = tmpHome('recycled-live-identity-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n0\nold-start\n`)
+
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
 })
 
 test('live pid within age ceiling => live update reported', () => {

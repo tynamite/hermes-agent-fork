@@ -185,6 +185,79 @@ fn marker_operation_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(".hermes-update-in-progress.lock")
 }
 
+/// Return a stable per-process start identity when the host exposes one.
+///
+/// Sidecar readers must retain a suspended live owner, while still rejecting
+/// a recycled PID. The wire value is only compared on the same host, so each
+/// platform may use its native process-start representation.
+fn process_start_identity(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some((_command, fields)) = raw.rsplit_once(')') {
+                if let Some(start) = fields.split_whitespace().nth(19) {
+                    return Some(start.to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let pid_arg = pid.to_string();
+        let output = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p"])
+            .arg(pid_arg)
+            .env("LC_ALL", "C")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !identity.is_empty() {
+                return Some(identity);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = MaybeUninit::<FILETIME>::uninit();
+        let mut exit = MaybeUninit::<FILETIME>::uninit();
+        let mut kernel = MaybeUninit::<FILETIME>::uninit();
+        let mut user = MaybeUninit::<FILETIME>::uninit();
+        let ok = unsafe {
+            GetProcessTimes(
+                handle,
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        };
+        if ok != 0 {
+            let value = unsafe { creation.assume_init() };
+            let ticks = ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64;
+            unsafe { CloseHandle(handle) };
+            return Some(ticks.to_string());
+        }
+        unsafe { CloseHandle(handle) };
+    }
+
+    None
+}
+
+// The sidecar owner file is pid + unix creation time + process-start
+// identity. Legacy two-line owners retain the short age fallback.
 fn marker_operation_lock_owner(path: &Path) -> Option<MarkerOwner> {
     let dir = marker_operation_lock_path(path);
     let metadata = std::fs::metadata(&dir).ok()?;
@@ -194,19 +267,44 @@ fn marker_operation_lock_owner(path: &Path) -> Option<MarkerOwner> {
         .and_then(|modified| modified.elapsed().ok())
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    let owner_pid = std::fs::read_to_string(dir.join("owner"))
+    let (owner_pid, owner_identity) = std::fs::read_to_string(dir.join("owner"))
         .ok()
-        .and_then(|raw| raw.lines().next()?.trim().parse::<u32>().ok())
-        .filter(|pid| *pid > 0);
+        .map(|raw| {
+            let mut lines = raw.lines();
+            let pid = lines
+                .next()
+                .and_then(|line| line.trim().parse::<u32>().ok())
+                .filter(|pid| *pid > 0);
+            let identity = lines
+                .nth(1)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            (pid, identity)
+        })
+        .unwrap_or((None, None));
     match owner_pid {
-        Some(pid)
-            if age_secs < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS && pid_is_alive(pid) =>
-        {
-            Some(MarkerOwner {
-                pid,
-                age_secs,
-                operation_lock: true,
-            })
+        Some(pid) if pid_is_alive(pid) => {
+            if let Some(expected) = owner_identity {
+                let current = process_start_identity(pid);
+                if current.is_none() || current.as_deref() == Some(expected.as_str()) {
+                    return Some(MarkerOwner {
+                        pid,
+                        age_secs,
+                        operation_lock: true,
+                    });
+                }
+                return None;
+            }
+            if age_secs < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS {
+                Some(MarkerOwner {
+                    pid,
+                    age_secs,
+                    operation_lock: true,
+                })
+            } else {
+                None
+            }
         }
         Some(_) => None,
         None if age_secs < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS => Some(MarkerOwner {
@@ -232,12 +330,20 @@ impl Drop for MarkerOperationLock {
 
 fn reap_stale_marker_operation_lock(dir: &Path) -> bool {
     let owner = dir.join("owner");
-    let owner_pid = match std::fs::read_to_string(&owner) {
-        Ok(raw) => raw
-            .lines()
-            .next()
-            .and_then(|line| line.trim().parse::<u32>().ok()),
-        Err(_) => None,
+    let (owner_pid, owner_identity) = match std::fs::read_to_string(&owner) {
+        Ok(raw) => {
+            let mut lines = raw.lines();
+            let pid = lines
+                .next()
+                .and_then(|line| line.trim().parse::<u32>().ok());
+            let identity = lines
+                .nth(1)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            (pid, identity)
+        }
+        Err(_) => (None, None),
     };
     let age = std::fs::metadata(dir)
         .ok()
@@ -246,8 +352,15 @@ fn reap_stale_marker_operation_lock(dir: &Path) -> bool {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     if let Some(pid) = owner_pid {
-        if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS && pid_is_alive(pid) {
-            return false;
+        if pid_is_alive(pid) {
+            if let Some(expected) = owner_identity {
+                let current = process_start_identity(pid);
+                if current.is_none() || current.as_deref() == Some(expected.as_str()) {
+                    return false;
+                }
+            } else if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS {
+                return false;
+            }
         }
     } else if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS {
         return false;
@@ -267,7 +380,13 @@ fn acquire_marker_operation_lock(path: &Path) -> std::io::Result<MarkerOperation
     loop {
         match std::fs::create_dir(&dir) {
             Ok(()) => {
-                let body = format!("{}\n{}\n", std::process::id(), unix_now_secs());
+                let identity = process_start_identity(std::process::id()).unwrap_or_default();
+                let body = format!(
+                    "{}\n{}\n{}\n",
+                    std::process::id(),
+                    unix_now_secs(),
+                    identity
+                );
                 if let Err(err) = write_marker_exclusive(&owner, &body) {
                     let _ = std::fs::remove_dir(&dir);
                     return Err(err);

@@ -31,6 +31,9 @@ marker is removed on read by whoever notices it first. Marker operations use a
 short-lived ``.hermes-update-in-progress.lock`` sidecar acquired with atomic
 directory creation; this serializes stale-marker reclamation with replacement
 claims without moving a path that a different updater may now own.
+The sidecar owner file carries ``pid``, creation time, and a process-start
+identity; a matching live identity remains authoritative even if the updater
+is suspended past the short-operation age fallback.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -209,6 +212,107 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _process_start_identity(pid: int) -> str | None:
+    """Return a stable per-process start identity, when the OS exposes one.
+
+    The marker-operation sidecar must remain authoritative while its owner is
+    suspended. Pairing its PID with this identity lets readers distinguish a
+    recycled PID without expiring a genuinely live owner by age. Keep this
+    helper stdlib-only because the bootstrap launch gate imports this module
+    before third-party packages are repairable.
+    """
+    if pid <= 0:
+        return None
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        _command, separator, fields = stat_path.read_text(encoding="utf-8").rpartition(")")
+        values = fields.split()
+        # After the command name, field 22 (starttime) is index 19.
+        if separator and len(values) > 19:
+            return values[19]
+    except (FileNotFoundError, IndexError, PermissionError, OSError):
+        pass
+
+    # Linux has no portable process-start source once procfs is unavailable;
+    # keep the sidecar's conservative age fallback rather than spawning a
+    # locale-dependent probe for every marker read.
+    if sys.platform.startswith("linux"):
+        return None
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL(  # type: ignore[attr-defined]
+                "kernel32", use_last_error=True
+            )
+            kernel32.OpenProcess.argtypes = (
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            )
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = (
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            )
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            process = kernel32.OpenProcess(0x1000, False, pid)
+            if process:
+                try:
+                    creation = wintypes.FILETIME()
+                    exit_time = wintypes.FILETIME()
+                    kernel_time = wintypes.FILETIME()
+                    user_time = wintypes.FILETIME()
+                    if kernel32.GetProcessTimes(
+                        process,
+                        ctypes.byref(creation),
+                        ctypes.byref(exit_time),
+                        ctypes.byref(kernel_time),
+                        ctypes.byref(user_time),
+                    ):
+                        value = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                        return str(value)
+                finally:
+                    kernel32.CloseHandle(process)
+        except (AttributeError, OSError, OverflowError, TypeError):
+            return None
+        return None
+
+    # macOS/BSD do not expose procfs. `ps -o lstart=` is available on the
+    # supported hosts and is stable for the lifetime of a process.
+    try:
+        import subprocess
+
+        env = {
+            "LC_ALL": "C",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=5,
+            check=False,
+        )
+        identity = result.stdout.strip()
+        if result.returncode == 0 and identity:
+            return identity
+    except Exception:
+        pass
+    return None
+
+
 def _marker_operation_lock_path(marker: Path) -> Path:
     """Stable sidecar path used to serialize marker check/claim/reclaim."""
     return marker.with_name(MARKER_OPERATION_LOCK_NAME)
@@ -223,7 +327,9 @@ def _live_marker_operation_holder(marker: Path) -> tuple[int, float] | None:
     let a runtime start in the middle of an update.  A missing/malformed owner
     file is considered active for the short stale-lock window: that covers the
     tiny create-directory → owner-file write interval without trusting a
-    crashed lock forever.
+    crashed lock forever. A well-formed owner with a matching process-start
+    identity remains active regardless of age, so a suspended updater cannot
+    lose its claim while a recycled PID is still rejected.
     """
     lock_dir = _marker_operation_lock_path(marker)
     try:
@@ -232,17 +338,29 @@ def _live_marker_operation_holder(marker: Path) -> tuple[int, float] | None:
         return None
 
     owner_pid: int | None = None
+    owner_identity: str | None = None
     try:
         lines = (lock_dir / "owner").read_text(encoding="utf-8").splitlines()
         parsed = int(lines[0].strip())
         if parsed > 0:
             owner_pid = parsed
+            if len(lines) > 2 and lines[2].strip():
+                owner_identity = lines[2].strip()
     except (FileNotFoundError, IndexError, ValueError, OSError):
         pass
 
     age = max(0.0, time.time() - stat.st_mtime)
     if owner_pid is not None:
-        if age >= MARKER_OPERATION_LOCK_STALE_SECONDS or not _pid_alive(owner_pid):
+        if not _pid_alive(owner_pid):
+            return None
+        if owner_identity:
+            current_identity = _process_start_identity(owner_pid)
+            # If identity inspection is temporarily unavailable, retain the
+            # live owner rather than opening a concurrent-update window.
+            if current_identity is None or current_identity == owner_identity:
+                return owner_pid, age
+            return None
+        if age >= MARKER_OPERATION_LOCK_STALE_SECONDS:
             return None
         return owner_pid, age
     if age < MARKER_OPERATION_LOCK_STALE_SECONDS:
@@ -258,10 +376,12 @@ def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
     cannot detach and later delete a replacement lock.
     """
     owner_file = lock_dir / "owner"
+    owner_identity = ""
     try:
         raw = owner_file.read_text(encoding="utf-8")
         lines = raw.splitlines()
         owner_pid = int(lines[0].strip())
+        owner_identity = lines[2].strip() if len(lines) > 2 else ""
     except (FileNotFoundError, IndexError, ValueError, OSError):
         try:
             age = time.time() - lock_dir.stat().st_mtime
@@ -275,15 +395,15 @@ def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
         age = time.time() - lock_dir.stat().st_mtime
     except OSError:
         return True
-    # Sidecar operations are intentionally short-lived. Even if a crashed
-    # owner PID has been recycled onto an unrelated live process, a parsed
-    # owner older than the stale ceiling must not wedge every future update.
-    if (
-        owner_pid > 0
-        and _pid_alive(owner_pid)
-        and age < MARKER_OPERATION_LOCK_STALE_SECONDS
-    ):
-        return False
+    if owner_pid > 0 and _pid_alive(owner_pid):
+        if owner_identity:
+            current_identity = _process_start_identity(owner_pid)
+            # A matching identity (or an unavailable probe) means the owner is
+            # still authoritative. Only a known mismatch proves PID reuse.
+            if current_identity is None or current_identity == owner_identity:
+                return False
+        elif age < MARKER_OPERATION_LOCK_STALE_SECONDS:
+            return False
     try:
         owner_file.unlink(missing_ok=True)
         lock_dir.rmdir()
@@ -314,7 +434,11 @@ def _marker_operation_lock(marker: Path):
         break
 
     try:
-        _write_marker_exclusive(owner_file, f"{os.getpid()}\n{int(time.time())}\n")
+        identity = _process_start_identity(os.getpid()) or ""
+        _write_marker_exclusive(
+            owner_file,
+            f"{os.getpid()}\n{int(time.time())}\n{identity}\n",
+        )
     except BaseException:
         owner_file.unlink(missing_ok=True)
         lock_dir.rmdir()

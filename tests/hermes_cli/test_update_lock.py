@@ -681,6 +681,41 @@ def test_old_live_pid_sidecar_is_bounded_by_stale_ceiling(marker, monkeypatch):
     assert read_live_update(path=marker) is None
 
 
+def test_old_live_sidecar_with_matching_process_identity_stays_active(marker, monkeypatch):
+    from hermes_cli import update_lock
+
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    (operation_lock / "owner").write_text(
+        f"{os.getpid()}\n{int(time.time())}\nowner-start\n",
+        encoding="utf-8",
+    )
+    original_time = time.time()
+    monkeypatch.setattr(update_lock.time, "time", lambda: original_time + 3600)
+    monkeypatch.setattr(update_lock, "_process_start_identity", lambda _pid: "owner-start")
+
+    holder = read_live_update(path=marker)
+
+    assert holder is not None
+    assert holder.operation_lock is True
+    assert holder.pid == os.getpid()
+
+
+def test_recycled_live_pid_sidecar_is_not_treated_as_active(marker, monkeypatch):
+    from hermes_cli import update_lock
+
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    (operation_lock / "owner").write_text(
+        f"{os.getpid()}\n{int(time.time())}\nold-start\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(update_lock, "_process_start_identity", lambda _pid: "new-start")
+
+    assert read_live_update(path=marker) is None
+    assert UpdateLock(path=marker).acquire() is True
+
+
 def test_marker_replacement_is_published_before_sidecar_release(marker, monkeypatch):
     """A reclaimed marker never leaves a reader-visible unlocked interval."""
     marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
