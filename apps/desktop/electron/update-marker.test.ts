@@ -114,6 +114,19 @@ test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () =
   assert.ok(fs.existsSync(markerPath(home)), 'marker file should exist after write')
 })
 
+test('writeUpdateMarker never overwrites an existing claim', () => {
+  const home = tmpHome('write-existing')
+  const now = 1_000_000_000_000
+  writeMarker(home, 1111, Math.floor(now / 1000) - 5)
+
+  writeUpdateMarker(home, 2222, { now: () => now })
+
+  assert.equal(
+    fs.readFileSync(markerPath(home), 'utf8'),
+    `1111\n${Math.floor(now / 1000) - 5}`
+  )
+})
+
 test('writeUpdateMarker is best-effort (no throw on bad path)', () => {
   // A non-existent directory should not throw.
   const badHome = path.join(os.tmpdir(), 'hermes-marker-nonexistent-' + Date.now())

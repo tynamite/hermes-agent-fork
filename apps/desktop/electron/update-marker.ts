@@ -34,6 +34,65 @@ export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
 }
 
+function reclaimStaleMarker(file, expectedRaw) {
+  try {
+    if (fs.readFileSync(file, 'utf8') !== expectedRaw) {
+      return false
+    }
+  } catch {
+    return true
+  }
+
+  const tombstone = `${file}.stale-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+  try {
+    // Rename the exact stale inode before deleting it. A new updater can create
+    // the shared marker path while this tombstone is cleaned up, without the
+    // cleanup unlinking that replacement claim.
+    fs.renameSync(file, tombstone)
+  } catch {
+    return false
+  }
+
+  let movedRaw
+
+  try {
+    movedRaw = fs.readFileSync(tombstone, 'utf8')
+  } catch {
+    return true
+  }
+
+  if (movedRaw === expectedRaw) {
+    try {
+      fs.unlinkSync(tombstone)
+    } catch {
+      void 0
+    }
+
+    return true
+  }
+
+  // Another reclaimer may have moved the stale inode first and a new updater
+  // may have claimed `file` before this reclaimer's rename. Never delete the
+  // unexpected inode: restore it with a no-clobber hard link when the path is
+  // still free, or leave the tombstone beside the winner.
+  try {
+    fs.linkSync(tombstone, file)
+  } catch (err) {
+    if (!(err && typeof err === 'object' && 'code' in err && err.code === 'EEXIST')) {
+      return false
+    }
+  }
+
+  try {
+    fs.unlinkSync(tombstone)
+  } catch {
+    void 0
+  }
+
+  return false
+}
+
 // True only if a host process with this pid is currently alive. Signal 0 does
 // not deliver a signal — it just probes existence/permission. ESRCH => dead;
 // EPERM => alive but owned by another user (still "alive" for our purposes).
@@ -92,11 +151,7 @@ export function readLiveUpdateMarker(
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
   if (!alive || ageMs > maxAgeMs) {
-    try {
-      fs.unlinkSync(file)
-    } catch {
-      void 0
-    }
+    reclaimStaleMarker(file, String(raw))
 
     return null
   }
@@ -119,21 +174,45 @@ export function readLiveUpdateMarker(
  * files locked and the update bricks.
  *
  * Fix: the desktop writes the marker itself, using the spawned updater's
- * PID, immediately after `spawn()`. The updater's `UpdateMarkerGuard` will
- * later overwrite it with its own PID — that's fine, the marker body is
- * the same format and `readLiveUpdateMarker` only cares that *some* live
- * pid owns it. When the updater finishes it deletes the marker as before.
+ * PID, immediately after `spawn()`. The updater's `UpdateMarkerGuard` adopts
+ * that pre-claim rather than overwriting it; the marker body is the same
+ * format and `readLiveUpdateMarker` only cares that *some* live pid owns it.
+ * When the updater finishes it deletes the marker as before.
  * If the updater never starts (spawn failure) the marker still contains a
  * real PID, so `readLiveUpdateMarker` will self-heal once that PID exits.
  */
 export function writeUpdateMarker(hermesHome, pid, { now = Date.now } = {}) {
   const file = markerPath(hermesHome)
   const startedAt = Math.floor(now() / 1000)
+  const temporary = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
   try {
-    fs.writeFileSync(file, `${pid}\n${startedAt}\n`, 'utf8')
-  } catch {
+    // Fully write a private file, then publish it with a no-clobber hard link.
+    // This keeps readers from observing a partially written marker and never
+    // overwrites a live marker owned by another updater.
+    fs.writeFileSync(temporary, `${pid}\n${startedAt}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o644
+    })
+    fs.linkSync(temporary, file)
+  } catch (err) {
+    if (
+      err &&
+      typeof err === 'object' &&
+      'code' in err &&
+      err.code === 'EEXIST'
+    ) {
+      return
+    }
+
     // Best-effort: if we can't write the marker, proceed anyway. The
     // updater will write its own when it reaches run_update.
+  } finally {
+    try {
+      fs.unlinkSync(temporary)
+    } catch {
+      void 0
+    }
   }
 }

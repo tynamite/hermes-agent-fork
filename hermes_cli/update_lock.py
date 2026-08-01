@@ -47,6 +47,7 @@ import ntpath
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -189,6 +190,104 @@ def _pid_alive(pid: int) -> bool:
     except (OSError, OverflowError):
         return False
     return True
+
+
+def _reclaim_stale_marker(marker: Path, expected_raw: str) -> bool:
+    """Atomically remove a stale marker without touching a replacement claim.
+
+    A plain ``unlink(marker)`` has a delete-after-check race: another updater
+    can create a fresh marker after the stale read and before the unlink. Move
+    the exact inode to a unique tombstone first; a new claimant can then create
+    ``marker`` independently while the old tombstone is cleaned up.
+    """
+    try:
+        if marker.read_text(encoding="utf-8") != expected_raw:
+            return False
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    tombstone = marker.with_name(
+        f".{marker.name}.stale-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        marker.rename(tombstone)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    try:
+        # The rename detached the inode from the shared path. This second
+        # comparison documents and enforces that only the bytes we inspected
+        # are discarded, even if a platform has unusual rename semantics.
+        moved_raw = tombstone.read_text(encoding="utf-8")
+    except OSError:
+        # A leftover tombstone is harmless: the shared marker path is free for
+        # the next atomic claimant, and a later run can clean this file.
+        return True
+
+    if moved_raw == expected_raw:
+        try:
+            tombstone.unlink()
+        except OSError:
+            pass
+        return True
+
+    # Another reclaimer may have moved the stale inode first and a new updater
+    # may have claimed ``marker`` before this reclaimer's rename. Never delete
+    # the unexpected inode: restore it with a no-clobber hard link when the
+    # path is still free, or leave the tombstone beside the winner.
+    try:
+        os.link(tombstone, marker)
+    except FileExistsError:
+        try:
+            tombstone.unlink()
+        except OSError:
+            pass
+    except OSError:
+        pass
+    else:
+        try:
+            tombstone.unlink()
+        except OSError:
+            pass
+    return False
+
+
+def _write_marker_exclusive(marker: Path, body: str) -> None:
+    """Create and publish a complete marker only if the path is absent."""
+    temporary = marker.with_name(
+        f".{marker.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o644,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        try:
+            os.link(temporary, marker)
+        except FileExistsError as exc:
+            raise FileExistsError(marker) from exc
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    try:
+        temporary.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _handoff_pid() -> int | None:
@@ -374,10 +473,7 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
 
     age = time.time() - started_at
     if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+        _reclaim_stale_marker(marker, raw)
         return None
 
     runtime_restarts_authorized = (
@@ -410,7 +506,7 @@ class UpdateLock:
     ``acquired`` is False when another live update already holds it — callers
     decide whether that's a hard refusal (CLI/dashboard) or a wait. Releasing
     only removes the marker when *we* still own it, so a marker rewritten by a
-    handoff partner (the Tauri updater overwrites it with its own pid) is never
+    handoff partner (the Tauri updater adopts the desktop's pre-claim) is never
     deleted out from under its new owner.
     """
 
@@ -419,6 +515,7 @@ class UpdateLock:
         self.acquired = False
         self.holder: UpdateHolder | None = None
         self._claim_pid: int | None = None
+        self._claim_started_at: str | None = None
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -429,33 +526,59 @@ class UpdateLock:
         refusing or re-writing the marker, and ``release`` leaves the parent's
         marker untouched.
         """
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.debug("Could not prepare update marker %s: %s", self.path, exc)
+            return True
+
+        pid = os.getpid()
+        started_at = str(int(time.time()))
+        body = f"{pid}\n{started_at}\n"
+        for _attempt in range(8):
+            try:
+                _write_marker_exclusive(self.path, body)
+            except FileExistsError:
+                existing = read_live_update(path=self.path)
+                if existing is not None:
+                    if is_verified_handoff(existing.pid):
+                        self.holder = existing
+                        self._claim_pid = existing.pid
+                        # A previous child stage may have crashed during the
+                        # narrow restart phase. Close that phase before this
+                        # retry performs mutation under the parent's claim.
+                        if not self.deauthorize_runtime_restarts():
+                            self._claim_pid = None
+                            return False
+                        return True
+                    self.holder = existing
+                    return False
+                # The stale/malformed marker was atomically reclaimed, or a
+                # competing claimant won the race. Retry the exclusive create.
+                continue
+            except OSError as exc:
+                # Best-effort, exactly like the Rust guard: an unwritable marker
+                # must not block the update itself. Degrade to pre-lock
+                # behavior rather than claiming a path we could not publish.
+                logger.debug("Could not write update marker %s: %s", self.path, exc)
+                return True
+            self.acquired = True
+            self._claim_pid = pid
+            self._claim_started_at = started_at
+            return True
+
         existing = read_live_update(path=self.path)
         if existing is not None:
             if is_verified_handoff(existing.pid):
                 self.holder = existing
                 self._claim_pid = existing.pid
-                # A previous child stage may have crashed during the narrow
-                # restart phase. Close that phase before this retry performs
-                # any new mutation under the parent's still-live claim.
-                if not self.deauthorize_runtime_restarts():
-                    self._claim_pid = None
-                    return False
-                return True
+                if self.deauthorize_runtime_restarts():
+                    return True
+                self._claim_pid = None
+                return False
             self.holder = existing
             return False
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
-            )
-        except OSError as exc:
-            # Best-effort, exactly like the Rust guard: an unwritable marker
-            # must not block the update itself (that would be a worse failure
-            # than the race it prevents). Degrade to the pre-lock behavior.
-            logger.debug("Could not write update marker %s: %s", self.path, exc)
-            return True
-        self.acquired = True
-        self._claim_pid = os.getpid()
+        logger.debug("Could not atomically claim update marker %s", self.path)
         return True
 
     def _set_runtime_restarts_authorized(self, authorized: bool) -> bool:
@@ -465,30 +588,44 @@ class UpdateLock:
             # launch gate to bypass.
             return True
         try:
-            raw = self.path.read_text(encoding="utf-8")
-            lines = raw.splitlines()
-            owner = int(lines[0].strip())
-            started_at = lines[1].strip()
-        except (OSError, IndexError, ValueError):
+            # Keep the descriptor open while checking and updating. If another
+            # process replaces the pathname after this open, writes still land
+            # on the old inode rather than clobbering the replacement claim.
+            with self.path.open("r+b") as handle:
+                raw_bytes = handle.read()
+                raw = raw_bytes.decode("utf-8")
+                lines = raw.splitlines()
+                owner = int(lines[0].strip())
+                started_at = lines[1].strip()
+                if owner != self._claim_pid or (
+                    self._claim_started_at is not None
+                    and started_at != self._claim_started_at
+                ):
+                    return False
+
+                prefix = f"{owner}\n{started_at}\n".encode("utf-8")
+                if authorized:
+                    if len(lines) > 2 and lines[2].strip() == "runtime-restarts":
+                        return True
+                    handle.seek(0, os.SEEK_END)
+                    if not raw_bytes.endswith(b"\n"):
+                        handle.write(b"\n")
+                    handle.write(b"runtime-restarts\n")
+                elif raw_bytes.startswith(prefix):
+                    # The first two lines are unchanged; truncating the phase
+                    # suffix avoids exposing a partially rewritten owner.
+                    handle.truncate(len(prefix))
+                else:
+                    handle.seek(0)
+                    handle.write(prefix)
+                    handle.truncate()
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
+        except (OSError, IndexError, ValueError, UnicodeDecodeError):
             return False
-        if owner != self._claim_pid:
-            return False
-        body = f"{owner}\n{started_at}\n"
-        if authorized:
-            body += "runtime-restarts\n"
-        temporary = self.path.with_name(
-            f".{self.path.name}.{os.getpid()}.tmp"
-        )
-        try:
-            temporary.write_text(body, encoding="utf-8")
-            os.replace(temporary, self.path)
-        except OSError:
-            return False
-        finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
         return True
 
     def authorize_runtime_restarts(self) -> bool:
@@ -508,19 +645,21 @@ class UpdateLock:
         self.acquired = False
         try:
             raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
+            lines = raw.splitlines()
+            owner = int(lines[0].strip())
+            started_at = lines[1].strip()
         except (OSError, IndexError, ValueError):
             self._claim_pid = None
             return
-        if owner != os.getpid():
+        if owner != os.getpid() or (
+            self._claim_started_at is not None
+            and started_at != self._claim_started_at
+        ):
             # A handoff partner took ownership (e.g. the Tauri updater wrote
             # its own pid). Leave it alone — it's still a live update.
             self._claim_pid = None
             return
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        _reclaim_stale_marker(self.path, raw)
         self._claim_pid = None
 
     def __enter__(self) -> "UpdateLock":
