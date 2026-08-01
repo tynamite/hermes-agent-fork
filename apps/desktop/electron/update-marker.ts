@@ -56,17 +56,28 @@ function reapStaleMarkerOperationLock(lockDir) {
     ownerIsMalformed = true
   }
 
+  let lockAgeMs
+
+  try {
+    lockAgeMs = Math.max(0, Date.now() - fs.statSync(lockDir).mtimeMs)
+  } catch {
+    return true
+  }
+
   if (ownerIsMalformed) {
-    try {
-      if (Date.now() - fs.statSync(lockDir).mtimeMs < MARKER_OPERATION_LOCK_STALE_MS) {
-        return false
-      }
-    } catch {
-      return true
+    if (lockAgeMs < MARKER_OPERATION_LOCK_STALE_MS) {
+      return false
     }
   }
 
-  if (ownerPid !== null && isPidAlive(ownerPid)) {
+  // Sidecar operations are intentionally short-lived. A live PID after the
+  // stale ceiling may have been recycled from a crashed owner, so it must not
+  // wedge every future update indefinitely.
+  if (
+    ownerPid !== null &&
+    isPidAlive(ownerPid) &&
+    lockAgeMs < MARKER_OPERATION_LOCK_STALE_MS
+  ) {
     return false
   }
 
@@ -109,7 +120,9 @@ function liveMarkerOperationLock(file, { kill, now }) {
   const ageMs = Math.max(0, now() - lockStat.mtimeMs)
 
   if (ownerPid !== null) {
-    return isPidAlive(ownerPid, kill) ? { pid: ownerPid, ageMs } : null
+    return ageMs < MARKER_OPERATION_LOCK_STALE_MS && isPidAlive(ownerPid, kill)
+      ? { pid: ownerPid, ageMs }
+      : null
   }
 
   return ageMs < MARKER_OPERATION_LOCK_STALE_MS
@@ -259,7 +272,21 @@ export function readLiveUpdateMarker(
   try {
     raw = fs.readFileSync(file, 'utf8')
   } catch {
-    return liveMarkerOperationLock(file, { kill, now })
+    const operation = liveMarkerOperationLock(file, { kill, now })
+
+    if (operation || _retries >= 2) {
+      return operation
+    }
+
+    // The sidecar may have been released just before the first marker read
+    // completed. Re-read once after it appears clear so a newly published live
+    // marker cannot be mistaken for absence.
+    return readLiveUpdateMarker(hermesHome, {
+      kill,
+      now,
+      maxAgeMs,
+      _retries: _retries + 1
+    })
   }
 
   const [pidLine, startedLine] = String(raw).split('\n')
@@ -291,7 +318,18 @@ export function readLiveUpdateMarker(
       }
     }
 
-    return liveMarkerOperationLock(file, { kill, now })
+    const operation = liveMarkerOperationLock(file, { kill, now })
+
+    if (operation || _retries >= 2) {
+      return operation
+    }
+
+    return readLiveUpdateMarker(hermesHome, {
+      kill,
+      now,
+      maxAgeMs,
+      _retries: _retries + 1
+    })
   }
 
   return { pid, ageMs }

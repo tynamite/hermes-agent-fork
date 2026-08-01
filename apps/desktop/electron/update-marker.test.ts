@@ -63,6 +63,17 @@ test('live operation sidecar blocks readers before marker publication', () => {
   assert.equal(res.pid, process.pid)
 })
 
+test('old live-pid sidecar is bounded by the stale ceiling', () => {
+  const home = tmpHome('old-operation-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n`)
+  const old = fs.statSync(operationLock).mtimeMs
+  const now = old + 30 * 1000 + 1
+
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
+})
+
 test('live pid within age ceiling => live update reported', () => {
   const home = tmpHome('live')
   const now = 1_000_000_000_000

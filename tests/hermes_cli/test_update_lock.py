@@ -665,6 +665,22 @@ def test_live_operation_sidecar_blocks_readers_before_marker_is_published(marker
     assert holder.pid == os.getpid()
 
 
+def test_old_live_pid_sidecar_is_bounded_by_stale_ceiling(marker, monkeypatch):
+    from hermes_cli import update_lock
+
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    (operation_lock / "owner").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    original_time = time.time()
+    monkeypatch.setattr(
+        update_lock.time,
+        "time",
+        lambda: original_time + update_lock.MARKER_OPERATION_LOCK_STALE_SECONDS + 1,
+    )
+
+    assert read_live_update(path=marker) is None
+
+
 def test_marker_replacement_is_published_before_sidecar_release(marker, monkeypatch):
     """A reclaimed marker never leaves a reader-visible unlocked interval."""
     marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")

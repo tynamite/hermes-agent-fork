@@ -199,11 +199,15 @@ fn marker_operation_lock_owner(path: &Path) -> Option<MarkerOwner> {
         .and_then(|raw| raw.lines().next()?.trim().parse::<u32>().ok())
         .filter(|pid| *pid > 0);
     match owner_pid {
-        Some(pid) if pid_is_alive(pid) => Some(MarkerOwner {
-            pid,
-            age_secs,
-            operation_lock: true,
-        }),
+        Some(pid)
+            if age_secs < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS && pid_is_alive(pid) =>
+        {
+            Some(MarkerOwner {
+                pid,
+                age_secs,
+                operation_lock: true,
+            })
+        }
         Some(_) => None,
         None if age_secs < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS => Some(MarkerOwner {
             pid: 0,
@@ -235,20 +239,18 @@ fn reap_stale_marker_operation_lock(dir: &Path) -> bool {
             .and_then(|line| line.trim().parse::<u32>().ok()),
         Err(_) => None,
     };
+    let age = std::fs::metadata(dir)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
     if let Some(pid) = owner_pid {
-        if pid_is_alive(pid) {
+        if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS && pid_is_alive(pid) {
             return false;
         }
-    } else if let Ok(metadata) = std::fs::metadata(dir) {
-        let age = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
-        if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS {
-            return false;
-        }
+    } else if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS {
+        return false;
     }
     let _ = std::fs::remove_file(&owner);
     match std::fs::remove_dir(dir) {

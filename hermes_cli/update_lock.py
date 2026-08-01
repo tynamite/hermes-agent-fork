@@ -243,7 +243,7 @@ def _live_marker_operation_holder(marker: Path) -> tuple[int, float] | None:
 
     age = max(0.0, time.time() - stat.st_mtime)
     if owner_pid is not None:
-        if not _pid_alive(owner_pid):
+        if age >= MARKER_OPERATION_LOCK_STALE_SECONDS or not _pid_alive(owner_pid):
             return None
         return owner_pid, age
     if age < MARKER_OPERATION_LOCK_STALE_SECONDS:
@@ -272,7 +272,18 @@ def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
             return False
         owner_pid = 0
 
-    if owner_pid > 0 and _pid_alive(owner_pid):
+    try:
+        age = time.time() - lock_dir.stat().st_mtime
+    except OSError:
+        return True
+    # Sidecar operations are intentionally short-lived. Even if a crashed
+    # owner PID has been recycled onto an unrelated live process, a parsed
+    # owner older than the stale ceiling must not wedge every future update.
+    if (
+        owner_pid > 0
+        and _pid_alive(owner_pid)
+        and age < MARKER_OPERATION_LOCK_STALE_SECONDS
+    ):
         return False
     try:
         owner_file.unlink(missing_ok=True)
@@ -574,7 +585,7 @@ class UpdateHolder:
 
 
 def read_live_update(
-    *, path: Path | None = None, _lock_held: bool = False
+    *, path: Path | None = None, _lock_held: bool = False, _retries: int = 0
 ) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
@@ -597,6 +608,15 @@ def read_live_update(
                     pid=pid,
                     age_seconds=age,
                     operation_lock=True,
+                )
+            # The sidecar may have been released just before the first
+            # marker read completed. Re-read once after it appears clear so a
+            # newly published live marker cannot be mistaken for absence.
+            if _retries < 1:
+                return read_live_update(
+                    path=marker,
+                    _lock_held=False,
+                    _retries=_retries + 1,
                 )
         return None  # absent or unreadable => no live update
 
@@ -622,10 +642,11 @@ def read_live_update(
                 replacement = marker.read_text(encoding="utf-8")
             except OSError:
                 replacement = raw
-            if replacement != raw:
+            if replacement != raw and _retries < 2:
                 return read_live_update(
                     path=marker,
                     _lock_held=_lock_held,
+                    _retries=_retries + 1,
                 )
             if not _lock_held:
                 operation = _live_marker_operation_holder(marker)
@@ -635,6 +656,12 @@ def read_live_update(
                         pid=operation_pid,
                         age_seconds=operation_age,
                         operation_lock=True,
+                    )
+                if _retries < 1:
+                    return read_live_update(
+                        path=marker,
+                        _lock_held=False,
+                        _retries=_retries + 1,
                     )
         return None
 
