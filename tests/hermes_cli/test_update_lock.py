@@ -776,6 +776,22 @@ def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
 
 
+def test_marker_sidecar_oserror_does_not_block_the_update(marker, monkeypatch):
+    from contextlib import contextmanager
+    from hermes_cli import update_lock
+
+    @contextmanager
+    def broken_sidecar(_marker):
+        raise OSError("sidecar unsupported")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(update_lock, "_marker_operation_lock", broken_sidecar)
+
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+    assert lock.acquired is False
+
+
 class TestHandoffFromOrchestratingUpdater:
     """The Tauri updater holds the marker, then spawns ``hermes update``.
 

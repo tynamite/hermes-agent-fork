@@ -3646,7 +3646,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        from gateway.status import terminate_pid
+        from gateway.status import get_process_start_time, terminate_pid
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
@@ -3682,6 +3682,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
                     "unmapped_pids": [],
                     "unmapped": [],
                     "unmapped_launcher_pids": [],
+                    "launcher_start_times": {},
                     "cold_start_if_installed": True,
                 }
         except Exception as exc:
@@ -3737,6 +3738,15 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # workers, just as for profile-mapped workers above.  The launcher can
     # outlive its worker and is what the venv-holder guard reports.
     unmapped_launcher_pids = _m()._venv_launcher_ancestors(unmapped_pids)
+    launcher_pids_all = set(launcher_pids).union(unmapped_launcher_pids)
+    launcher_start_times: dict[int, int] = {}
+    for launcher_pid in launcher_pids_all:
+        try:
+            start_time = get_process_start_time(int(launcher_pid))
+        except Exception:
+            start_time = None
+        if start_time is not None:
+            launcher_start_times[int(launcher_pid)] = int(start_time)
 
     # Snapshot each unmapped gateway's command line *before* we force-kill it,
     # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
@@ -3765,6 +3775,24 @@ def _pause_windows_gateways_for_update() -> dict | None:
         .union(launcher_pids)
         .union(unmapped_launcher_pids)
     ):
+        if pid in launcher_pids_all:
+            expected_start_time = launcher_start_times.get(int(pid))
+            if expected_start_time is None:
+                logger.debug(
+                    "Skipping launcher PID %s without a verified start time",
+                    pid,
+                )
+                continue
+            try:
+                live_start_time = get_process_start_time(int(pid))
+            except Exception:
+                live_start_time = None
+            if live_start_time != expected_start_time:
+                logger.debug(
+                    "Skipping launcher PID %s after process identity changed",
+                    pid,
+                )
+                continue
         try:
             terminate_pid(int(pid), force=True)
             force_killed.append(int(pid))
@@ -3792,6 +3820,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         "unmapped_pids": unmapped_pids,
         "unmapped": unmapped,
         "unmapped_launcher_pids": unmapped_launcher_pids,
+        "launcher_start_times": launcher_start_times,
     }
 
 def _cold_start_windows_gateway_after_update() -> None:
@@ -4227,6 +4256,7 @@ def _cmd_update_impl(
     _posix_gateway_quiesce = None
     _profile_gateway_pids: set[int] = set()
     _verified_gateway_pids: set[int] = set()
+    _verified_launcher_start_times: dict[int, int] = {}
     _quiesced_gateway_start_times: dict[int, int] = {}
     _supervisor_pid = 0
     if not getattr(args, "force_venv", False):
@@ -4318,14 +4348,33 @@ def _cmd_update_impl(
                     and entry.get("argv")
                     and str(entry.get("pid", "")).isdigit()
                 )
-                _verified_gateway_pids.update(
-                    int(pid)
-                    for pid in (
-                        _windows_gateway_resume.get("unmapped_launcher_pids")
-                        or []
-                    )
-                    if str(pid).isdigit()
-                )
+                _launcher_start_times = {
+                    int(pid): int(start_time)
+                    for pid, start_time in (
+                        _windows_gateway_resume.get("launcher_start_times")
+                        or {}
+                    ).items()
+                    if str(pid).isdigit() and str(start_time).isdigit()
+                }
+                try:
+                    from gateway.status import get_process_start_time
+                except Exception:
+                    get_process_start_time = None
+                for pid in _launcher_start_times:
+                    if not str(pid).isdigit() or get_process_start_time is None:
+                        continue
+                    expected_start_time = _launcher_start_times.get(int(pid))
+                    if expected_start_time is None:
+                        continue
+                    try:
+                        live_start_time = get_process_start_time(int(pid))
+                    except Exception:
+                        live_start_time = None
+                    if live_start_time == expected_start_time:
+                        _verified_gateway_pids.add(int(pid))
+                        _verified_launcher_start_times[int(pid)] = int(
+                            expected_start_time
+                        )
                 if _windows_profiles:
                     try:
                         from hermes_cli.gateway import find_profile_gateway_processes
@@ -4343,12 +4392,20 @@ def _cmd_update_impl(
                         )
                 if _verified_gateway_pids:
                     try:
-                        _verified_gateway_pids.update(
-                            int(pid)
-                            for pid in _m()._venv_launcher_ancestors(
-                                sorted(_verified_gateway_pids)
-                            )
+                        _launcher_pids = _m()._venv_launcher_ancestors(
+                            sorted(_verified_gateway_pids)
                         )
+                        if get_process_start_time is not None:
+                            for pid in _launcher_pids:
+                                try:
+                                    start_time = get_process_start_time(int(pid))
+                                except Exception:
+                                    start_time = None
+                                if start_time is not None:
+                                    _verified_gateway_pids.add(int(pid))
+                                    _verified_launcher_start_times[int(pid)] = int(
+                                        start_time
+                                    )
                     except Exception:
                         logger.debug(
                             "Could not refresh Windows gateway launcher identities",
@@ -4444,8 +4501,27 @@ def _cmd_update_impl(
         if _venv_holders:
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:
+                _verified_gateway_pids_now = set(_verified_gateway_pids)
+                if _verified_launcher_start_times:
+                    try:
+                        from gateway.status import get_process_start_time
+                    except Exception:
+                        get_process_start_time = None
+                    for _launcher_pid, _expected_start_time in (
+                        _verified_launcher_start_times.items()
+                    ):
+                        try:
+                            _live_start_time = (
+                                get_process_start_time(_launcher_pid)
+                                if get_process_start_time is not None
+                                else None
+                            )
+                        except Exception:
+                            _live_start_time = None
+                        if _live_start_time != _expected_start_time:
+                            _verified_gateway_pids_now.discard(_launcher_pid)
                 _unmapped_gateway_holders = sorted(
-                    set(_gateway_holders) - _verified_gateway_pids
+                    set(_gateway_holders) - _verified_gateway_pids_now
                 )
                 if _unmapped_gateway_holders:
                     # The updater has no quiesce token or restart

@@ -175,22 +175,14 @@ function withMarkerOperationLock(file, operation) {
 }
 
 function publishExclusive(file, body) {
-  const temporary = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
-
-  try {
-    fs.writeFileSync(temporary, body, {
-      encoding: 'utf8',
-      flag: 'wx',
-      mode: 0o644
-    })
-    fs.linkSync(temporary, file)
-  } finally {
-    try {
-      fs.unlinkSync(temporary)
-    } catch {
-      void 0
-    }
-  }
+  // The sidecar is held by the caller, so an exclusive direct create is a
+  // no-clobber publication that also works on filesystems without hard-link
+  // support (FAT/exFAT and some network mounts).
+  fs.writeFileSync(file, body, {
+    encoding: 'utf8',
+    flag: 'wx',
+    mode: 0o644
+  })
 }
 
 function reclaimStaleMarkerLocked(file, expectedRaw) {
@@ -363,9 +355,9 @@ export function writeUpdateMarker(hermesHome, pid, { now = Date.now } = {}) {
 
   try {
     withMarkerOperationLock(file, () => {
-      // Fully write a private file, then publish it with a no-clobber hard
-      // link. This keeps readers from observing a partial marker and never
-      // overwrites a claim that won the sidecar operation lock first.
+      // Publish with an exclusive create while the sidecar is held. Readers
+      // treat that sidecar as an active operation until the complete body is
+      // written, so no hard-link capability is required.
       publishExclusive(file, `${pid}\n${startedAt}\n`)
     })
   } catch {

@@ -50,7 +50,6 @@ import ntpath
 import os
 import sys
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -360,11 +359,8 @@ def _reclaim_stale_marker(marker: Path, expected_raw: str) -> bool:
 
 def _write_marker_exclusive(marker: Path, body: str) -> None:
     """Create and publish a complete marker only if the path is absent."""
-    temporary = marker.with_name(
-        f".{marker.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
-    )
     fd = os.open(
-        temporary,
+        marker,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
         0o644,
     )
@@ -376,20 +372,12 @@ def _write_marker_exclusive(marker: Path, body: str) -> None:
                 os.fsync(handle.fileno())
             except OSError:
                 pass
-        try:
-            os.link(temporary, marker)
-        except FileExistsError as exc:
-            raise FileExistsError(marker) from exc
     except BaseException:
         try:
-            temporary.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
         except OSError:
             pass
         raise
-    try:
-        temporary.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def _handoff_pid() -> int | None:
@@ -800,6 +788,18 @@ class UpdateLock:
                         operation_lock=True,
                     )
                 return False
+            except OSError as exc:
+                # Marker locking is best-effort when the parent filesystem
+                # cannot create the sidecar (permissions, read-only mount,
+                # or an unsupported directory operation).  Preserve the
+                # historical update behavior instead of aborting before the
+                # mutation path starts.
+                logger.debug(
+                    "Could not create marker operation lock %s: %s",
+                    self.path,
+                    exc,
+                )
+                return True
 
         existing = read_live_update(path=self.path)
         if existing is not None:

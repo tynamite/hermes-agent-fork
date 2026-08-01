@@ -762,6 +762,7 @@ def test_windows_gateway_resume_verifies_profile_launcher(
         "resume_needed": True,
         "profiles": {"work": 101},
         "unmapped": [],
+        "launcher_start_times": {303: 111},
     }
     seen = []
 
@@ -783,7 +784,9 @@ def test_windows_gateway_resume_verifies_profile_launcher(
         cli_main, "_leftover_pausable_gateway_pids", return_value={303}
     ), patch.object(
         cli_main, "_venv_launcher_ancestors", return_value=[303]
-    ), patch("gateway.status.terminate_pid"), patch(
+    ), patch("gateway.status.get_process_start_time", return_value=111), patch(
+        "gateway.status.terminate_pid"
+    ), patch(
         "hermes_cli.update_cmd._time.sleep"
     ):
         result = _run_update_until_guard(
@@ -820,6 +823,7 @@ def test_windows_gateway_resume_verifies_unmapped_launcher(
             }
         ],
         "unmapped_launcher_pids": [303],
+        "launcher_start_times": {303: 111},
     }
     seen = []
 
@@ -837,7 +841,9 @@ def test_windows_gateway_resume_verifies_unmapped_launcher(
 
     with patch.object(
         cli_main, "_leftover_pausable_gateway_pids", return_value={303}
-    ), patch("gateway.status.terminate_pid"), patch(
+    ), patch("gateway.status.get_process_start_time", return_value=111), patch(
+        "gateway.status.terminate_pid"
+    ), patch(
         "hermes_cli.update_cmd._time.sleep"
     ):
         result = _run_update_until_guard(

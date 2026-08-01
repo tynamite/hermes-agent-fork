@@ -320,30 +320,15 @@ fn reclaim_stale_marker(path: &Path, expected_raw: &str) -> bool {
 /// cross-platform O_CREAT|O_EXCL equivalent and closes the check-then-write
 /// race between two updater processes.
 fn write_marker_exclusive(path: &Path, body: &str) -> std::io::Result<()> {
-    let temporary = path.with_file_name(format!(
-        ".{}-tmp-{}-{}",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("marker"),
-        std::process::id(),
-        uuid::Uuid::new_v4(),
-    ));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&temporary)?;
+        .open(path)?;
     if let Err(err) = file.write_all(body.as_bytes()).and_then(|()| file.sync_all()) {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(path);
         return Err(err);
     }
-    drop(file);
-    let result = match std::fs::hard_link(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(
-            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "marker already exists"),
-        ),
-        Err(err) => Err(err),
-    };
-    let _ = std::fs::remove_file(&temporary);
-    result
+    Ok(())
 }
 
 /// True when a process with `pid` currently exists.
