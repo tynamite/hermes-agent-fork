@@ -669,7 +669,11 @@ class TestCmdUpdateBranchFallback:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     @pytest.mark.parametrize("supervisor_pid", ("555", None))
-    def test_quiesced_profile_gateway_is_included_in_restart_fleet(
+    @pytest.mark.parametrize(
+        "live_start_time, should_restart",
+        ((111, True), (222, False)),
+    )
+    def test_quiesced_profile_gateway_is_identity_checked_before_restart_fleet(
         self,
         mock_run,
         _mock_which,
@@ -677,6 +681,8 @@ class TestCmdUpdateBranchFallback:
         tmp_path,
         monkeypatch,
         supervisor_pid,
+        live_start_time,
+        should_restart,
     ):
         from hermes_cli import main as hm
 
@@ -741,13 +747,19 @@ class TestCmdUpdateBranchFallback:
             hm,
             "_finish_posix_gateway_quiesce",
             return_value=set(),
+        ), patch(
+            "gateway.status.get_process_start_time",
+            return_value=live_start_time,
         ):
             psutil_process.return_value.parents.return_value = [
                 SimpleNamespace(pid=555)
             ]
             cmd_update(mock_args)
 
-        prepare_mock.assert_called_with("default", 555)
+        if should_restart:
+            prepare_mock.assert_called_with("default", 555)
+        else:
+            prepare_mock.assert_not_called()
         authorize_restarts.assert_called_once_with()
 
 

@@ -4031,8 +4031,15 @@ def _spawn_hermes_action_unlocked(
         # starts. Identify that one supervisor and attest that this process has
         # closed its other admission paths before the venv-holder guard
         # excludes it.
+        from gateway.status import get_process_start_time
+
         action_env["_HERMES_UPDATE_SUPERVISOR_PID"] = str(os.getpid())
         action_env["_HERMES_UPDATE_SUPERVISOR_QUIESCED"] = "dashboard"
+        supervisor_start_time = get_process_start_time(os.getpid())
+        if supervisor_start_time is not None:
+            action_env["_HERMES_UPDATE_SUPERVISOR_START_TIME"] = str(
+                supervisor_start_time
+            )
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),

@@ -741,6 +741,7 @@ def test_released_quiescence_removes_gateway_pid_exclusions(
 def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
     seen = []
     supervisor = SimpleNamespace(pid=555)
     fake_psutil = types.SimpleNamespace(
@@ -808,6 +809,7 @@ def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
 ):
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
     seen = []
     supervisor = SimpleNamespace(pid=555)
     fake_psutil = types.SimpleNamespace(
@@ -846,6 +848,7 @@ def test_venv_holder_guard_binds_attested_dashboard_to_process_identity(
 ):
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
     seen = []
     supervisor = SimpleNamespace(pid=555)
     fake_psutil = types.SimpleNamespace(
@@ -871,11 +874,42 @@ def test_venv_holder_guard_binds_attested_dashboard_to_process_identity(
     assert seen == [({555}, {555: 111})]
 
 
+def test_venv_holder_guard_requires_dashboard_pre_spawn_identity(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", raising=False)
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        return [(555, "python", "venv/bin/python -m replacement")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=111):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [(set(), None)]
+
+
 def test_venv_holder_guard_keeps_dashboard_visible_without_process_identity(
     monkeypatch, capsys
 ):
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
     seen = []
     supervisor = SimpleNamespace(pid=555)
     fake_psutil = types.SimpleNamespace(

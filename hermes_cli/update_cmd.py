@@ -4230,6 +4230,14 @@ def _cmd_update_impl(
                 if _raw_supervisor_pid.isdigit()
                 else 0
             )
+            _raw_supervisor_start_time = os.environ.get(
+                "_HERMES_UPDATE_SUPERVISOR_START_TIME", ""
+            ).strip()
+            _supervisor_start_time = (
+                int(_raw_supervisor_start_time)
+                if _raw_supervisor_start_time.isdigit()
+                else None
+            )
             if _supervisor_pid > 0:
                 import psutil
 
@@ -4256,21 +4264,27 @@ def _cmd_update_impl(
                         try:
                             from gateway.status import get_process_start_time
 
-                            _supervisor_start_time = get_process_start_time(
-                                _supervisor_pid
+                            _live_supervisor_start_time = (
+                                get_process_start_time(_supervisor_pid)
+                                if _supervisor_start_time is not None
+                                else None
                             )
                         except Exception:
-                            _supervisor_start_time = None
-                        if _supervisor_start_time is not None:
+                            _live_supervisor_start_time = None
+                        if (
+                            _supervisor_start_time is not None
+                            and _live_supervisor_start_time
+                            == _supervisor_start_time
+                        ):
                             _venv_guard_exclude.add(_supervisor_pid)
                             _quiesced_gateway_start_times[
                                 _supervisor_pid
                             ] = int(_supervisor_start_time)
                         else:
                             logger.debug(
-                                "Could not capture dashboard supervisor PID "
-                                "%s identity; leaving it visible to the "
-                                "venv-holder guard",
+                                "Could not verify dashboard supervisor PID %s "
+                                "identity against its pre-spawn start time; "
+                                "leaving it visible to the venv-holder guard",
                                 _supervisor_pid,
                             )
         except Exception:
@@ -6076,12 +6090,33 @@ def _cmd_update_impl(
             # ``hermes``. Restore every PID that was independently
             # profile-mapped and quiesced before mutation, while leaving
             # service-owned processes to their managers above.
-            quiesced_profile_pids = (
-                set(
-                    (_posix_gateway_quiesce or {}).get("pids", set())
-                )
-                & _profile_gateway_pids
+            quiesced_profile_pids = set()
+            _recorded_quiesced_start_times = (
+                (_posix_gateway_quiesce or {}).get("process_start_times", {})
             )
+            try:
+                from gateway.status import get_process_start_time
+            except Exception:
+                get_process_start_time = None
+            if get_process_start_time is not None:
+                for _raw_pid in (
+                    set((_posix_gateway_quiesce or {}).get("pids", set()))
+                    & _profile_gateway_pids
+                ):
+                    try:
+                        _pid = int(_raw_pid)
+                        _expected_start_time = _recorded_quiesced_start_times.get(
+                            _pid,
+                            _recorded_quiesced_start_times.get(str(_pid)),
+                        )
+                        _live_start_time = get_process_start_time(_pid)
+                    except Exception:
+                        continue
+                    if (
+                        _expected_start_time is not None
+                        and _live_start_time == _expected_start_time
+                    ):
+                        quiesced_profile_pids.add(_pid)
             manual_pids.update(
                 quiesced_profile_pids - set(service_pids)
             )
