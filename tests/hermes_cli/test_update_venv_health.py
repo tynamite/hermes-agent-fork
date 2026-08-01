@@ -716,6 +716,45 @@ def test_windows_gateway_resume_is_authorized_before_venv_abort(
     authorize.assert_called_once_with()
 
 
+def test_windows_gateway_resume_verifies_profile_replacement(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {"work": 101},
+        "unmapped": [],
+    }
+    seen = []
+
+    def detect(**kwargs):
+        seen.append(kwargs)
+        if len(seen) == 1:
+            # The supervisor replaced the paused worker with PID 202, while
+            # the pause token still records the original PID 101.
+            return [
+                (202, "python.exe", "python.exe -m hermes_cli.main gateway run")
+            ]
+        return []
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={202}
+    ), patch("gateway.status.terminate_pid"), patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=True,
+            detector=detect,
+            windows_resume_token=token,
+            profile_gateways=[
+                SimpleNamespace(profile="work", path="C:/hermes", pid=202)
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert len(seen) == 2
+
+
 @pytest.mark.parametrize(
     "quiesce_token",
     [

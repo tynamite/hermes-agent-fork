@@ -4215,6 +4215,7 @@ def _cmd_update_impl(
     # explicit --force-venv escape hatch skips this coherence boundary.
     _posix_gateway_quiesce = None
     _profile_gateway_pids: set[int] = set()
+    _verified_gateway_pids: set[int] = set()
     _quiesced_gateway_start_times: dict[int, int] = {}
     _supervisor_pid = 0
     if not getattr(args, "force_venv", False):
@@ -4228,6 +4229,7 @@ def _cmd_update_impl(
                     int(proc.pid)
                     for proc in find_profile_gateway_processes()
                 }
+                _verified_gateway_pids.update(_profile_gateway_pids)
                 # A direct terminal update has no supervisor environment
                 # claim, but it must still drain every profile-mapped gateway
                 # before the venv-holder guard decides whether mutation is
@@ -4278,6 +4280,41 @@ def _cmd_update_impl(
                         _m()._release_posix_gateway_quiesce_at_exit,
                         _posix_gateway_quiesce,
                     )
+
+            if _m()._is_windows() and _windows_gateway_resume:
+                # Windows pause/resume owns the mapped profile fleet even
+                # though the POSIX profile scan above is intentionally skipped.
+                # Include the original PIDs and any profile-mapped replacement
+                # discovered after a supervisor respawn before applying the
+                # unmapped-holder refusal below.
+                _windows_profiles = {
+                    str(profile)
+                    for profile in (
+                        _windows_gateway_resume.get("profiles") or {}
+                    )
+                }
+                _verified_gateway_pids.update(
+                    int(pid)
+                    for pid in (
+                        _windows_gateway_resume.get("profiles") or {}
+                    ).values()
+                    if str(pid).isdigit()
+                )
+                if _windows_profiles:
+                    try:
+                        from hermes_cli.gateway import find_profile_gateway_processes
+
+                        _verified_gateway_pids.update(
+                            int(proc.pid)
+                            for proc in find_profile_gateway_processes()
+                            if str(getattr(proc, "profile", ""))
+                            in _windows_profiles
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not refresh Windows profile gateway identities",
+                            exc_info=True,
+                        )
 
             _raw_supervisor_pid = os.environ.get(
                 "_HERMES_UPDATE_SUPERVISOR_PID", ""
@@ -4350,9 +4387,10 @@ def _cmd_update_impl(
             # boundary (psutil missing, AccessDenied, process exited, etc.).
             _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
             _posix_gateway_quiesce = None
-            _venv_guard_exclude.difference_update(
-                _quiesced_gateway_pids
-            )
+            # The handler releases every update-owned boundary, including a
+            # separately attested dashboard supervisor; no holder exclusion
+            # remains valid after that release.
+            _venv_guard_exclude.clear()
             _quiesced_gateway_pids.clear()
             _quiesced_gateway_start_times.clear()
         if _quiesced_gateway_start_times:
@@ -4368,7 +4406,7 @@ def _cmd_update_impl(
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:
                 _unmapped_gateway_holders = sorted(
-                    set(_gateway_holders) - _profile_gateway_pids
+                    set(_gateway_holders) - _verified_gateway_pids
                 )
                 if _unmapped_gateway_holders:
                     # The updater has no quiesce token or restart
