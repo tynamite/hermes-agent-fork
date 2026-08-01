@@ -27,6 +27,7 @@ import pytest
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
+    MARKER_OPERATION_LOCK_NAME,
     UPDATE_EXIT_CONCURRENT,
     UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateHolder,
@@ -639,6 +640,16 @@ def test_stale_marker_is_removed_on_read(marker):
 
     assert read_live_update(path=marker) is None
     assert not marker.exists(), "whoever notices a stale marker clears it"
+
+
+def test_crashed_marker_operation_lock_is_reclaimed(marker):
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    (operation_lock / "owner").write_text(f"{DEAD_PID}\n", encoding="utf-8")
+
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+    assert not operation_lock.exists(), "a dead sidecar owner must not wedge claims"
 
 
 def test_absent_marker_reports_no_live_update(marker):

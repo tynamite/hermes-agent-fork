@@ -27,7 +27,10 @@ backward-compatible with the Rust and Electron readers:
 A marker only counts as a live update when its pid is alive AND it is younger
 than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
 crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first.
+marker is removed on read by whoever notices it first. Marker operations use a
+short-lived ``.hermes-update-in-progress.lock`` sidecar acquired with atomic
+directory creation; this serializes stale-marker reclamation with replacement
+claims without moving a path that a different updater may now own.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -48,6 +51,7 @@ import os
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,6 +64,8 @@ logger = logging.getLogger(__name__)
 UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
+MARKER_OPERATION_LOCK_NAME = ".hermes-update-in-progress.lock"
+MARKER_OPERATION_LOCK_STALE_SECONDS = 30
 
 # Set by an orchestrating updater (the Tauri `hermes-setup --update` flow) to
 # its own pid before spawning `hermes update` as a child stage. The parent
@@ -192,14 +198,81 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _reclaim_stale_marker(marker: Path, expected_raw: str) -> bool:
-    """Atomically remove a stale marker without touching a replacement claim.
+def _marker_operation_lock_path(marker: Path) -> Path:
+    """Stable sidecar path used to serialize marker check/claim/reclaim."""
+    return marker.with_name(MARKER_OPERATION_LOCK_NAME)
 
-    A plain ``unlink(marker)`` has a delete-after-check race: another updater
-    can create a fresh marker after the stale read and before the unlink. Move
-    the exact inode to a unique tombstone first; a new claimant can then create
-    ``marker`` independently while the old tombstone is cleaned up.
+
+def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
+    """Remove a crashed sidecar lock only when its owner is not alive.
+
+    Reaping uses ``unlink`` + ``rmdir``, never rename: a new owner cannot
+    create the directory until ``rmdir`` succeeds, so a competing reaper
+    cannot detach and later delete a replacement lock.
     """
+    owner_file = lock_dir / "owner"
+    try:
+        raw = owner_file.read_text(encoding="utf-8")
+        lines = raw.splitlines()
+        owner_pid = int(lines[0].strip())
+    except (FileNotFoundError, IndexError, ValueError, OSError):
+        try:
+            age = time.time() - lock_dir.stat().st_mtime
+        except OSError:
+            return True
+        if age < MARKER_OPERATION_LOCK_STALE_SECONDS:
+            return False
+        owner_pid = 0
+
+    if owner_pid > 0 and _pid_alive(owner_pid):
+        return False
+    try:
+        owner_file.unlink(missing_ok=True)
+        lock_dir.rmdir()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextmanager
+def _marker_operation_lock(marker: Path):
+    """Serialize a marker operation with an atomic sidecar directory claim."""
+    lock_dir = _marker_operation_lock_path(marker)
+    owner_file = lock_dir / "owner"
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            lock_dir.mkdir()
+        except FileExistsError:
+            _reap_stale_marker_operation_lock(lock_dir)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out acquiring marker operation lock {lock_dir}")
+            time.sleep(0.01)
+            continue
+        except OSError:
+            raise
+        break
+
+    try:
+        _write_marker_exclusive(owner_file, f"{os.getpid()}\n{int(time.time())}\n")
+    except BaseException:
+        owner_file.unlink(missing_ok=True)
+        lock_dir.rmdir()
+        raise
+    try:
+        yield
+    finally:
+        try:
+            owner_file.unlink(missing_ok=True)
+            lock_dir.rmdir()
+        except OSError:
+            pass
+
+
+def _reclaim_stale_marker_locked(marker: Path, expected_raw: str) -> bool:
+    """Remove a stale marker after the caller acquired the sidecar lock."""
     try:
         if marker.read_text(encoding="utf-8") != expected_raw:
             return False
@@ -208,52 +281,22 @@ def _reclaim_stale_marker(marker: Path, expected_raw: str) -> bool:
     except OSError:
         return False
 
-    tombstone = marker.with_name(
-        f".{marker.name}.stale-{os.getpid()}-{uuid.uuid4().hex}"
-    )
     try:
-        marker.rename(tombstone)
+        marker.unlink()
     except FileNotFoundError:
         return True
     except OSError:
         return False
+    return True
 
+
+def _reclaim_stale_marker(marker: Path, expected_raw: str) -> bool:
+    """Compare-and-delete a stale marker under the shared sidecar lock."""
     try:
-        # The rename detached the inode from the shared path. This second
-        # comparison documents and enforces that only the bytes we inspected
-        # are discarded, even if a platform has unusual rename semantics.
-        moved_raw = tombstone.read_text(encoding="utf-8")
-    except OSError:
-        # A leftover tombstone is harmless: the shared marker path is free for
-        # the next atomic claimant, and a later run can clean this file.
-        return True
-
-    if moved_raw == expected_raw:
-        try:
-            tombstone.unlink()
-        except OSError:
-            pass
-        return True
-
-    # Another reclaimer may have moved the stale inode first and a new updater
-    # may have claimed ``marker`` before this reclaimer's rename. Never delete
-    # the unexpected inode: restore it with a no-clobber hard link when the
-    # path is still free, or leave the tombstone beside the winner.
-    try:
-        os.link(tombstone, marker)
-    except FileExistsError:
-        try:
-            tombstone.unlink()
-        except OSError:
-            pass
-    except OSError:
-        pass
-    else:
-        try:
-            tombstone.unlink()
-        except OSError:
-            pass
-    return False
+        with _marker_operation_lock(marker):
+            return _reclaim_stale_marker_locked(marker, expected_raw)
+    except (OSError, TimeoutError):
+        return False
 
 
 def _write_marker_exclusive(marker: Path, body: str) -> None:
@@ -447,7 +490,9 @@ class UpdateHolder:
     runtime_restarts_authorized: bool = False
 
 
-def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
+def read_live_update(
+    *, path: Path | None = None, _lock_held: bool = False
+) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
     Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
@@ -473,7 +518,21 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
 
     age = time.time() - started_at
     if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
-        _reclaim_stale_marker(marker, raw)
+        reclaimed = (
+            _reclaim_stale_marker_locked(marker, raw)
+            if _lock_held
+            else _reclaim_stale_marker(marker, raw)
+        )
+        if not reclaimed:
+            try:
+                replacement = marker.read_text(encoding="utf-8")
+            except OSError:
+                replacement = raw
+            if replacement != raw:
+                return read_live_update(
+                    path=marker,
+                    _lock_held=_lock_held,
+                )
         return None
 
     runtime_restarts_authorized = (
@@ -537,35 +596,55 @@ class UpdateLock:
         body = f"{pid}\n{started_at}\n"
         for _attempt in range(8):
             try:
-                _write_marker_exclusive(self.path, body)
-            except FileExistsError:
-                existing = read_live_update(path=self.path)
-                if existing is not None:
-                    if is_verified_handoff(existing.pid):
-                        self.holder = existing
-                        self._claim_pid = existing.pid
-                        # A previous child stage may have crashed during the
-                        # narrow restart phase. Close that phase before this
-                        # retry performs mutation under the parent's claim.
-                        if not self.deauthorize_runtime_restarts():
-                            self._claim_pid = None
+                with _marker_operation_lock(self.path):
+                    try:
+                        _write_marker_exclusive(self.path, body)
+                    except FileExistsError:
+                        existing = read_live_update(
+                            path=self.path,
+                            _lock_held=True,
+                        )
+                        if existing is not None:
+                            if is_verified_handoff(existing.pid):
+                                self.holder = existing
+                                self._claim_pid = existing.pid
+                                # A previous child stage may have crashed during
+                                # the narrow restart phase. Close that phase
+                                # before this retry performs mutation under the
+                                # parent's claim.
+                                if not self.deauthorize_runtime_restarts(
+                                    _lock_held=True
+                                ):
+                                    self._claim_pid = None
+                                    return False
+                                return True
+                            self.holder = existing
                             return False
+                        # The stale/malformed marker was atomically reclaimed,
+                        # or a competing claimant won the race. Retry the
+                        # exclusive create after releasing the sidecar lock.
+                        continue
+                    except OSError as exc:
+                        # Best-effort, exactly like the Rust guard: an unwritable
+                        # marker must not block the update itself. Degrade to
+                        # pre-lock behavior rather than claiming a path we could
+                        # not publish.
+                        logger.debug(
+                            "Could not write update marker %s: %s",
+                            self.path,
+                            exc,
+                        )
                         return True
-                    self.holder = existing
-                    return False
-                # The stale/malformed marker was atomically reclaimed, or a
-                # competing claimant won the race. Retry the exclusive create.
-                continue
-            except OSError as exc:
-                # Best-effort, exactly like the Rust guard: an unwritable marker
-                # must not block the update itself. Degrade to pre-lock
-                # behavior rather than claiming a path we could not publish.
-                logger.debug("Could not write update marker %s: %s", self.path, exc)
-                return True
-            self.acquired = True
-            self._claim_pid = pid
-            self._claim_started_at = started_at
-            return True
+                    self.acquired = True
+                    self._claim_pid = pid
+                    self._claim_started_at = started_at
+                    return True
+            except TimeoutError:
+                logger.debug(
+                    "Could not acquire marker operation lock %s",
+                    self.path,
+                )
+                break
 
         existing = read_live_update(path=self.path)
         if existing is not None:
@@ -581,7 +660,18 @@ class UpdateLock:
         logger.debug("Could not atomically claim update marker %s", self.path)
         return True
 
-    def _set_runtime_restarts_authorized(self, authorized: bool) -> bool:
+    def _set_runtime_restarts_authorized(
+        self, authorized: bool, *, _lock_held: bool = False
+    ) -> bool:
+        if _lock_held:
+            return self._set_runtime_restarts_authorized_locked(authorized)
+        try:
+            with _marker_operation_lock(self.path):
+                return self._set_runtime_restarts_authorized_locked(authorized)
+        except (OSError, TimeoutError):
+            return False
+
+    def _set_runtime_restarts_authorized_locked(self, authorized: bool) -> bool:
         """Compare-and-rewrite our live claim's restart phase."""
         if self._claim_pid is None:
             # Marker creation is best-effort. If no claim exists, there is no
@@ -632,9 +722,12 @@ class UpdateLock:
         """Allow only managed runtime entrypoints after mutation completes."""
         return self._set_runtime_restarts_authorized(True)
 
-    def deauthorize_runtime_restarts(self) -> bool:
+    def deauthorize_runtime_restarts(self, *, _lock_held: bool = False) -> bool:
         """Close the restart phase while preserving an orchestrator's claim."""
-        return self._set_runtime_restarts_authorized(False)
+        return self._set_runtime_restarts_authorized(
+            False,
+            _lock_held=_lock_held,
+        )
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""

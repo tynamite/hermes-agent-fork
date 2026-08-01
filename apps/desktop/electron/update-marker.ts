@@ -6,6 +6,9 @@
  * update.rs `UpdateMarkerGuard`). The marker starts with the updater's pid and
  * unix start time. Python may append a third `runtime-restarts` phase line;
  * this reader intentionally ignores additional lines.
+ * A short-lived `.hermes-update-in-progress.lock` sidecar serializes stale-
+ * marker cleanup with replacement claims across the Python, Rust, and Electron
+ * writers.
  *
  * Why: if the user relaunches the desktop mid-update — the window vanished with
  * no progress and looks crashed — a fresh instance must NOT spawn its own local
@@ -29,12 +32,123 @@ import path from 'path'
 // of minutes; past this the marker is almost certainly stale (e.g. the OS
 // recycled the pid onto an unrelated process), so the gate self-heals.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+const MARKER_OPERATION_LOCK_STALE_MS = 30 * 1000
 
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
 }
 
-function reclaimStaleMarker(file, expectedRaw) {
+function markerOperationLockPath(file) {
+  return path.join(path.dirname(file), '.hermes-update-in-progress.lock')
+}
+
+function reapStaleMarkerOperationLock(lockDir) {
+  const ownerFile = path.join(lockDir, 'owner')
+  let ownerPid = null
+  let ownerIsMalformed = false
+
+  try {
+    const [pidLine] = fs.readFileSync(ownerFile, 'utf8').split('\n')
+    const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
+    ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+    ownerIsMalformed = ownerPid === null
+  } catch {
+    ownerIsMalformed = true
+  }
+
+  if (ownerIsMalformed) {
+    try {
+      if (Date.now() - fs.statSync(lockDir).mtimeMs < MARKER_OPERATION_LOCK_STALE_MS) {
+        return false
+      }
+    } catch {
+      return true
+    }
+  }
+
+  if (ownerPid !== null && isPidAlive(ownerPid)) {
+    return false
+  }
+
+  try {
+    fs.unlinkSync(ownerFile)
+  } catch {
+    void 0
+  }
+
+  try {
+    fs.rmdirSync(lockDir)
+
+    return true
+  } catch (err) {
+    return Boolean(err && err.code === 'ENOENT')
+  }
+}
+
+function withMarkerOperationLock(file, operation) {
+  const lockDir = markerOperationLockPath(file)
+  const ownerFile = path.join(lockDir, 'owner')
+
+  // Marker operations are intentionally short. Avoid blocking Electron's
+  // event loop while another process holds the sidecar; the caller can retry
+  // or re-read the marker when acquisition loses.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.mkdirSync(lockDir)
+    } catch (err) {
+      if (err && err.code === 'EEXIST' && reapStaleMarkerOperationLock(lockDir)) {
+        continue
+      }
+
+      return { acquired: false, value: undefined }
+    }
+
+    try {
+      fs.writeFileSync(ownerFile, `${process.pid}\n${Math.floor(Date.now() / 1000)}\n`, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o644
+      })
+
+      return { acquired: true, value: operation() }
+    } finally {
+      try {
+        fs.unlinkSync(ownerFile)
+      } catch {
+        void 0
+      }
+
+      try {
+        fs.rmdirSync(lockDir)
+      } catch {
+        void 0
+      }
+    }
+  }
+
+  return { acquired: false, value: undefined }
+}
+
+function publishExclusive(file, body) {
+  const temporary = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+  try {
+    fs.writeFileSync(temporary, body, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o644
+    })
+    fs.linkSync(temporary, file)
+  } finally {
+    try {
+      fs.unlinkSync(temporary)
+    } catch {
+      void 0
+    }
+  }
+}
+
+function reclaimStaleMarkerLocked(file, expectedRaw) {
   try {
     if (fs.readFileSync(file, 'utf8') !== expectedRaw) {
       return false
@@ -43,54 +157,23 @@ function reclaimStaleMarker(file, expectedRaw) {
     return true
   }
 
-  const tombstone = `${file}.stale-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
-
   try {
-    // Rename the exact stale inode before deleting it. A new updater can create
-    // the shared marker path while this tombstone is cleaned up, without the
-    // cleanup unlinking that replacement claim.
-    fs.renameSync(file, tombstone)
-  } catch {
-    return false
-  }
-
-  let movedRaw
-
-  try {
-    movedRaw = fs.readFileSync(tombstone, 'utf8')
-  } catch {
-    return true
-  }
-
-  if (movedRaw === expectedRaw) {
-    try {
-      fs.unlinkSync(tombstone)
-    } catch {
-      void 0
-    }
+    fs.unlinkSync(file)
 
     return true
-  }
-
-  // Another reclaimer may have moved the stale inode first and a new updater
-  // may have claimed `file` before this reclaimer's rename. Never delete the
-  // unexpected inode: restore it with a no-clobber hard link when the path is
-  // still free, or leave the tombstone beside the winner.
-  try {
-    fs.linkSync(tombstone, file)
-  } catch (err) {
-    if (!(err && typeof err === 'object' && 'code' in err && err.code === 'EEXIST')) {
-      return false
-    }
-  }
-
-  try {
-    fs.unlinkSync(tombstone)
   } catch {
-    void 0
+    return !fs.existsSync(file)
   }
+}
 
-  return false
+function reclaimStaleMarker(file, expectedRaw) {
+  try {
+    return withMarkerOperationLock(file, () =>
+      reclaimStaleMarkerLocked(file, expectedRaw)
+    )
+  } catch {
+    return { acquired: false, value: false }
+  }
 }
 
 // True only if a host process with this pid is currently alive. Signal 0 does
@@ -128,11 +211,13 @@ export function readLiveUpdateMarker(
   {
     kill,
     now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS
+    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
+    _retries = 0
   }: {
     now?: () => number
     maxAgeMs?: number
     kill?: typeof process.kill
+    _retries?: number
   } = {}
 ) {
   const file = markerPath(hermesHome)
@@ -151,7 +236,27 @@ export function readLiveUpdateMarker(
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
   if (!alive || ageMs > maxAgeMs) {
-    reclaimStaleMarker(file, String(raw))
+    const expectedRaw = String(raw)
+    const reclaimed = reclaimStaleMarker(file, expectedRaw)
+
+    if (!reclaimed.value && _retries < 2) {
+      let replacement = expectedRaw
+
+      try {
+        replacement = fs.readFileSync(file, 'utf8')
+      } catch {
+        void 0
+      }
+
+      if (replacement !== expectedRaw) {
+        return readLiveUpdateMarker(hermesHome, {
+          kill,
+          now,
+          maxAgeMs,
+          _retries: _retries + 1
+        })
+      }
+    }
 
     return null
   }
@@ -184,35 +289,16 @@ export function readLiveUpdateMarker(
 export function writeUpdateMarker(hermesHome, pid, { now = Date.now } = {}) {
   const file = markerPath(hermesHome)
   const startedAt = Math.floor(now() / 1000)
-  const temporary = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
   try {
-    // Fully write a private file, then publish it with a no-clobber hard link.
-    // This keeps readers from observing a partially written marker and never
-    // overwrites a live marker owned by another updater.
-    fs.writeFileSync(temporary, `${pid}\n${startedAt}\n`, {
-      encoding: 'utf8',
-      flag: 'wx',
-      mode: 0o644
+    withMarkerOperationLock(file, () => {
+      // Fully write a private file, then publish it with a no-clobber hard
+      // link. This keeps readers from observing a partial marker and never
+      // overwrites a claim that won the sidecar operation lock first.
+      publishExclusive(file, `${pid}\n${startedAt}\n`)
     })
-    fs.linkSync(temporary, file)
-  } catch (err) {
-    if (
-      err &&
-      typeof err === 'object' &&
-      'code' in err &&
-      err.code === 'EEXIST'
-    ) {
-      return
-    }
-
+  } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The
     // updater will write its own when it reaches run_update.
-  } finally {
-    try {
-      fs.unlinkSync(temporary)
-    } catch {
-      void 0
-    }
   }
 }

@@ -115,6 +115,8 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// `acquire` therefore REFUSES when a live foreign owner holds it rather than
 /// overwriting — the pre-fix clobber is what let a dashboard `hermes update`
 /// keep running while install-mode bootstrap rewrote the tree underneath it.
+/// A short-lived sibling operation lock serializes marker reclamation with
+/// replacement claims, so stale cleanup cannot detach a newer owner's marker.
 struct UpdateMarkerGuard {
     path: PathBuf,
     /// False when a live foreign updater already owns the marker: we hold no
@@ -131,6 +133,7 @@ struct UpdateMarkerGuard {
 /// this one file, so a shorter ceiling in any of them would steal a lock the
 /// others still consider live.
 const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
+const UPDATE_MARKER_OPERATION_LOCK_STALE_SECS: u64 = 30;
 
 /// The pid + age of a confirmed-live update holding the marker.
 #[derive(Clone, Copy)]
@@ -171,47 +174,108 @@ fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
     (owner.pid != std::process::id()).then_some(owner)
 }
 
-/// Atomically move a stale marker to a private tombstone before deleting it.
-/// A new claimant can create the shared path immediately; it is never removed
-/// by cleanup of the old inode.
-fn reclaim_stale_marker(path: &Path, expected_raw: &str) -> bool {
+fn marker_operation_lock_path(path: &Path) -> PathBuf {
+    path.with_file_name(".hermes-update-in-progress.lock")
+}
+
+struct MarkerOperationLock {
+    dir: PathBuf,
+    owner: PathBuf,
+}
+
+impl Drop for MarkerOperationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.owner);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+fn reap_stale_marker_operation_lock(dir: &Path) -> bool {
+    let owner = dir.join("owner");
+    let owner_pid = match std::fs::read_to_string(&owner) {
+        Ok(raw) => raw
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<u32>().ok()),
+        Err(_) => None,
+    };
+    if let Some(pid) = owner_pid {
+        if pid_is_alive(pid) {
+            return false;
+        }
+    } else if let Ok(metadata) = std::fs::metadata(dir) {
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS {
+            return false;
+        }
+    }
+    let _ = std::fs::remove_file(&owner);
+    match std::fs::remove_dir(dir) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+fn acquire_marker_operation_lock(path: &Path) -> std::io::Result<MarkerOperationLock> {
+    let dir = marker_operation_lock_path(path);
+    let owner = dir.join("owner");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                let body = format!("{}\n{}\n", std::process::id(), unix_now_secs());
+                if let Err(err) = write_marker_exclusive(&owner, &body) {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(err);
+                }
+                return Ok(MarkerOperationLock { dir, owner });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = reap_stale_marker_operation_lock(&dir);
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out acquiring marker operation lock",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Remove a stale marker after the caller acquired the sidecar lock.
+fn reclaim_stale_marker_locked(path: &Path, expected_raw: &str) -> bool {
     if std::fs::read_to_string(path).ok().as_deref() != Some(expected_raw) {
         return false;
     }
-    let tombstone = path.with_file_name(format!(
-        ".{}-stale-{}-{}",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("marker"),
-        std::process::id(),
-        uuid::Uuid::new_v4(),
-    ));
-    match std::fs::rename(path, &tombstone) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
     }
-    let moved_raw = match std::fs::read_to_string(&tombstone) {
-        Ok(raw) => raw,
-        Err(_) => return true,
-    };
-    if moved_raw == expected_raw {
-        let _ = std::fs::remove_file(&tombstone);
-        return true;
-    }
+}
 
-    // Another reclaimer may have moved the stale inode first and a new updater
-    // may have claimed `path` before this reclaimer's rename. Never delete the
-    // unexpected inode: restore it with a no-clobber hard link when the path is
-    // still free, or leave the tombstone beside the winner.
-    match std::fs::hard_link(&tombstone, path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&tombstone);
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(&tombstone);
-        }
-        Err(_) => {}
-    }
-    false
+/// Compare-and-delete a stale marker under the shared sidecar lock.
+fn reclaim_stale_marker(path: &Path, expected_raw: &str) -> bool {
+    let Ok(_lock) = acquire_marker_operation_lock(path) else {
+        return false;
+    };
+    reclaim_stale_marker_locked(path, expected_raw)
 }
 
 /// Publish a marker only when the path is still absent. `create_new` is the
@@ -295,6 +359,13 @@ impl UpdateMarkerGuard {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let _operation_lock = match acquire_marker_operation_lock(&path) {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                tracing::warn!(?path, %err, "could not acquire marker operation lock");
+                None
+            }
+        };
 
         for _attempt in 0..8 {
             match write_marker_exclusive(&path, &body) {
@@ -325,7 +396,11 @@ impl UpdateMarkerGuard {
                         Ok(raw) => raw,
                         Err(_) => continue,
                     };
-                    let _ = reclaim_stale_marker(&path, &expected);
+                    if _operation_lock.is_some() {
+                        let _ = reclaim_stale_marker_locked(&path, &expected);
+                    } else {
+                        let _ = reclaim_stale_marker(&path, &expected);
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(?path, %err, "could not write update-in-progress marker");

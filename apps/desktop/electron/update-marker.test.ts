@@ -127,6 +127,18 @@ test('writeUpdateMarker never overwrites an existing claim', () => {
   )
 })
 
+test('writeUpdateMarker reclaims a crashed marker-operation lock', () => {
+  const home = tmpHome('write-stale-operation-lock')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), '4294967294\n')
+
+  writeUpdateMarker(home, 2222)
+
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8').split('\n')[0], '2222')
+  assert.ok(!fs.existsSync(operationLock), 'a dead sidecar owner must not wedge claims')
+})
+
 test('writeUpdateMarker is best-effort (no throw on bad path)', () => {
   // A non-existent directory should not throw.
   const badHome = path.join(os.tmpdir(), 'hermes-marker-nonexistent-' + Date.now())
