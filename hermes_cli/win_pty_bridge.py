@@ -65,6 +65,14 @@ class WinPtyBridge:
     def __init__(self, proc: "PtyProcess") -> None:  # type: ignore[name-defined]
         self._proc = proc
         self._closed = False
+        self._tree_identities: dict[int, Optional[int]] = {}
+        self._tree_snapshot_failed = False
+        try:
+            from gateway.status import get_process_start_time
+
+            self._tree_identities[self.pid] = get_process_start_time(self.pid)
+        except Exception:
+            self._tree_identities[self.pid] = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -117,6 +125,35 @@ class WinPtyBridge:
             return bool(self._proc.isalive())
         except Exception:
             return False
+
+    def verify_closed(self) -> bool:
+        """Strict process-tree exit probe used by fail-closed update shutdown."""
+        if getattr(self, "_tree_snapshot_failed", False):
+            return False
+        try:
+            if self._proc.isalive():
+                return False
+        except Exception:
+            return False
+        try:
+            from gateway.status import _pid_exists, get_process_start_time
+        except Exception:
+            return False
+        for pid, expected_start_time in self._tree_identities.items():
+            try:
+                live_start_time = get_process_start_time(pid)
+                if (
+                    expected_start_time is not None
+                    and live_start_time is not None
+                ):
+                    if live_start_time == expected_start_time:
+                        return False
+                    continue
+                if _pid_exists(pid):
+                    return False
+            except Exception:
+                return False
+        return True
 
     # -- I/O --------------------------------------------------------------
 
@@ -172,6 +209,27 @@ class WinPtyBridge:
         if self._closed:
             return
         self._closed = True
+        try:
+            import psutil
+
+            from gateway.status import get_process_start_time
+
+            for child in psutil.Process(self.pid).children(recursive=True):
+                child_pid = int(child.pid)
+                self._tree_identities[child_pid] = get_process_start_time(
+                    child_pid
+                )
+        except Exception:
+            # taskkill /T and pywinpty are both best-effort below. Without an
+            # authoritative pre-kill tree snapshot, a surviving grandchild is
+            # unknowable, so update teardown must fail closed.
+            self._tree_snapshot_failed = True
+        try:
+            from gateway.status import terminate_pid
+
+            terminate_pid(self.pid, force=True)
+        except Exception:
+            pass
         try:
             self._proc.terminate(force=True)
         except Exception:

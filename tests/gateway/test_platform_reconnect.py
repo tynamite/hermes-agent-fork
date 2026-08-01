@@ -715,6 +715,39 @@ class TestConnectAdapterDetachOnTimeout:
     """Verify _connect_adapter_with_timeout uses the detach pattern."""
 
     @pytest.mark.asyncio
+    async def test_connect_is_tracked_from_creation_until_completion(self):
+        runner = _make_runner()
+        adapter = StubAdapter(succeed=True)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocked_connect(**kwargs):
+            started.set()
+            await release.wait()
+            return True
+
+        with patch.object(adapter, "connect", side_effect=_blocked_connect):
+            with patch.object(
+                runner, "_platform_connect_timeout_secs", return_value=1
+            ):
+                connect = asyncio.create_task(
+                    runner._connect_adapter_with_timeout(
+                        adapter,
+                        Platform.TELEGRAM,
+                    )
+                )
+                await started.wait()
+                assert any(
+                    not task.done()
+                    for task in runner._detached_adapter_tasks
+                )
+                release.set()
+                assert await connect is True
+                await asyncio.sleep(0)
+
+        assert not runner._detached_adapter_tasks
+
+    @pytest.mark.asyncio
     async def test_connect_timed_out_raises_timeouterror(self):
         """A connect() that never finishes must raise TimeoutError."""
         runner = _make_runner()
@@ -852,4 +885,3 @@ class TestVoiceInputCallbackWiring:
         assert adapter._voice_input_callback is not None, (
             "startup must wire _voice_input_callback"
         )
-

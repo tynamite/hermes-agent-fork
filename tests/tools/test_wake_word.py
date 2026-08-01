@@ -518,6 +518,61 @@ def test_detector_flags_silent_stream_and_recovers(monkeypatch):
         det.stop()
 
 
+def test_detector_retains_reader_reference_when_stop_times_out():
+    release = threading.Event()
+    reader = threading.Thread(
+        target=lambda: release.wait(timeout=2),
+        name="stuck-wake-reader",
+    )
+    reader.start()
+    engine = _FakeEngine(fire=False)
+    det = ww.WakeWordDetector(engine, lambda: None)
+    det._thread = reader
+
+    try:
+        assert det.stop(timeout=0.01, wait_for_callback=True) is False
+        assert det._thread is reader
+        assert engine.closed is False
+    finally:
+        release.set()
+        reader.join(timeout=1)
+
+    assert det.stop(timeout=0.1, wait_for_callback=True) is True
+    assert det._thread is None
+    assert engine.closed is True
+
+
+def test_detector_tracks_callback_until_strict_stop_completes():
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    engine = _FakeEngine(fire=False)
+    det = ww.WakeWordDetector(
+        engine,
+        lambda: (callback_started.set(), release_callback.wait(timeout=2)),
+    )
+    callback = threading.Thread(
+        target=det._dispatch_wake,
+        name="wake-word-callback",
+    )
+    with det._lock:
+        det._callback_inflight.set()
+        det._callback_thread = callback
+        callback.start()
+    assert callback_started.wait(timeout=1)
+
+    try:
+        assert det.stop(timeout=0.01, wait_for_callback=True) is False
+        assert det._callback_thread is callback
+        assert engine.closed is False
+    finally:
+        release_callback.set()
+        callback.join(timeout=1)
+
+    assert det.stop(timeout=0.1, wait_for_callback=True) is True
+    assert det._callback_thread is None
+    assert engine.closed is True
+
+
 # ── Singleton lifecycle ──────────────────────────────────────────────────
 
 
@@ -545,6 +600,30 @@ def test_detection_callback_can_pause_and_close_stream(monkeypatch, tmp_path):
     assert ww.is_listening() is False
     assert streams[0].closed is True
     assert ww.stop_listening(owner=owner) is True
+
+
+def test_update_stop_retains_ownership_until_workers_are_verified(monkeypatch):
+    owner = object()
+    lock_handle = object()
+    det = types.SimpleNamespace(stop=lambda **_kwargs: False)
+    released = []
+    monkeypatch.setattr(ww, "_detector", det)
+    monkeypatch.setattr(ww, "_detector_owner", owner)
+    monkeypatch.setattr(ww, "_detector_file_lock", lock_handle)
+    monkeypatch.setattr(ww, "_release_machine_lock", released.append)
+
+    assert ww.stop_listening_for_update(timeout=0.01) is False
+    assert ww._detector is det
+    assert ww._detector_owner is owner
+    assert ww._detector_file_lock is lock_handle
+    assert released == []
+
+    det.stop = lambda **_kwargs: True
+    assert ww.stop_listening_for_update(timeout=0.01) is True
+    assert ww._detector is None
+    assert ww._detector_owner is None
+    assert ww._detector_file_lock is None
+    assert released == [lock_handle]
 
 
 def test_startup_failure_releases_owner_and_machine_lock(monkeypatch, tmp_path):

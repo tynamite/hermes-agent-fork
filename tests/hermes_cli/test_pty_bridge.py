@@ -169,6 +169,7 @@ class TestPtyBridgeClose:
 
     def test_close_signals_child_process_group(self, monkeypatch):
         sent: list[tuple[int, signal.Signals]] = []
+        group_alive = True
 
         class _FakeProc:
             pid = 12345
@@ -189,21 +190,51 @@ class TestPtyBridgeClose:
         fake = _FakeProc()
 
         def fake_killpg(pgid, sig):
+            nonlocal group_alive
+            if sig == 0:
+                if group_alive:
+                    return
+                raise ProcessLookupError
             sent.append((pgid, sig))
             fake.alive = False
+            if sig == signal.SIGTERM:
+                group_alive = False
 
-        monkeypatch.setattr(os, "getpgid", lambda pid: 67890)
         monkeypatch.setattr(os, "killpg", fake_killpg)
 
         bridge = PtyBridge.__new__(PtyBridge)
         bridge._proc = fake
         bridge._fd = -1
         bridge._closed = False
+        bridge._pgid = 67890
 
         bridge.close()
 
-        assert sent == [(67890, signal.SIGHUP)]
+        assert sent == [
+            (67890, signal.SIGHUP),
+            (67890, signal.SIGTERM),
+        ]
         assert bridge._closed is True
+        assert bridge.verify_closed() is True
+
+    def test_verify_closed_rejects_surviving_process_group(self, monkeypatch):
+        class _ExitedProc:
+            pid = 12345
+            fd = -1
+
+            @staticmethod
+            def isalive():
+                return False
+
+        monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+
+        bridge = PtyBridge.__new__(PtyBridge)
+        bridge._proc = _ExitedProc()
+        bridge._fd = -1
+        bridge._closed = True
+        bridge._pgid = 67890
+
+        assert bridge.verify_closed() is False
 
 
 @skip_on_windows

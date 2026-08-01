@@ -63,6 +63,17 @@ class TestActiveApiRunCount:
         runner.adapters = {}
         assert runner._active_api_run_count() == 0
 
+    def test_probe_failure_counts_as_active(self):
+        runner, _adapter = make_restart_runner()
+        api = SimpleNamespace(
+            active_agent_work_count=MagicMock(
+                side_effect=RuntimeError("unreadable")
+            )
+        )
+        runner.adapters = {Platform.API_SERVER: api}
+
+        assert runner._active_api_run_count() == 1
+
 
 class TestAPIServerAdapterWorkCount:
 
@@ -95,6 +106,20 @@ class TestAPIServerAdapterWorkCount:
 
 
 class TestDrainWaitsForApiWork:
+
+    @pytest.mark.asyncio
+    async def test_shutdown_drain_does_not_force_interrupt_on_probe_failure(self):
+        runner, _adapter = make_restart_runner()
+        api = SimpleNamespace(
+            active_agent_work_count=MagicMock(
+                side_effect=RuntimeError("unreadable")
+            )
+        )
+        runner.adapters = {Platform.API_SERVER: api}
+
+        assert runner._active_api_run_count() == 1
+        _snapshot, timed_out = await runner._drain_active_agents(0.01)
+        assert timed_out is False
 
     @pytest.mark.asyncio
     async def test_drain_waits_for_real_queued_run_before_agent_creation(self):
@@ -165,5 +190,3 @@ class TestDrainAdmission:
                     assert response.status == 503
                     assert response.headers["Retry-After"] == "1"
                     assert payload["error"]["code"] == "gateway_draining"
-
-

@@ -571,6 +571,38 @@ def active_task_count() -> int:
         return total
 
 
+def active_count_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+) -> int:
+    """Count live delegations owned by any supplied session selector."""
+    if not session_key and not origin_ui_session_id and not parent_session_id:
+        return 0
+    with _records_lock:
+        return sum(
+            1
+            for record in _records.values()
+            if record.get("status") in {"running", "stalling", "finalizing"}
+            and (
+                (
+                    origin_ui_session_id
+                    and str(record.get("origin_ui_session_id") or "")
+                    == origin_ui_session_id
+                )
+                or (
+                    session_key
+                    and str(record.get("session_key") or "") == session_key
+                )
+                or (
+                    parent_session_id
+                    and str(record.get("parent_session_id") or "")
+                    == parent_session_id
+                )
+            )
+        )
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 

@@ -2023,30 +2023,44 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 tui_dir,
                 include_child_workspaces=True,
             )
-        result = subprocess.run(
-            [
-                npm,
-                "install",
-                *npm_workspace_args,
-                # --include=dev: ui-tui's build toolchain (esbuild, typescript)
-                # lives in devDependencies. An inherited NODE_ENV=production
-                # (e.g. from a container shell or a parent TUI launch) or an
-                # npm `omit=dev` config would silently skip them and the TUI
-                # build would fail. See _run_npm_install_deterministic.
-                "--include=dev",
-                "--silent",
-                "--no-fund",
-                "--no-audit",
-                "--progress=false",
-            ],
-            cwd=str(npm_cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env={**os.environ, "CI": "1"},
-        )
+        npm_install_cmd = [
+            npm,
+            "install",
+            *npm_workspace_args,
+            # --include=dev: ui-tui's build toolchain (esbuild, typescript)
+            # lives in devDependencies. An inherited NODE_ENV=production
+            # (e.g. from a container shell or a parent TUI launch) or an
+            # npm `omit=dev` config would silently skip them and the TUI
+            # build would fail. See _run_npm_install_deterministic.
+            "--include=dev",
+            "--silent",
+            "--no-fund",
+            "--no-audit",
+            "--progress=false",
+        ]
+
+        def _run_tui_install() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                npm_install_cmd,
+                cwd=str(npm_cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env={**os.environ, "CI": "1"},
+            )
+
+        result = _run_tui_install()
+        if result.returncode != 0:
+            # An npm outside the root package.json's `engines.npm` range fails
+            # here before doing any work; upgrade a Hermes-managed npm once and
+            # retry rather than dumping EBADENGINE at the user.
+            from hermes_cli.npm_engine import maybe_repair_npm_engine
+
+            combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+            if maybe_repair_npm_engine(npm, combined_output):
+                result = _run_tui_install()
         if result.returncode != 0:
             combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
             preview = "\n".join(combined.splitlines()[-30:])
@@ -3029,7 +3043,11 @@ def select_provider_and_model(args=None):
         load_config,
         get_env_value,
     )
-    from hermes_cli.providers import resolve_provider_full
+    from hermes_cli.providers import (
+        custom_provider_aliases,
+        custom_provider_slug,
+        resolve_provider_full,
+    )
 
     config = load_config()
     current_model = config.get("model")
@@ -3149,13 +3167,8 @@ def select_provider_and_model(args=None):
             base_url = (entry.get("base_url") or "").strip()
             if not name or not base_url:
                 continue
-            key = "custom:" + name.lower().replace(" ", "-")
             provider_key = (entry.get("provider_key") or "").strip()
-            if provider_key:
-                try:
-                    resolve_provider(provider_key)
-                except AuthError:
-                    key = provider_key
+            key = custom_provider_slug(name, provider_key)
             custom_provider_map[key] = {
                 "name": name,
                 "base_url": base_url,
@@ -3183,6 +3196,16 @@ def select_provider_and_model(args=None):
         config
     )  # key → {name, base_url, api_key}
 
+    def _canonical_named_custom_key(provider_id: str) -> str:
+        requested = str(provider_id or "").strip().lower()
+        for key, provider_info in _custom_provider_map.items():
+            if requested in custom_provider_aliases(
+                provider_info.get("name", ""),
+                provider_info.get("provider_key", ""),
+            ):
+                return key
+        return provider_id
+
     def _active_custom_key_from_base_url() -> str:
         if effective_provider != "custom" or not isinstance(model_cfg, dict):
             return ""
@@ -3205,6 +3228,8 @@ def select_provider_and_model(args=None):
         )
         if active_def is not None:
             active = active_def.id
+            if active_def.source == "user-config":
+                active = _canonical_named_custom_key(active)
         else:
             warning = (
                 f"Unknown provider '{effective_provider}'. Check 'hermes model' for "
@@ -5014,6 +5039,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _invalidate_update_cache,
     _is_android_python,
     _is_fork,
+    _leftover_pausable_gateway_pids,
     _log_only_write,
     _mark_skip_upstream_prompt,
     _npm_bin_exists,
@@ -5021,6 +5047,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _npm_manifest_paths,
     _npm_manifests_digest,
     _pause_windows_gateways_for_update,
+    _quiesce_posix_gateways_for_update,
     _print_curator_first_run_notice,
     _print_curator_recent_run_notice,
     _print_fts_optimize_available_notice,
@@ -5029,6 +5056,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _refresh_active_lazy_features,
     _refresh_active_memory_provider_dependencies,
     _refresh_windows_gateway_launchers,
+    _release_posix_gateway_quiesce,
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
     _resolve_stash_selector,
@@ -5045,7 +5073,9 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _update_via_zip,
     _upgrade_pip_before_lazy_refresh,
     _validate_critical_files_syntax,
+    _validate_critical_modules_import,
     _venv_core_imports_healthy,
+    _venv_launcher_ancestors,
     _wait_for_windows_update_gateway_exit,
     _warn_incomplete_gateway_fleet_restart,
     _web_build_toolchain_ready,
@@ -5056,6 +5086,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _write_update_planned_stop_marker,
     _UPDATE_RUNTIME_RELOAD_MODULES,
     _UPDATE_CRITICAL_FILES,
+    _UPDATE_CRITICAL_MODULES,
     OFFICIAL_REPO_URLS,
     OFFICIAL_REPO_URL,
     SKIP_UPSTREAM_PROMPT_FILE,
@@ -5443,34 +5474,84 @@ def _run_npm_install_deterministic(
     # install path and nix/lib.nix npm ci hooks.
     run_env = {**os.environ, **(env or {}), "CI": "1"}
 
-    lockfile = cwd / "package-lock.json"
-    if lockfile.exists():
-        ci_cmd = [npm, "ci", "--include=dev", *extra_args]
-        ci_result = subprocess.run(
-            ci_cmd,
+    def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+        return _run_npm_watching_for_engine_failure(
+            cmd,
             cwd=cwd,
             env=run_env,
             capture_output=capture_output,
+        )
+
+    def _attempt() -> subprocess.CompletedProcess:
+        lockfile = cwd / "package-lock.json"
+        if lockfile.exists():
+            ci_result = _run([npm, "ci", "--include=dev", *extra_args])
+            if ci_result.returncode == 0:
+                return ci_result
+            # Fall through to `npm install` — lockfile may be out of sync on a
+            # WIP fork/branch, or `npm ci` may not be available on very old npm.
+        return _run([npm, "install", "--no-save", "--include=dev", *extra_args])
+
+    result = _attempt()
+    if result.returncode == 0:
+        return result
+
+    # An npm outside the root package.json's `engines.npm` range fails every
+    # command here identically (the `npm install` fallback included), so the
+    # failure is worth exactly one upgrade attempt. `maybe_repair_npm_engine`
+    # returns True only when it actually upgraded a Hermes-managed npm.
+    from hermes_cli.npm_engine import maybe_repair_npm_engine
+
+    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+    if not maybe_repair_npm_engine(npm, combined):
+        return result
+    return _attempt()
+
+
+def _run_npm_watching_for_engine_failure(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    capture_output: bool,
+) -> subprocess.CompletedProcess:
+    """Run *cmd*, always retaining stderr so ``EBADENGINE`` stays detectable.
+
+    ``capture_output=False`` callers stream npm's progress live and would
+    otherwise hand back a ``CompletedProcess`` with ``stderr=None``, leaving the
+    engine-failure recovery nothing to read. Tee stderr instead: each line is
+    forwarded to this process's stderr as it arrives (so live output is
+    unchanged) and accumulated for the caller.
+    """
+    if capture_output:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
         )
-        if ci_result.returncode == 0:
-            return ci_result
-        # Fall through to `npm install` — lockfile may be out of sync on a
-        # WIP fork/branch, or `npm ci` may not be available on very old npm.
-    install_cmd = [npm, "install", "--no-save", "--include=dev", *extra_args]
-    return subprocess.run(
-        install_cmd,
+
+    captured: list[str] = []
+    with subprocess.Popen(
+        cmd,
         cwd=cwd,
-        env=run_env,
-        capture_output=capture_output,
+        env=env,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
-    )
+    ) as proc:
+        if proc.stderr is not None:
+            for line in proc.stderr:
+                captured.append(line)
+                sys.stderr.write(line)
+            sys.stderr.flush()
+        returncode = proc.wait()
+    return subprocess.CompletedProcess(cmd, returncode, None, "".join(captured))
 
 
 def _missing_web_build_tool(output: str) -> str | None:
@@ -7884,7 +7965,9 @@ def _venv_scripts_dir() -> Path | None:
     venv_dir = PROJECT_ROOT / "venv"
     if not venv_dir.is_dir():
         return None
-    scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
+    from hermes_constants import venv_bin_dir
+
+    scripts = venv_bin_dir(venv_dir, windows=_is_windows())
     return scripts if scripts.is_dir() else None
 
 
@@ -8677,9 +8760,10 @@ def _resolve_install_target_python(
     ``importlib.metadata`` queries the right site-packages.
     """
     if env and "VIRTUAL_ENV" in env:
+        from hermes_constants import venv_python_path
+
         venv_root = Path(env["VIRTUAL_ENV"])
-        scripts = venv_root / ("Scripts" if _is_windows() else "bin")
-        candidate = scripts / ("python.exe" if _is_windows() else "python")
+        candidate = venv_python_path(venv_root, windows=_is_windows())
         if candidate.exists():
             return candidate
 

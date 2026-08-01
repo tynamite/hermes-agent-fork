@@ -24,10 +24,22 @@ export interface StopBackendChildDeps {
   forceKillProcessTree: (pid: number) => void
 }
 
+export interface StopBackendChildrenDeps extends StopBackendChildDeps {
+  /** Resolve only after the child has exited or the bounded exit policy ran. */
+  waitForExit: (child: KillableChild) => Promise<unknown>
+}
+
 export interface KillableChild {
   pid?: number | null
   killed?: boolean
+  exitCode?: number | null
+  signalCode?: string | null
   kill: (signal: string) => void
+}
+
+export interface ConfirmBackendExitDeps {
+  isProcessAlive: (pid: number) => boolean
+  sleep: (delayMs: number) => Promise<void>
 }
 
 /**
@@ -52,4 +64,57 @@ export function stopBackendChild(child: KillableChild | null | undefined, deps: 
   } catch {
     // Already gone.
   }
+}
+
+/**
+ * Stop every distinct desktop-managed backend and await its bounded exit path.
+ *
+ * Update callers must close the whole primary + profile-pool set before
+ * mutating the shared Python environment. Deduplication matters during
+ * connection handoffs, where two registries can briefly reference one child.
+ */
+export async function stopBackendChildrenAndWait(
+  children: Array<KillableChild | null | undefined>,
+  deps: StopBackendChildrenDeps
+): Promise<number> {
+  const managed = [...new Set(children.filter((child): child is KillableChild => Boolean(child)))]
+
+  for (const child of managed) {
+    stopBackendChild(child, deps)
+  }
+
+  await Promise.all(managed.map(child => deps.waitForExit(child)))
+
+  return managed.length
+}
+
+/**
+ * Confirm that a force-killed backend is no longer live.
+ *
+ * A signal being accepted is not an exit boundary. Poll both the child state
+ * and the OS PID table for a short bounded grace, returning false when exit
+ * cannot be established so callers can fail closed before mutating files.
+ */
+export async function confirmBackendExit(
+  child: KillableChild,
+  deps: ConfirmBackendExitDeps,
+  { attempts = 20, intervalMs = 50 } = {}
+): Promise<boolean> {
+  const pid = child.pid
+
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    if (child.exitCode != null || child.signalCode != null) {
+      return true
+    }
+
+    if (Number.isInteger(pid) && !deps.isProcessAlive(pid as number)) {
+      return true
+    }
+
+    if (attempt < attempts) {
+      await deps.sleep(intervalMs)
+    }
+  }
+
+  return false
 }

@@ -2,7 +2,11 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
+import {
+  BackendStartInterruptedByUpdateError,
+  shouldLatchBackendStartFailure,
+  shouldLatchRemoteReauthFailure
+} from './backend-start-failure'
 
 test('latches a LOCAL backend failure so the install-retry loop is broken', () => {
   assert.equal(shouldLatchBackendStartFailure({ attemptedRemote: false }), true)
@@ -13,6 +17,37 @@ test('never latches a REMOTE failure so recovery stays retryable without a resta
   // laptop sleep must not wedge the app: the next connect has to re-attempt and
   // re-mint against the refreshed session.
   assert.equal(shouldLatchBackendStartFailure({ attemptedRemote: true }), false)
+})
+
+test('a local start interrupted by an update remains retryable', () => {
+  let backendStartFailure: Error | null = null
+  let starts = 0
+
+  const finishFailedAttempt = (error: Error) => {
+    if (
+      shouldLatchBackendStartFailure({
+        attemptedRemote: false,
+        error
+      })
+    ) {
+      backendStartFailure = error
+    }
+  }
+
+  const start = () => {
+    starts += 1
+
+    if (backendStartFailure) {
+      throw backendStartFailure
+    }
+
+    return 'started'
+  }
+
+  finishFailedAttempt(new BackendStartInterruptedByUpdateError())
+  assert.equal(backendStartFailure, null)
+  assert.equal(start(), 'started')
+  assert.equal(starts, 1)
 })
 
 test('the two branches are mutually exclusive (a failure either latches or stays retryable)', () => {

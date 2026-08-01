@@ -75,6 +75,128 @@ class TestWinPtyBridgeUnavailable:
             WinPtyBridge.spawn(["true"])
 
 
+def test_verify_closed_rejects_a_surviving_tracked_descendant(monkeypatch):
+    import gateway.status
+
+    class _ExitedProc:
+        pid = 101
+
+        @staticmethod
+        def isalive():
+            return False
+
+    bridge = WinPtyBridge.__new__(WinPtyBridge)
+    bridge._proc = _ExitedProc()
+    bridge._closed = True
+    bridge._tree_identities = {101: 1001, 202: 2002}
+
+    monkeypatch.setattr(
+        gateway.status,
+        "get_process_start_time",
+        lambda pid: 2002 if pid == 202 else None,
+    )
+    monkeypatch.setattr(gateway.status, "_pid_exists", lambda _pid: False)
+
+    assert bridge.verify_closed() is False
+
+
+def test_verify_closed_accepts_gone_tree_without_pid_reuse(monkeypatch):
+    import gateway.status
+
+    class _ExitedProc:
+        pid = 101
+
+        @staticmethod
+        def isalive():
+            return False
+
+    bridge = WinPtyBridge.__new__(WinPtyBridge)
+    bridge._proc = _ExitedProc()
+    bridge._closed = True
+    bridge._tree_identities = {101: 1001, 202: 2002}
+
+    monkeypatch.setattr(
+        gateway.status,
+        "get_process_start_time",
+        lambda _pid: None,
+    )
+    monkeypatch.setattr(gateway.status, "_pid_exists", lambda _pid: False)
+
+    assert bridge.verify_closed() is True
+
+
+def test_verify_closed_fails_closed_after_tree_snapshot_error():
+    class _ExitedProc:
+        pid = 101
+
+        @staticmethod
+        def isalive():
+            return False
+
+    bridge = WinPtyBridge.__new__(WinPtyBridge)
+    bridge._proc = _ExitedProc()
+    bridge._closed = True
+    bridge._tree_identities = {101: 1001}
+    bridge._tree_snapshot_failed = True
+
+    assert bridge.verify_closed() is False
+
+
+def test_close_force_kills_and_records_the_windows_process_tree(
+    monkeypatch,
+):
+    import gateway.status
+    import hermes_cli.win_pty_bridge as win_bridge
+
+    terminated = []
+
+    class _Proc:
+        pid = 101
+
+        @staticmethod
+        def terminate(*, force):
+            terminated.append(("leader", force))
+
+    class _Child:
+        pid = 202
+
+    bridge = WinPtyBridge.__new__(WinPtyBridge)
+    bridge._proc = _Proc()
+    bridge._closed = False
+    bridge._tree_identities = {101: 1001}
+
+    fake_psutil = type(
+        "_Psutil",
+        (),
+        {
+            "Process": staticmethod(
+                lambda _pid: type(
+                    "_Tree",
+                    (),
+                    {"children": staticmethod(lambda recursive: [_Child()])},
+                )()
+            )
+        },
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(
+        gateway.status,
+        "get_process_start_time",
+        lambda pid: {101: 1001, 202: 2002}[pid],
+    )
+    monkeypatch.setattr(
+        gateway.status,
+        "terminate_pid",
+        lambda pid, *, force: terminated.append((pid, force)),
+    )
+
+    bridge.close()
+
+    assert terminated == [(101, True), ("leader", True)]
+    assert bridge._tree_identities == {101: 1001, 202: 2002}
+    assert bridge._closed is True
+
+
 # ---------------------------------------------------------------------------
 # Windows-only end-to-end behaviour
 # ---------------------------------------------------------------------------
@@ -247,4 +369,3 @@ class TestWinPtyBridgeEnv:
             assert b"pty-env-works" in output
         finally:
             bridge.close()
-

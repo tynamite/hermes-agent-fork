@@ -166,7 +166,7 @@ class TestTickerErrorMarker:
 
 
 class TestTickerLoopRecordsErrors:
-    def _run_one_tick(self, monkeypatch, tick_fn):
+    def _run_one_tick(self, monkeypatch, tick_fn, **start_kwargs):
         """Run one iteration of the built-in ticker loop with a stubbed tick."""
         from cron.scheduler_provider import InProcessCronScheduler
 
@@ -182,7 +182,7 @@ class TestTickerLoopRecordsErrors:
             return original_wait(0)
 
         stop_event.wait = _stop_after_first_tick
-        provider.start(stop_event)
+        provider.start(stop_event, **start_kwargs)
 
     def test_failing_tick_persists_error(self, cron_store, monkeypatch):
         def _boom(**kwargs):
@@ -207,6 +207,27 @@ class TestTickerLoopRecordsErrors:
         assert jobs.get_ticker_last_error() is None, (
             "a clean tick must clear the stale error marker"
         )
+
+    def test_dispatch_scope_can_pause_tick(self, cron_store, monkeypatch):
+        from contextlib import contextmanager
+
+        calls = 0
+
+        def _tick(**_kwargs):
+            nonlocal calls
+            calls += 1
+
+        @contextmanager
+        def _paused():
+            yield False
+
+        self._run_one_tick(
+            monkeypatch,
+            _tick,
+            dispatch_scope=_paused,
+        )
+
+        assert calls == 0
 
 
 # =========================================================================
@@ -237,4 +258,3 @@ class TestCronStatusSurfacesError:
         assert "Permission denied" in out
         # The permission-specific hint must point at the ownership fix.
         assert "docker exec -u" in out
-

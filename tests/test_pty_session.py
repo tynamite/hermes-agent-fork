@@ -46,6 +46,9 @@ class FakeBridge:
     def close(self):
         self.closed = True
 
+    def is_alive(self):
+        return not self.closed
+
 
 class FakeWS:
     def __init__(self):
@@ -68,7 +71,12 @@ async def test_attach_replays_buffer_then_streams_live():
     bridge = FakeBridge([b"hello ", b"world", None])
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
-    await asyncio.sleep(0.05)                      # drain consumes "hello world"
+    deadline = time.monotonic() + 1
+    while (
+        s.buffer.snapshot() != b"hello world"
+        and time.monotonic() < deadline
+    ):
+        await asyncio.sleep(0.01)
     ws = FakeWS()
     await s.attach(ws)
     replay = b"".join(p for kind, p in ws.sent if kind == "bytes")
@@ -90,6 +98,47 @@ async def test_eof_marks_dead_and_closes_socket_4410():
     assert s.alive is False
     assert ws.close_code == 4410
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_close_propagates_unreaped_child(monkeypatch):
+    import hermes_cli.pty_session as pty_session
+
+    monkeypatch.setattr(pty_session, "_PTY_CLOSE_VERIFY_TIMEOUT_S", 0.01)
+
+    class StuckBridge(FakeBridge):
+        def close(self):
+            self.closed = True
+
+        def is_alive(self):
+            return True
+
+    s = pty_session.PtySession(
+        "stuck",
+        StuckBridge([]),
+        buffer_cap=1024,
+        read_timeout=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="did not terminate"):
+        await s.close()
+
+
+@pytest.mark.asyncio
+async def test_close_all_retains_session_when_child_survives():
+    reg = make_registry()
+
+    class StuckSession:
+        async def close(self):
+            raise RuntimeError("still alive")
+
+    session = StuckSession()
+    reg._sessions["stuck"] = session
+
+    with pytest.raises(RuntimeError, match="still alive"):
+        await reg.close_all()
+
+    assert reg._sessions["stuck"] is session
 
 
 from hermes_cli.pty_session import PtySessionRegistry, RegistryFull
@@ -123,6 +172,60 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
     with pytest.raises(RegistryFull):
         await reg.attach_or_spawn("b", spawn=lambda: FakeBridge([]))
     await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_capacity_eviction_remains_registered_until_close_finishes():
+    reg = make_registry(max_sessions=1)
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class SlowIdleSession:
+        key = "old"
+        attached = False
+        last_detached_at = 1.0
+        alive = True
+
+        async def close(self):
+            close_started.set()
+            await allow_close.wait()
+
+    old = SlowIdleSession()
+    reg._sessions[old.key] = old
+    spawn_task = asyncio.create_task(
+        reg.attach_or_spawn("new", spawn=lambda: FakeBridge([]))
+    )
+
+    await close_started.wait()
+    assert reg._sessions == {"old": old}
+
+    allow_close.set()
+    session, created = await spawn_task
+    assert created is True
+    assert reg._sessions == {"new": session}
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_capacity_eviction_retains_session_when_close_fails():
+    reg = make_registry(max_sessions=1)
+
+    class StuckIdleSession:
+        key = "old"
+        attached = False
+        last_detached_at = 1.0
+        alive = True
+
+        async def close(self):
+            raise RuntimeError("still alive")
+
+    old = StuckIdleSession()
+    reg._sessions[old.key] = old
+
+    with pytest.raises(RuntimeError, match="still alive"):
+        await reg.attach_or_spawn("new", spawn=lambda: FakeBridge([]))
+
+    assert reg._sessions == {"old": old}
 
 
 @pytest.mark.asyncio

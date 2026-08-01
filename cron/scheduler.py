@@ -325,6 +325,7 @@ def _is_cron_silence_response(text: str) -> bool:
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
+_inflight_delivery_futures: dict[str, set] = {}
 _running_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
@@ -353,7 +354,25 @@ def get_running_job_ids() -> "frozenset[str]":
     blind to them (#60432).
     """
     with _running_lock:
-        return frozenset(_running_job_ids)
+        return frozenset(_running_job_ids | _inflight_delivery_futures.keys())
+
+
+def _track_inflight_delivery(job_id: str, future) -> None:
+    """Keep an already-dispatched delivery visible until it actually exits."""
+    with _running_lock:
+        futures = _inflight_delivery_futures.setdefault(job_id, set())
+        futures.add(future)
+
+    def _release(done_future) -> None:
+        with _running_lock:
+            futures = _inflight_delivery_futures.get(job_id)
+            if futures is None:
+                return
+            futures.discard(done_future)
+            if not futures:
+                _inflight_delivery_futures.pop(job_id, None)
+
+    future.add_done_callback(_release)
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -1846,6 +1865,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 adapter_ok = False  # fall through to standalone path
                                 timeout_handled = True
                             else:
+                                _track_inflight_delivery(job["id"], future)
                                 timed_out = True
                                 timeout_handled = True
                                 logger.warning(
@@ -4225,7 +4245,10 @@ def tick(
                 )
                 return None
             with _running_lock:
-                if job_id in _running_job_ids:
+                if (
+                    job_id in _running_job_ids
+                    or job_id in _inflight_delivery_futures
+                ):
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)

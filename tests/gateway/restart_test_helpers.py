@@ -64,6 +64,7 @@ def make_restart_runner(
     runner._pending_approvals = {}
     runner._pending_model_notes = {}
     runner._background_tasks = set()
+    runner._supervised_tasks = set()
     runner._draining = False
     runner._restart_requested = False
     runner._signal_initiated_shutdown = False
@@ -120,6 +121,11 @@ def make_restart_runner(
     )
     runner._active_api_run_count = GatewayRunner._active_api_run_count.__get__(
         runner, GatewayRunner
+    )
+    runner._active_background_work_count = (
+        GatewayRunner._active_background_work_count.__get__(
+            runner, GatewayRunner
+        )
     )
     runner._active_work_count = GatewayRunner._active_work_count.__get__(
         runner, GatewayRunner

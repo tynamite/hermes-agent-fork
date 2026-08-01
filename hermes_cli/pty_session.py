@@ -14,6 +14,35 @@ from typing import Optional
 
 WS_CLOSE_PROCESS_EXITED = 4410
 WS_CLOSE_SUPERSEDED = 4409
+_PTY_CLOSE_VERIFY_TIMEOUT_S = 5.0
+
+
+async def close_and_verify_bridge(bridge) -> None:
+    """Close a PTY bridge off-loop and prove its process tree terminated."""
+
+    def _close_and_verify() -> None:
+        # Both production bridges expose a strict verify_closed() probe.
+        # Their close methods are intentionally tolerant of individual
+        # signal/reap errors, so successful return alone is not proof that
+        # the child exited.
+        bridge.close()
+        verify_closed = getattr(bridge, "verify_closed", None)
+        if not callable(verify_closed):
+            is_alive = getattr(bridge, "is_alive", None)
+            if callable(is_alive):
+                verify_closed = lambda: not is_alive()
+        if not callable(verify_closed):
+            raise RuntimeError("PTY bridge cannot verify child termination")
+        deadline = time.monotonic() + _PTY_CLOSE_VERIFY_TIMEOUT_S
+        while not verify_closed() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not verify_closed():
+            raise RuntimeError("PTY child did not terminate")
+
+    # bridge.close() and the bounded liveness wait are blocking; keep both
+    # off the event loop (#53227). Propagate failure so update quiescence
+    # cannot treat a surviving checkout/venv process as closed.
+    await asyncio.to_thread(_close_and_verify)
 
 
 class RingBuffer:
@@ -111,12 +140,9 @@ class PtySession:
                 await self._drain_task
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            # bridge.close() joins the child — blocking; keep it off the
-            # event loop (#53227).
-            await asyncio.to_thread(self.bridge.close)
-        except Exception:
-            pass
+
+        await close_and_verify_bridge(self.bridge)
+        self.alive = False
 
 
 from typing import Callable, Dict, Tuple
@@ -144,26 +170,32 @@ class PtySessionRegistry:
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
+        # Lookup, blocking spawn, and insertion must be one registry
+        # transaction. Without this, concurrent reconnects for one attach key
+        # can each spawn a bridge and overwrite one another in ``_sessions``.
+        self._lock = asyncio.Lock()
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
                               ) -> Tuple[PtySession, bool]:
-        await self.reap_idle()
-        existing = self._sessions.get(key)
-        if existing is not None and existing.alive:
-            return existing, False
-        if existing is not None:                       # dead remnant
-            await existing.close()
-            self._sessions.pop(key, None)
-        if len(self._sessions) >= self._max:
-            self._reap_one_idle_or_raise()
-        # PTY spawn does blocking fork/exec work — keep it off the event
-        # loop (#53227).
-        bridge = await asyncio.to_thread(spawn)
-        session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
-                             read_timeout=self._read_timeout)
-        await session.start()
-        self._sessions[key] = session
-        return session, True
+        async with self._lock:
+            await self._reap_idle_locked()
+            existing = self._sessions.get(key)
+            if existing is not None and existing.alive:
+                return existing, False
+            if existing is not None:                   # dead remnant
+                await existing.close()
+                self._sessions.pop(key, None)
+            if len(self._sessions) >= self._max:
+                await self._reap_one_idle_or_raise()
+            # PTY spawn does blocking fork/exec work — keep it off the event
+            # loop (#53227). Keep the registry lock across spawn and insertion
+            # so no second caller can create an unregistered losing bridge.
+            bridge = await asyncio.to_thread(spawn)
+            session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
+                                 read_timeout=self._read_timeout)
+            await session.start()
+            self._sessions[key] = session
+            return session, True
 
     def detach(self, key: str, ws) -> None:
         s = self._sessions.get(key)
@@ -171,6 +203,10 @@ class PtySessionRegistry:
             s.detach(ws)
 
     async def reap_idle(self, now: Optional[float] = None) -> None:
+        async with self._lock:
+            await self._reap_idle_locked(now)
+
+    async def _reap_idle_locked(self, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
         doomed = [
             key for key, s in self._sessions.items()
@@ -179,17 +215,29 @@ class PtySessionRegistry:
                 and (now - s.last_detached_at) > self._ttl)
         ]
         for key in doomed:
-            await self._sessions.pop(key).close()
+            session = self._sessions.get(key)
+            if session is None:
+                continue
+            await session.close()
+            self._sessions.pop(key, None)
 
-    def _reap_one_idle_or_raise(self) -> None:
+    async def _reap_one_idle_or_raise(self) -> None:
         idle = [s for s in self._sessions.values()
                 if not s.attached and s.last_detached_at is not None]
         if not idle:
             raise RegistryFull()
         oldest = min(idle, key=lambda s: s.last_detached_at or 0.0)
+        # Keep the session registered until its process tree has been verified
+        # closed. Update quiescence counts the registry, so removing it before
+        # close() finishes would make an evicted PTY invisible to the updater.
+        await oldest.close()
         self._sessions.pop(oldest.key, None)
-        asyncio.create_task(oldest.close())
 
     async def close_all(self) -> None:
-        for key in list(self._sessions):
-            await self._sessions.pop(key).close()
+        async with self._lock:
+            for key in list(self._sessions):
+                session = self._sessions.get(key)
+                if session is None:
+                    continue
+                await session.close()
+                self._sessions.pop(key, None)

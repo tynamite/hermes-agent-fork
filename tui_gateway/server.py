@@ -24,6 +24,8 @@ from agent.secret_scope import (
     set_secret_scope,
 )
 from hermes_constants import (
+    DEFAULT_INDICATOR_STYLE,
+    INDICATOR_STYLES,
     get_hermes_home,
     get_hermes_home_override,
     reset_hermes_home_override,
@@ -148,6 +150,17 @@ _db_error: str | None = None
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+_rpc_futures_lock = threading.Lock()
+_active_rpc_futures: set[concurrent.futures.Future] = set()
+_update_quiesce_lock = threading.Lock()
+_scheduled_agent_builds: dict[str, object] = {}
+_starting_agent_builds: set[str] = set()
+_scheduled_auto_continues: dict[str, tuple[object, Any]] = {}
+_starting_auto_continues: set[str] = set()
+_deferred_ws_orphan_reaps: set[str] = set()
+_active_detached_tui_workers: set[threading.Thread] = set()
+_active_tui_maintenance = 0
+_tui_update_quiesced = False
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -289,6 +302,180 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+
+
+def _start_tracked_tui_worker(
+    *,
+    target,
+    args: tuple = (),
+    daemon: bool = True,
+    name: str | None = None,
+) -> threading.Thread | None:
+    """Atomically admit and track one detached TUI worker.
+
+    Registration and thread start share the update-quiesce lock, so an update
+    cannot attest idle in the gap between admission and ``Thread.start()``.
+    New workers are rejected after quiescence begins; admitted workers remain
+    visible to :func:`has_active_tui_work` until their target returns.
+    """
+
+    def _run() -> None:
+        try:
+            target(*args)
+        finally:
+            with _update_quiesce_lock:
+                _active_detached_tui_workers.discard(
+                    threading.current_thread()
+                )
+
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            return None
+        worker = threading.Thread(
+            target=_run,
+            daemon=daemon,
+            name=name,
+        )
+        _active_detached_tui_workers.add(worker)
+        try:
+            worker.start()
+        except Exception:
+            _active_detached_tui_workers.discard(worker)
+            raise
+    return worker
+
+
+def has_active_tui_work() -> bool:
+    """Whether an embedded TUI RPC or agent turn still owns live work."""
+    with _update_quiesce_lock:
+        if (
+            _starting_agent_builds
+            or _starting_auto_continues
+            or _active_detached_tui_workers
+            or _active_tui_maintenance
+        ):
+            return True
+    voice_module = sys.modules.get("hermes_cli.voice")
+    if voice_module is not None:
+        try:
+            if voice_module.has_active_voice_work():
+                return True
+        except Exception:
+            # A loaded voice runtime whose state cannot be inspected is not a
+            # safe idle attestation.
+            return True
+    with _sessions_lock:
+        if any(
+            session.get("running")
+            or (
+                (run_thread := session.get("_run_thread")) is not None
+                and run_thread.is_alive()
+            )
+            or (
+                (ready := session.get("agent_ready")) is not None
+                and not ready.is_set()
+                and session.get("agent_build_started")
+            )
+            for session in _sessions.values()
+        ):
+            return True
+    with _rpc_futures_lock:
+        return any(not future.done() for future in _active_rpc_futures)
+
+
+def begin_update_quiesce() -> None:
+    """Pause deferred TUI agent builds at the dashboard update boundary.
+
+    A build already past admission remains visible through
+    ``_starting_agent_builds`` and the session's ``agent_build_started`` flag,
+    so the caller can wait for it. Builds whose timers have not fired remain
+    scheduled and resume only after :func:`end_update_quiesce`.
+    """
+    global _tui_update_quiesced
+
+    with _update_quiesce_lock:
+        _tui_update_quiesced = True
+    voice_module = sys.modules.get("hermes_cli.voice")
+    begin_voice_quiesce = getattr(
+        voice_module,
+        "begin_continuous_update_quiesce",
+        None,
+    )
+    if callable(begin_voice_quiesce):
+        begin_voice_quiesce()
+
+
+def end_update_quiesce() -> None:
+    """Resume deferred TUI agent builds after an update exits or aborts."""
+    global _tui_update_quiesced
+
+    with _update_quiesce_lock:
+        if not _tui_update_quiesced:
+            return
+        _tui_update_quiesced = False
+        pending_builds = list(_scheduled_agent_builds)
+        pending_continues = [
+            (sid, target)
+            for sid, (_token, target) in _scheduled_auto_continues.items()
+        ]
+        pending_orphan_reaps = list(_deferred_ws_orphan_reaps)
+        _scheduled_agent_builds.clear()
+        _scheduled_auto_continues.clear()
+        _deferred_ws_orphan_reaps.clear()
+    voice_module = sys.modules.get("hermes_cli.voice")
+    end_voice_quiesce = getattr(
+        voice_module,
+        "end_continuous_update_quiesce",
+        None,
+    )
+    if callable(end_voice_quiesce):
+        try:
+            end_voice_quiesce()
+        except Exception:
+            logger.debug("failed to release voice update quiesce", exc_info=True)
+    for sid in pending_builds:
+        _schedule_agent_build(sid, delay=0.0)
+    for sid, target in pending_continues:
+        _schedule_auto_continue_kickoff(sid, target)
+    for sid in pending_orphan_reaps:
+        threading.Thread(
+            target=_run_ws_orphan_reap,
+            args=(sid,),
+            daemon=True,
+        ).start()
+    # A one-shot cap/orphan/lease sweep may have fired while updates were
+    # paused. Re-run the consolidated maintenance pass now so pausing remains
+    # lossless without letting teardown work cross the update boundary.
+    threading.Thread(target=_reap_idle_sessions, daemon=True).start()
+
+
+@contextlib.contextmanager
+def _tui_maintenance_scope():
+    """Admit one short TUI maintenance sweep unless an update is quiesced."""
+    global _active_tui_maintenance
+
+    with _update_quiesce_lock:
+        admitted = not _tui_update_quiesced
+        if admitted:
+            _active_tui_maintenance += 1
+    try:
+        yield admitted
+    finally:
+        if admitted:
+            with _update_quiesce_lock:
+                _active_tui_maintenance = max(_active_tui_maintenance - 1, 0)
+
+
+def _try_claim_autonomous_turn(session: dict) -> bool:
+    """Atomically admit one poller-owned turn outside update quiescence."""
+    with _update_quiesce_lock:
+        if _tui_update_quiesced or session.get("_finalized"):
+            return False
+        with session["history_lock"]:
+            if session.get("running"):
+                return False
+            session["running"] = True
+            return True
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -618,7 +805,7 @@ def _transfer_active_session_slot(
 # TUI backend itself creates ("tui", plus whatever a client passes as its
 # own ``source``) and the CLI's own sessions are NOT gateway-owned.
 _NON_GATEWAY_SOURCES = frozenset({
-    "", "tui", "cli", "webui", "desktop", "cron", "subagent", "test",
+    "", "tui", "cli", "webui", "desktop", "cron", "kanban", "subagent", "test",
     "local", "acp", "webhook", "api_server", "msgraph_webhook",
 })
 
@@ -793,6 +980,39 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         pass
 
 
+# End reasons where the BACKEND reclaimed a session the client never asked to
+# close: the idle-TTL reaper, the LRU cap, and the WS-orphan reap. A client
+# holding that live session id gets no signal today — its next prompt fails
+# against an id the backend has already forgotten, which reads as the session
+# silently vanishing rather than being reclaimed. ``tui_close`` and friends are
+# deliberately absent: the client initiated those and already knows.
+_RECLAIM_END_REASONS = frozenset({"idle_timeout", "lru_evict", "ws_orphan_reap"})
+
+
+def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
+    """Tell connected clients a session was reclaimed out from under them.
+
+    Broadcast rather than session-targeted: the reap paths run on background
+    timer threads with no contextvar binding, and the WS-orphan case has by
+    definition lost its own transport — ``_emit`` would bottom out on stdio and
+    the peer that owns the session would never see it. Best-effort; a failed
+    notify must never break teardown.
+    """
+    if end_reason not in _RECLAIM_END_REASONS:
+        return
+    try:
+        _broadcast_global_event(
+            "session.reclaimed",
+            {
+                "session_id": str(session.get("_sid") or ""),
+                "stored_session_id": str(session.get("session_key") or ""),
+                "reason": end_reason,
+            },
+        )
+    except Exception:
+        logger.debug("session.reclaimed broadcast failed", exc_info=True)
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
@@ -806,6 +1026,7 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     if not session:
         return
     _finalize_session(session, end_reason=end_reason)
+    _announce_session_reclaimed(session, end_reason)
     try:
         from tools.approval import unregister_gateway_notify
 
@@ -905,25 +1126,46 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         return
 
     def _reap() -> None:
-        # Serialize the orphan re-check against session.resume (which re-binds a
-        # live transport under _session_resume_lock and would make this session
-        # non-orphaned). Claim teardown by popping under both lifecycle locks,
-        # then release the global resume lock before the slow finalization work.
-        # The dict mutation still happens under _sessions_lock — consistent
-        # with every other _sessions mutator
-        # (#39591: _reap previously popped under _session_resume_lock, giving no
-        # mutual exclusion against _init_session / _close_session_by_id, which
-        # guard with _sessions_lock). _sessions_lock is an RLock and the global
-        # ordering is always resume_lock -> sessions_lock, so nesting is safe.
-        with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
-                return
-            session = _pop_session_by_id(sid)
-        _teardown_popped_session(session, end_reason="ws_orphan_reap")
+        _run_ws_orphan_reap(sid)
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
     timer.daemon = True
     timer.start()
+
+
+def _run_ws_orphan_reap(sid: str) -> None:
+    """Run or defer one grace-expired WebSocket orphan check."""
+    global _active_tui_maintenance
+
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            _deferred_ws_orphan_reaps.add(sid)
+            return
+        _active_tui_maintenance += 1
+    try:
+        _reap_ws_orphan_if_still_detached(sid)
+    finally:
+        with _update_quiesce_lock:
+            _active_tui_maintenance = max(_active_tui_maintenance - 1, 0)
+
+
+def _reap_ws_orphan_if_still_detached(sid: str) -> None:
+    """Claim and tear down one still-detached WS session."""
+    # Serialize the orphan re-check against session.resume (which re-binds a
+    # live transport under _session_resume_lock and would make this session
+    # non-orphaned). Claim teardown by popping under both lifecycle locks,
+    # then release the global resume lock before the slow finalization work.
+    # The dict mutation still happens under _sessions_lock — consistent
+    # with every other _sessions mutator
+    # (#39591: _reap previously popped under _session_resume_lock, giving no
+    # mutual exclusion against _init_session / _close_session_by_id, which
+    # guard with _sessions_lock). _sessions_lock is an RLock and the global
+    # ordering is always resume_lock -> sessions_lock, so nesting is safe.
+    with _session_resume_lock:
+        if not _ws_session_is_orphaned(_sessions.get(sid)):
+            return
+        session = _pop_session_by_id(sid)
+    _teardown_popped_session(session, end_reason="ws_orphan_reap")
 
 
 def _close_sessions_for_transport(
@@ -974,6 +1216,102 @@ def _shutdown_sessions() -> None:
         _close_session_by_id(sid, end_reason="tui_shutdown")
 
 
+def close_sessions_for_update() -> None:
+    """Close idle embedded-TUI sessions before the managed venv is rewritten.
+
+    Dashboard WebSocket closure detaches resumable sessions by design, so their
+    notification pollers and slash-worker Python subprocesses otherwise survive
+    the transport task. The POSIX holder guard must then reject the update.
+    Quiesce admission is already closed when this runs; tear sessions down and
+    briefly join their pollers so no venv-backed child or lazy import crosses
+    the updater spawn.
+    """
+    with _sessions_lock:
+        session_items = list(_sessions.items())
+    sessions = [session for _sid, session in session_items]
+    delegation_owners = [
+        (
+            str(session.get("session_key") or ""),
+            str(sid or session.get("_sid") or ""),
+        )
+        for sid, session in session_items
+    ]
+    deadline = time.monotonic() + 1.0
+    voice_module = sys.modules.get("hermes_cli.voice")
+    if voice_module is not None:
+        try:
+            voice_stopped = voice_module.stop_continuous_for_update(
+                timeout=max(deadline - time.monotonic(), 0.0)
+            )
+        except Exception as exc:
+            raise RuntimeError("Could not stop TUI voice work before update") from exc
+        if not voice_stopped:
+            raise RuntimeError("TUI voice work did not stop before update")
+    wake_module = sys.modules.get("tools.wake_word")
+    if wake_module is not None:
+        try:
+            wake_stopped = wake_module.stop_listening_for_update(
+                timeout=max(deadline - time.monotonic(), 0.0)
+            )
+        except Exception as exc:
+            raise RuntimeError("Could not stop TUI wake-word work before update") from exc
+        if not wake_stopped:
+            raise RuntimeError("TUI wake-word work did not stop before update")
+    _shutdown_sessions()
+    current = threading.current_thread()
+    pollers = []
+    for session in sessions:
+        poller = session.get("_notif_thread")
+        if (
+            poller is not None
+            and poller is not current
+            and getattr(poller, "is_alive", lambda: False)()
+        ):
+            pollers.append(poller)
+    for poller in pollers:
+        poller.join(timeout=max(deadline - time.monotonic(), 0.0))
+    try:
+        from tools.async_delegation import active_count_for_session
+
+        while (
+            any(
+                active_count_for_session(
+                    session_key=session_key,
+                    origin_ui_session_id=sid,
+                )
+                for session_key, sid in delegation_owners
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        live_delegations = sum(
+            active_count_for_session(
+                session_key=session_key,
+                origin_ui_session_id=sid,
+            )
+            for session_key, sid in delegation_owners
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not verify embedded-TUI delegation shutdown"
+        ) from exc
+    still_alive = [
+        poller
+        for poller in pollers
+        if getattr(poller, "is_alive", lambda: False)()
+    ]
+    if still_alive:
+        raise RuntimeError(
+            f"{len(still_alive)} embedded-TUI notification poller(s) "
+            "did not stop before update"
+        )
+    if live_delegations:
+        raise RuntimeError(
+            f"{live_delegations} embedded-TUI delegation(s) did not stop "
+            "before update"
+        )
+
+
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
 # hours-scale because last_active freezes during a long turn and on passive
 # viewing — running/pending/starting/live-transport are hard exemptions instead.
@@ -1011,13 +1349,20 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
 
 
 def _reap_idle_sessions() -> None:
-    now = time.time()
-    with _sessions_lock:
-        victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
-    for sid in victims:
-        _close_session_by_id(sid, end_reason="idle_timeout")
-    _enforce_session_cap()
-    _reclaim_orphaned_leases()
+    with _tui_maintenance_scope() as admitted:
+        if not admitted:
+            return
+        now = time.time()
+        with _sessions_lock:
+            victims = [
+                sid
+                for sid, s in _sessions.items()
+                if _session_is_evictable(sid, s, now)
+            ]
+        for sid in victims:
+            _close_session_by_id(sid, end_reason="idle_timeout")
+        _enforce_session_cap()
+        _reclaim_orphaned_leases()
 
 
 def _reclaim_orphaned_leases() -> None:
@@ -1074,22 +1419,28 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
 
 
 def _enforce_session_cap() -> None:
-    cap = _max_live_sessions()
-    if cap <= 0:
-        return
-    with _sessions_lock:
-        total = len(_sessions)
-        if total <= cap:
+    with _tui_maintenance_scope() as admitted:
+        if not admitted:
             return
-        evictable = [
-            (sid, s) for sid, s in _sessions.items() if _session_is_lru_evictable(sid, s)
-        ]
-    # Oldest-touched first; only evict down to the cap (live/focused sessions on
-    # a live transport are never eligible, so we may stop short of the cap).
-    evictable.sort(key=lambda kv: float(kv[1].get("last_active") or 0.0))
-    overflow = total - cap
-    for sid, _s in evictable[:overflow]:
-        _close_session_by_id(sid, end_reason="lru_evict")
+        cap = _max_live_sessions()
+        if cap <= 0:
+            return
+        with _sessions_lock:
+            total = len(_sessions)
+            if total <= cap:
+                return
+            evictable = [
+                (sid, s)
+                for sid, s in _sessions.items()
+                if _session_is_lru_evictable(sid, s)
+            ]
+        # Oldest-touched first; only evict down to the cap (live/focused
+        # sessions on a live transport are never eligible, so we may stop short
+        # of the cap).
+        evictable.sort(key=lambda kv: float(kv[1].get("last_active") or 0.0))
+        overflow = total - cap
+        for sid, _s in evictable[:overflow]:
+            _close_session_by_id(sid, end_reason="lru_evict")
 
 
 def _schedule_session_cap_enforcement() -> None:
@@ -1454,11 +1805,22 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
         return _compute_host_supervisor
 
 
-def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _compute_host_turn_frame(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    image_paths: list[str] | None = None,
+    queued_prompt_generation: int | None = None,
+) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
-        attached_images = list(session.get("attached_images", []))
+        attached_images = (
+            list(image_paths)
+            if image_paths is not None
+            else list(session.get("attached_images", []))
+        )
     return {
         "type": "turn.start",
         "sid": sid,
@@ -1475,6 +1837,7 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
         "attached_images": attached_images,
+        "queued_prompt_generation": queued_prompt_generation,
     }
 
 
@@ -1545,9 +1908,23 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     _drain_queued_prompt(rid, sid, session)
 
 
-def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _submit_prompt_to_compute_host(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    image_paths: list[str] | None = None,
+    queued_prompt_generation: int | None = None,
+) -> dict:
     cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(rid, sid, session, text)
+    frame = _compute_host_turn_frame(
+        rid,
+        sid,
+        session,
+        text,
+        image_paths=image_paths,
+        queued_prompt_generation=queued_prompt_generation,
+    )
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -1564,7 +1941,8 @@ def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any)
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
-        session["attached_images"] = []
+        if image_paths is None:
+            session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -1734,7 +2112,15 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        future = _pool.submit(lambda: ctx.run(run))
+        with _rpc_futures_lock:
+            _active_rpc_futures.add(future)
+
+        def _discard_rpc_future(completed: concurrent.futures.Future) -> None:
+            with _rpc_futures_lock:
+                _active_rpc_futures.discard(completed)
+
+        future.add_done_callback(_discard_rpc_future)
 
         return None
     finally:
@@ -2482,7 +2868,14 @@ def _ensure_session_db_row(session: dict) -> None:
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
         )
-    except Exception:
+    except Exception as exc:
+        # Disk-full is not a soft failure: if we swallow it here, prompt.submit
+        # returns {"status":"streaming"} and the user's message vanishes with
+        # no toast. Re-raise so the submit handler can return a real RPC error.
+        from hermes_state import is_disk_full_error
+
+        if is_disk_full_error(exc):
+            raise
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
         if close_db:
@@ -2525,7 +2918,11 @@ def _persist_branch_seed(session: dict) -> None:
                     timestamp=msg.get("timestamp"),
                 )
             session["_branch_seed_persisted"] = True
-        except Exception:
+        except Exception as exc:
+            from hermes_state import is_disk_full_error
+
+            if is_disk_full_error(exc):
+                raise
             logger.debug("branch seed persist failed", exc_info=True)
 
 
@@ -2589,7 +2986,11 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
         except Exception:
             logger.debug("failed to persist session git metadata", exc_info=True)
 
-    threading.Thread(target=_run, name="git-meta", daemon=True).start()
+    _start_tracked_tui_worker(
+        target=_run,
+        name="git-meta",
+        daemon=True,
+    )
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
@@ -2623,12 +3024,6 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
 
 # ── Config I/O ────────────────────────────────────────────────────────
 
-
-# Keep aligned with `INDICATOR_STYLES` / `DEFAULT_INDICATOR_STYLE` in
-# ``ui-tui/src/app/interfaces.ts`` — both ends validate against the
-# same shape so `config.get indicator` and the live TUI render agree.
-_INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
-_INDICATOR_DEFAULT = "kaomoji"
 
 _DASHBOARD_TURN_ISOLATION_DEFAULT = False
 _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT = 15
@@ -3554,8 +3949,31 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
         logger.debug("failed to persist live session system prompt", exc_info=True)
 
 
+# Stable leading text of the model-switch marker, shared by the builder and the
+# dedup below. Only the newest marker is meaningful (it names the *currently*
+# active model); older ones are stale and would otherwise be re-sent to the
+# provider on every turn (#65891).
+_MODEL_SWITCH_MARKER_PREFIX = "[System: The active model for this chat has changed to "
+
+
+def _is_model_switch_marker(entry: Any) -> bool:
+    """Whether a history entry is a (self-replacing) model-switch marker."""
+    if not isinstance(entry, dict):
+        return False
+    content = entry.get("content")
+    return isinstance(content, str) and content.startswith(_MODEL_SWITCH_MARKER_PREFIX)
+
+
 def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
-    """Record a real system-history pivot after a live model switch."""
+    """Record a real system-history pivot after a live model switch.
+
+    Only the most recent marker is kept: each new switch first strips any
+    prior model-switch markers from the live history, so N switches leave one
+    marker (naming the active model), not N stale ones accumulating tokens on
+    every subsequent API call (#65891). The in-memory history is the payload
+    re-sent each turn; the dedup is self-healing across resumes because the
+    next switch collapses whatever markers a reload brought back.
+    """
     if not session:
         return
     session_key = str(session.get("session_key") or "").strip()
@@ -3564,7 +3982,7 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
 
     provider_part = f" via provider {provider}" if provider else ""
     marker = (
-        "[System: The active model for this chat has changed to "
+        f"{_MODEL_SWITCH_MARKER_PREFIX}"
         f"{model}{provider_part}. From this point forward, use this runtime "
         "metadata when answering questions about what model/provider is active.]"
     )
@@ -3574,14 +3992,19 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
     # beginning of the API message list (#48338).
     entry = {"role": "user", "content": marker, "display_kind": "model_switch"}
 
+    def _replace_markers() -> None:
+        history = session.setdefault("history", [])
+        # Drop any earlier markers in place before appending the new one.
+        history[:] = [h for h in history if not _is_model_switch_marker(h)]
+        history.append(entry)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+
     lock = session.get("history_lock")
     if lock is not None:
         with lock:
-            session.setdefault("history", []).append(entry)
-            session["history_version"] = int(session.get("history_version", 0)) + 1
+            _replace_markers()
     else:
-        session.setdefault("history", []).append(entry)
-        session["history_version"] = int(session.get("history_version", 0)) + 1
+        _replace_markers()
 
     try:
         agent = session.get("agent")
@@ -5845,6 +6268,9 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     session["agent"] = new_agent
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
+    session["queued_prompt"] = None
+    session.pop("queued_prompts", None)
+    session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     session["edit_snapshots"] = {}
     session["image_counter"] = 0
     session["running"] = False
@@ -5927,11 +6353,11 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             info = _session_info(agent, session)
         # Emit outside the lock — write_json must not block under _sessions_lock.
         _emit("session.info", sid, info)
-    threading.Thread(
+    _start_tracked_tui_worker(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",
         daemon=True,
-    ).start()
+    )
 
 
 class _RuntimeFallbackResolution(NamedTuple):
@@ -7016,7 +7442,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             with session["history_lock"]:
                 session["running"] = False
 
-    threading.Thread(target=kickoff, daemon=True).start()
+    _schedule_auto_continue_kickoff(sid, kickoff)
     logger.info(
         "auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago)",
         session_key,
@@ -7026,24 +7452,41 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    image_paths: list[str] | None = None,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
-    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
-    slot is kept; a second arrival is merged (lossless, mirroring the
-    consecutive-user merge in ``repair_message_sequence``) so nothing the user
-    typed is dropped. ``transport`` is pinned so the drained turn streams back to
-    the client that sent it even if the session transport is rebound meanwhile.
+    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
+    arrivals share a slot and merge losslessly (mirroring the consecutive-user
+    merge in ``repair_message_sequence``). Image-bearing submissions stay as
+    separate envelopes, so their attachment ownership and chronology survive.
+    ``transport`` is pinned so the drained turn streams back to the client that
+    sent it even if the session transport is rebound meanwhile.
     """
+    image_paths = list(image_paths or [])
+    queued = {"text": text, "transport": transport}
+    if image_paths:
+        queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
     if (
         existing
         and isinstance(existing.get("text"), str)
         and isinstance(text, str)
+        and not existing.get("image_paths")
+        and not image_paths
+        and not session.get("queued_prompts")
     ):
         prev = existing["text"]
-        text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        return
+    if existing:
+        session.setdefault("queued_prompts", []).append(queued)
+        return
+    session["queued_prompt"] = queued
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7078,7 +7521,16 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
 
-    threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
+    worker = _start_tracked_tui_worker(
+        target=interrupt,
+        daemon=True,
+        name=f"busy-interrupt-{sid}",
+    )
+    if worker is None:
+        # Quiescence won the admission race, so the target never gets its
+        # finally block. Release the per-session coalescing flag here.
+        with session["history_lock"]:
+            session["_busy_interrupt_pending"] = False
 
 
 def _handle_busy_submit(
@@ -7110,7 +7562,15 @@ def _handle_busy_submit(
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
-    text_only = _is_text_only_busy_payload(text)
+    with session["history_lock"]:
+        if not session.get("running"):
+            return None
+        image_paths = list(session.get("attached_images", []))
+        if image_paths:
+            # Claim at submission time. A later paste must not be consumed by
+            # this prompt after the active turn finally yields.
+            session["attached_images"] = []
+    text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
         try:
@@ -7144,11 +7604,15 @@ def _handle_busy_submit(
     # can wait behind the very operation it is trying to cancel.
     with session["history_lock"]:
         if not session.get("running"):
+            if image_paths:
+                session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport)
+        _enqueue_prompt(session, text, transport, image_paths=image_paths)
         session["last_active"] = time.time()
 
-    if mode != "queue":
+    # Attachments need a separate model invocation. Queue them without
+    # cancelling the active turn so the user gets both results in order.
+    if mode != "queue" and not image_paths:
         _interrupt_busy_session(sid, session, agent)
     return _ok(rid, {"status": "queued"})
 
@@ -7164,21 +7628,60 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
-        session["queued_prompt"] = None
+        queue_generation = int(session.get("_queued_prompt_generation", 0))
+        queued_prompts = session.get("queued_prompts") or []
+        session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
+        if not queued_prompts:
+            session.pop("queued_prompts", None)
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+    use_compute_host = _session_uses_compute_host(session)
+    with session["history_lock"]:
+        if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+            session["running"] = False
+            return True
+    dispatch_failed = False
     try:
-        if _session_uses_compute_host(session):
-            resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
+        if use_compute_host:
+            if queued.get("image_paths"):
+                resp = _submit_prompt_to_compute_host(
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    image_paths=queued["image_paths"],
+                    queued_prompt_generation=queue_generation,
+                )
+            else:
+                resp = _submit_prompt_to_compute_host(
+                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
+                dispatch_failed = True
         else:
-            _run_prompt_submit(rid, sid, session, queued["text"])
+            if queued.get("image_paths"):
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    image_paths=queued["image_paths"],
+                    queued_prompt_generation=queue_generation,
+                )
+            else:
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -7187,6 +7690,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+        dispatch_failed = True
+    if dispatch_failed:
+        with session["history_lock"]:
+            drain_next = bool(session.get("queued_prompt")) and not session.get(
+                "_turn_cancel_requested"
+            )
+        if drain_next:
+            _drain_queued_prompt(rid, sid, session)
     return True
 
 
@@ -7374,15 +7885,90 @@ def _claim_or_reuse_live(
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     """Pre-warm a deferred session's agent off the response path (session.create
     and cold resume both build through here; _sess() also builds on demand)."""
+    schedule_token = object()
 
     def _run():
-        session = _sessions.get(sid)
-        if session is not None:
-            _start_agent_build(sid, session)
+        with _update_quiesce_lock:
+            if _scheduled_agent_builds.get(sid) is not schedule_token:
+                # The quiesce ended and re-armed this sid with a fresh timer
+                # before this older timer acquired the lock.
+                return
+            if _tui_update_quiesced:
+                # Leave the sid scheduled. end_update_quiesce() will arm a
+                # fresh timer after the updater exits.
+                return
+            _scheduled_agent_builds.pop(sid, None)
+            _starting_agent_builds.add(sid)
+        try:
+            session = _sessions.get(sid)
+            if session is not None:
+                _start_agent_build(sid, session)
+        finally:
+            with _update_quiesce_lock:
+                _starting_agent_builds.discard(sid)
+
+    with _update_quiesce_lock:
+        if sid in _scheduled_agent_builds or sid in _starting_agent_builds:
+            return
+        _scheduled_agent_builds[sid] = schedule_token
+        if _tui_update_quiesced:
+            return
 
     timer = threading.Timer(delay, _run)
     timer.daemon = True
-    timer.start()
+    try:
+        timer.start()
+    except Exception:
+        with _update_quiesce_lock:
+            if _scheduled_agent_builds.get(sid) is schedule_token:
+                _scheduled_agent_builds.pop(sid, None)
+        raise
+
+
+def _schedule_auto_continue_kickoff(sid: str, target) -> None:
+    """Start one crash-recovery kickoff unless update quiesce defers it.
+
+    The kickoff directly starts or waits for an agent build and can then launch
+    a synthesized turn. Track the entire handoff so an update cannot attest
+    idle between the resume RPC returning and either the build or turn becoming
+    visible through the ordinary session flags.
+    """
+    schedule_token = object()
+
+    def _run() -> None:
+        with _update_quiesce_lock:
+            pending = _scheduled_auto_continues.get(sid)
+            if pending is None or pending[0] is not schedule_token:
+                return
+            if _tui_update_quiesced:
+                return
+            _scheduled_auto_continues.pop(sid, None)
+            _starting_auto_continues.add(sid)
+        try:
+            target()
+        finally:
+            with _update_quiesce_lock:
+                _starting_auto_continues.discard(sid)
+
+    with _update_quiesce_lock:
+        if sid in _scheduled_auto_continues or sid in _starting_auto_continues:
+            return
+        _scheduled_auto_continues[sid] = (schedule_token, target)
+        if _tui_update_quiesced:
+            return
+
+    worker = threading.Thread(
+        target=_run,
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        with _update_quiesce_lock:
+            pending = _scheduled_auto_continues.get(sid)
+            if pending is not None and pending[0] is schedule_token:
+                _scheduled_auto_continues.pop(sid, None)
+        raise
 
 
 def _session_pending_kind(sid: str) -> str:
@@ -8651,9 +9237,8 @@ def _notification_poller_loop(
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
+                if _try_claim_autonomous_turn(session):
+                    with session["history_lock"]:
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
                 if _batch:
@@ -8723,14 +9308,8 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        _requeued = False
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
-        if _requeued:
+        if not _try_claim_autonomous_turn(session):
+            process_registry.completion_queue.put(evt)
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
@@ -8772,6 +9351,9 @@ def _notification_poller_loop(
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            return
     deferred: list = []
     while not process_registry.completion_queue.empty():
         try:
@@ -8809,11 +9391,9 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
+        if not _try_claim_autonomous_turn(session):
+            process_registry.completion_queue.put(evt)
+            break
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -8955,30 +9535,47 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         args=(stop, sid, session),
         daemon=True,
     )
+    session["_notif_thread"] = t
     t.start()
     return stop
 
 
 def _run_prompt_submit(
-    rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    display_kind: str | None = None,
     display_metadata: dict | None = None,
+    image_paths: list[str] | None = None,
+    queued_prompt_generation: int | None = None,
 ) -> None:
     with session["history_lock"]:
+        if (
+            queued_prompt_generation is not None
+            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+        ):
+            session["running"] = False
+            return
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
-        images = list(session.get("attached_images", []))
-        session["attached_images"] = []
+        if image_paths is None:
+            images = list(session.get("attached_images", []))
+            session["attached_images"] = []
+        else:
+            images = list(image_paths)
         inflight = session.get("inflight_turn")
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
-    agent = session["agent"]
-    if hasattr(agent, "clear_interrupt"):
-        try:
-            agent.clear_interrupt()
-        except Exception:
-            pass
+        agent = session["agent"]
+        if hasattr(agent, "clear_interrupt"):
+            try:
+                agent.clear_interrupt()
+            except Exception:
+                pass
     _emit("message.start", sid)
 
     def run():
@@ -9560,9 +10157,12 @@ def _run_prompt_submit(
                     spoken = raw
                     # Barge-aware: spoken interruptions must cut this
                     # fallback playback too, not just the streaming path.
-                    threading.Thread(
-                        target=_speak_text_with_barge, args=(spoken,), daemon=True
-                    ).start()
+                    _start_tracked_tui_worker(
+                        target=_speak_text_with_barge,
+                        args=(spoken,),
+                        daemon=True,
+                        name=f"voice-fallback-{sid}",
+                    )
                 except ImportError:
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
@@ -9810,6 +10410,26 @@ def _allowed_image_extensions() -> frozenset[str]:
         return frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 
 
+def _session_images_dir(session: dict) -> Path:
+    """Resolve the uploads ``images/`` dir against the session's effective home.
+
+    Attach RPCs (``image.attach_bytes``, ``clipboard.paste``, ``pdf.attach``)
+    run BEFORE ``prompt.submit`` installs the session's profile HERMES_HOME
+    override, so ``get_hermes_home()`` here would return the gateway's launch
+    home. In a multi-profile / root-gateway deployment that writes the upload to
+    the launch home's ``images/`` while the sandbox mount and the vision host-
+    read allowlist both resolve the *session profile's* ``images/`` at run time
+    — so the file the agent tries to read is never the file we wrote (#69575).
+
+    Anchor the write on the session's stored ``profile_home`` when present
+    (matching the mount/read scope), else fall back to the launch home. Keeps
+    per-profile isolation: a profile's uploads stay under that profile's home.
+    """
+    profile_home = session.get("profile_home")
+    base = Path(profile_home) if profile_home else _hermes_home
+    return base / "images"
+
+
 def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
     """Write image bytes into the gateway's images dir and queue them.
 
@@ -9818,7 +10438,7 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     the existing native-image-attach pipeline. Returns the written path.
     """
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _session_images_dir(session)
     img_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
@@ -10628,11 +11248,11 @@ def _(rid, params: dict) -> dict:
         # non-string inputs (0, False, []) still surface as themselves
         # in the error message instead of looking like a blank value.
         raw = ("" if value is None else str(value)).strip().lower()
-        if raw not in _INDICATOR_STYLES:
+        if raw not in INDICATOR_STYLES:
             return _err(
                 rid,
                 4002,
-                f"unknown indicator: {raw!r}; pick one of {'|'.join(_INDICATOR_STYLES)}",
+                f"unknown indicator: {raw!r}; pick one of {'|'.join(INDICATOR_STYLES)}",
             )
         _write_config_key("display.tui_status_indicator", raw)
         return _ok(rid, {"key": key, "value": raw})
@@ -11033,10 +11653,11 @@ def _discover_repos_payload(
     return out
 
 
-# Sources excluded from the project tree: cron runs and tool/subagent children
-# are not user conversations. Subagent/compression children are already dropped
-# by list_sessions_rich(include_children=False); cron has its own section.
-_PROJECT_TREE_EXCLUDED_SOURCES = ["cron"]
+# Sources excluded from the project tree: cron runs, and kanban dispatcher
+# workers, are not user conversations. Subagent/compression children are
+# already dropped by list_sessions_rich(include_children=False); cron has its
+# own section, and kanban runs are read on the board.
+_PROJECT_TREE_EXCLUDED_SOURCES = ["cron", "kanban"]
 
 
 def _project_tree_row(r: dict) -> dict:
@@ -11338,6 +11959,55 @@ def _skill_usage_lookup():
         return "local"
 
     return usage, origin
+
+
+_SLASH_COMPLETION_LIMIT = 30
+
+
+def _rank_slash_completions(
+    items: list[dict],
+    usage,
+    origin_of,
+    *,
+    browsing: bool,
+) -> list[dict]:
+    """Rank and bound slash completions the way the menu should read.
+
+    ``usage``/``origin_of`` are the callables :func:`_skill_usage_lookup`
+    returns. Registry commands keep their existing order — only the skill
+    block is reordered, most-used first and A-Z within a tie, so the handful
+    of skills someone invokes daily lead the ones that shipped with Hermes
+    and were never opened.
+
+    The limit is spent PER KIND rather than on one flat truncation. A flat
+    cut is positional, not editorial: the completer emits every registry
+    command before the first skill, so on a 230-skill install a bare ``/``
+    hit the cap while still inside the command block and offered no skill at
+    all, and ``/p`` dropped ``/proving-a-fix-works`` (471 uses) while keeping
+    ``/pretext`` (2).
+
+    ``browsing`` separates the two things a slash means. A bare ``/`` is
+    BROWSING, so bundled skills with no recorded activity are dropped as
+    noise. A typed query is SEARCHING, and a search that hides a match is
+    broken — there nothing is pruned, the ranking only reorders.
+    """
+
+    def name_of(item: dict) -> str:
+        return str(item.get("text", "")).strip().lstrip("/").lower()
+
+    commands = [item for item in items if item.get("kind") != "skill"]
+    skills = [item for item in items if item.get("kind") == "skill"]
+
+    if browsing:
+        skills = [
+            item
+            for item in skills
+            if origin_of(name_of(item)) != "bundled" or usage(name_of(item)) > 0
+        ]
+
+    skills.sort(key=lambda item: (-usage(name_of(item)), name_of(item)))
+
+    return commands[:_SLASH_COMPLETION_LIMIT] + skills[:_SLASH_COMPLETION_LIMIT]
 
 
 def _cli_exec_blocked(argv: list[str]) -> str | None:
@@ -12185,9 +12855,16 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     text_queue: queue.Queue = queue.Queue()
     stop = threading.Event()
     done = threading.Event()
-    threading.Thread(
-        target=stream_tts_to_speaker, args=(text_queue, stop, done), daemon=True
-    ).start()
+    worker = _start_tracked_tui_worker(
+        target=stream_tts_to_speaker,
+        args=(text_queue, stop, done),
+        daemon=True,
+        name="voice-tts-stream",
+    )
+    if worker is None:
+        stop.set()
+        done.set()
+        return None
 
     global _tts_stream_state
     with _tts_stream_lock:
@@ -12259,9 +12936,14 @@ def _arm_full_duplex_listener() -> None:
         if _fd_listener_active:
             return
         _fd_listener_active = True
-    threading.Thread(
-        target=_full_duplex_listener, daemon=True, name="voice-full-duplex"
-    ).start()
+    worker = _start_tracked_tui_worker(
+        target=_full_duplex_listener,
+        daemon=True,
+        name="voice-full-duplex",
+    )
+    if worker is None:
+        with _fd_listener_lock:
+            _fd_listener_active = False
 
 
 def _fd_tts_pending() -> bool:
@@ -12440,7 +13122,16 @@ def _speak_text_with_barge(text: str) -> None:
             with _fd_listener_lock:
                 _fd_speak_pipelines.discard((stop, done))
 
-    threading.Thread(target=_speak, daemon=True).start()
+    worker = _start_tracked_tui_worker(
+        target=_speak,
+        daemon=True,
+        name="voice-tts-fallback",
+    )
+    if worker is None:
+        done.set()
+        with _fd_listener_lock:
+            _fd_speak_pipelines.discard((stop, done))
+        return
     if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
         _arm_full_duplex_listener()
 
@@ -12560,7 +13251,15 @@ def _wake_resume_if_owner(owner: "Transport", *, retry_seconds: float = 15.0,
             with _wake_resume_retry_lock:
                 _wake_resume_retry_active = False
 
-    threading.Thread(target=_retry, daemon=True, name="wake-resume-retry").start()
+    worker = _start_tracked_tui_worker(
+        target=_retry,
+        daemon=True,
+        name="wake-resume-retry",
+    )
+    if worker is None:
+        with _wake_resume_retry_lock:
+            _wake_resume_retry_active = False
+        return False
     return False
 
 
@@ -13086,9 +13785,14 @@ def _(rid, params: dict) -> dict:
         # documented 5026 instead of failing silently in the thread.
         import hermes_cli.voice  # noqa: F401
 
-        threading.Thread(
-            target=_speak_text_with_barge, args=(text,), daemon=True
-        ).start()
+        worker = _start_tracked_tui_worker(
+            target=_speak_text_with_barge,
+            args=(text,),
+            daemon=True,
+            name="voice-tts-rpc",
+        )
+        if worker is None:
+            return _err(rid, 5026, "Hermes update in progress")
         return _ok(rid, {"status": "speaking"})
     except ImportError:
         return _err(rid, 5026, "voice module not available")

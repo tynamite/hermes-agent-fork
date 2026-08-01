@@ -79,6 +79,7 @@ async def test_safe_disconnect_detaches_cancellation_swallowing_disconnect(
     try:
         assert operation in done
         assert "Timed out after 0.0s while disconnecting feishu adapter" in caplog.text
+        assert bare_runner._active_background_work_count() == 1
     finally:
         # The implementation must detach rather than abandon the old task.
         # Release it here so this test leaves no cancellation-swallowing task
@@ -86,3 +87,5 @@ async def test_safe_disconnect_detaches_cancellation_swallowing_disconnect(
         release.set()
         await asyncio.wait({operation}, timeout=0.2)
         await asyncio.wait_for(finished.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+    assert bare_runner._active_background_work_count() == 0
