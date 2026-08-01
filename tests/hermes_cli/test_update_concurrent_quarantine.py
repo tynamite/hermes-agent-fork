@@ -254,6 +254,7 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
                 "argv": ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"],
             }
         ],
+        "unmapped_launcher_pids": [],
     }
     assert waited_for == [101]
     assert terminated == [(202, True)]
@@ -522,7 +523,6 @@ def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
 # ---------------------------------------------------------------------------
 # cmd_update integration — concurrent-instance gate
 # ---------------------------------------------------------------------------
-
 
 
 

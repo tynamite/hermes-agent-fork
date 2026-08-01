@@ -3681,6 +3681,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
                     "profiles": {},
                     "unmapped_pids": [],
                     "unmapped": [],
+                    "unmapped_launcher_pids": [],
                     "cold_start_if_installed": True,
                 }
         except Exception as exc:
@@ -3732,6 +3733,10 @@ def _pause_windows_gateways_for_update() -> dict | None:
         timeout=drain_timeout,
     )
     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
+    # Capture venv-side launcher ancestors before force-killing unmapped
+    # workers, just as for profile-mapped workers above.  The launcher can
+    # outlive its worker and is what the venv-holder guard reports.
+    unmapped_launcher_pids = _m()._venv_launcher_ancestors(unmapped_pids)
 
     # Snapshot each unmapped gateway's command line *before* we force-kill it,
     # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
@@ -3754,7 +3759,12 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # already exited with its drained worker raises ProcessLookupError below
     # and is skipped.
     force_killed = []
-    for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
+    for pid in sorted(
+        set(survivors)
+        .union(unmapped_pids)
+        .union(launcher_pids)
+        .union(unmapped_launcher_pids)
+    ):
         try:
             terminate_pid(int(pid), force=True)
             force_killed.append(int(pid))
@@ -3781,6 +3791,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         "profiles": profiles,
         "unmapped_pids": unmapped_pids,
         "unmapped": unmapped,
+        "unmapped_launcher_pids": unmapped_launcher_pids,
     }
 
 def _cold_start_windows_gateway_after_update() -> None:
@@ -4298,6 +4309,21 @@ def _cmd_update_impl(
                     for pid in (
                         _windows_gateway_resume.get("profiles") or {}
                     ).values()
+                    if str(pid).isdigit()
+                )
+                _verified_gateway_pids.update(
+                    int(entry["pid"])
+                    for entry in (_windows_gateway_resume.get("unmapped") or [])
+                    if isinstance(entry, dict)
+                    and entry.get("argv")
+                    and str(entry.get("pid", "")).isdigit()
+                )
+                _verified_gateway_pids.update(
+                    int(pid)
+                    for pid in (
+                        _windows_gateway_resume.get("unmapped_launcher_pids")
+                        or []
+                    )
                     if str(pid).isdigit()
                 )
                 if _windows_profiles:

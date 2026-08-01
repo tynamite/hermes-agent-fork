@@ -800,6 +800,57 @@ def test_windows_gateway_resume_verifies_profile_launcher(
     assert len(seen) == 2
 
 
+def test_windows_gateway_resume_verifies_unmapped_launcher(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {},
+        "unmapped_pids": [202],
+        "unmapped": [
+            {
+                "pid": 202,
+                "argv": [
+                    "pythonw.exe",
+                    "-m",
+                    "hermes_cli.main",
+                    "gateway",
+                    "run",
+                ],
+            }
+        ],
+        "unmapped_launcher_pids": [303],
+    }
+    seen = []
+
+    def detect(**kwargs):
+        seen.append(kwargs)
+        if len(seen) == 1:
+            return [
+                (
+                    303,
+                    "python.exe",
+                    "python.exe -m hermes_cli.main gateway run",
+                )
+            ]
+        return []
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={303}
+    ), patch("gateway.status.terminate_pid"), patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=True,
+            detector=detect,
+            windows_resume_token=token,
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert len(seen) == 2
+
+
 @pytest.mark.parametrize(
     "quiesce_token",
     [
