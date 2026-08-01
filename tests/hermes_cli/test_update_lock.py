@@ -755,33 +755,26 @@ class TestHandoffFromOrchestratingUpdater:
         assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
 
 
-class TestAncestryHandoff:
-    """Staged updaters older than the HANDOFF_PID_ENV export never send it.
+class TestUnverifiedAncestorHandoff:
+    """A parent PID without an explicit verified handoff remains blocked.
 
-    ``hermes-setup`` under ``~/.hermes`` is only refreshed by a full installer
-    run, so an updated checkout (new lock) driven by a pre-handoff staged
-    updater (old parent) deadlocks on exit 2 forever unless the child also
-    recognizes a live holder that is its own process ancestor.
-
-    ``_pid_alive`` is pinned True here because the hermetic conftest guards
-    ``os.kill`` probes of pids outside the test subtree (our ppid included);
-    liveness has its own coverage above — ancestry is what's under test.
+    The launch gate requires both the declared handoff PID and the actual
+    parent relationship. A coincidental ancestor relationship alone must not
+    grant the lock, because it is not an authenticated updater handoff.
     """
 
     @pytest.fixture(autouse=True)
     def _liveness_pinned_true(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.update_lock._pid_alive", lambda pid: True)
 
-    def test_marker_owned_by_our_parent_process_is_our_orchestrator(self, marker):
+    def test_marker_owned_by_our_parent_without_handoff_is_refused(self, marker, monkeypatch):
+        monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
         marker.write_text(f"{os.getppid()}\n{int(time.time())}\n", encoding="utf-8")
 
         lock = UpdateLock(path=marker)
-        assert lock.acquire() is True, "a live ancestor's claim is the one we run under"
-        assert lock.acquired is False, "the parent's claim is not ours to own"
-
-        lock.release()
-        assert marker.exists(), "the parent still needs its marker after our stage ends"
-        assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getppid()
+        assert lock.acquire() is False
+        assert lock.holder is not None
+        assert lock.holder.pid == os.getppid()
 
     def test_live_non_ancestor_holder_is_still_refused(self, marker):
         """Ancestry must not open the lock to unrelated concurrent updaters."""

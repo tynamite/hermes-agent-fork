@@ -837,7 +837,10 @@ def test_venv_holder_guard_does_not_exclude_unquiesced_gateway_supervisor(
         )
 
     assert result == "exit_2", capsys.readouterr().out
-    assert seen == [set()]
+    # The first scan must not exclude the unquiesced supervisor. If it is
+    # identified as a leftover gateway, the updater terminates it and performs
+    # one final unexcluded scan before refusing the update.
+    assert seen == [set(), None]
 
 
 def test_venv_holder_guard_rejects_non_ancestor_supervisor(monkeypatch, capsys):
