@@ -24,6 +24,7 @@ import {
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
+  spawnUpdaterWithMarker,
   UPDATE_MARKER_MAX_AGE_MS,
   writeUpdateMarker
 } from './update-marker'
@@ -196,6 +197,42 @@ test('writeUpdateMarker replaces a stale existing claim before releasing the sid
     !fs.existsSync(path.join(home, '.hermes-update-in-progress.lock')),
     'the replacement claim is published before releasing the sidecar'
   )
+})
+
+test('spawnUpdaterWithMarker refuses a foreign live claim before spawning', () => {
+  const home = tmpHome('spawn-foreign-claim')
+  const now = 1_000_000_000_000
+  writeMarker(home, process.pid, Math.floor(now / 1000) - 5)
+  let spawned = false
+
+  const child = spawnUpdaterWithMarker(
+    home,
+    () => {
+      spawned = true
+
+      return { pid: 4242, kill: () => true }
+    },
+    { now: () => now }
+  )
+
+  assert.equal(child, null)
+  assert.equal(spawned, false)
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8'), `${process.pid}\n${Math.floor(now / 1000) - 5}`)
+})
+
+test('spawnUpdaterWithMarker publishes the child claim before releasing the sidecar', () => {
+  const home = tmpHome('spawn-and-claim')
+  const now = 1_000_000_000_000
+
+  const child = spawnUpdaterWithMarker(
+    home,
+    () => ({ pid: 4242, kill: () => true }),
+    { now: () => now }
+  )
+
+  assert.ok(child)
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8'), `4242\n${Math.floor(now / 1000)}\n`)
+  assert.ok(!fs.existsSync(path.join(home, '.hermes-update-in-progress.lock')))
 })
 
 test('writeUpdateMarker reclaims a crashed marker-operation lock', () => {

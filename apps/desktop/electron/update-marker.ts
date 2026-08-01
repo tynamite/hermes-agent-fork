@@ -343,7 +343,7 @@ function publishOrReplaceMarkerLocked(file, body, now = Date.now) {
     try {
       publishExclusive(file, body)
 
-      return
+      return true
     } catch (err) {
       if (!err || err.code !== 'EEXIST') {
         throw err
@@ -370,7 +370,7 @@ function publishOrReplaceMarkerLocked(file, body, now = Date.now) {
       isPidAlive(existingPid) &&
       ageMs <= UPDATE_MARKER_MAX_AGE_MS
     ) {
-      return
+      return false
     }
 
     // The sidecar is held by the caller, so compare-and-delete the stale
@@ -383,6 +383,76 @@ function publishOrReplaceMarkerLocked(file, body, now = Date.now) {
   // Preserve the historical best-effort contract if a racing writer keeps
   // the path occupied; the caller will leave the existing claim untouched.
   throw Object.assign(new Error('could not publish update marker'), { code: 'EEXIST' })
+}
+
+function hasLiveMarkerClaimLocked(file, now) {
+  let raw
+
+  try {
+    raw = fs.readFileSync(file, 'utf8')
+  } catch {
+    return false
+  }
+
+  const [pidLine, startedLine] = String(raw).split('\n')
+  const pid = Number.parseInt((pidLine || '').trim(), 10)
+  const startedAt = Number.parseInt((startedLine || '').trim(), 10)
+  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
+
+  return Number.isInteger(pid) && isPidAlive(pid) && ageMs <= UPDATE_MARKER_MAX_AGE_MS
+}
+
+/**
+ * Spawn an updater only while holding the shared sidecar, and publish its
+ * child PID before releasing that sidecar. A live foreign marker prevents the
+ * spawn entirely; if a legacy writer races the claim, the child is terminated
+ * before this helper returns.
+ */
+export function spawnUpdaterWithMarker(hermesHome, spawn, { now = Date.now } = {}) {
+  const file = markerPath(hermesHome)
+  let child
+  let returned = false
+
+  try {
+    const result = withMarkerOperationLock(file, () => {
+      if (hasLiveMarkerClaimLocked(file, now)) {
+        return null
+      }
+
+      child = spawn()
+
+      if (!child || !Number.isInteger(child.pid) || child.pid <= 0) {
+        return null
+      }
+
+      const startedAt = Math.floor(now() / 1000)
+
+      if (!publishOrReplaceMarkerLocked(file, `${child.pid}\n${startedAt}\n`, now)) {
+        return null
+      }
+
+      return child
+    })
+
+    if (result.acquired && result.value) {
+      returned = true
+
+      return result.value
+    }
+  } catch {
+    // Handoff callers fail closed when the shared claim cannot be acquired or
+    // published; an unmarked detached updater must never mutate the checkout.
+  } finally {
+    if (!returned && child && typeof child.kill === 'function') {
+      try {
+        child.kill()
+      } catch {
+        void 0
+      }
+    }
+  }
+
+  return null
 }
 
 // True only if a host process with this pid is currently alive. Signal 0 does
