@@ -755,6 +755,51 @@ def test_windows_gateway_resume_verifies_profile_replacement(
     assert len(seen) == 2
 
 
+def test_windows_gateway_resume_verifies_profile_launcher(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {"work": 101},
+        "unmapped": [],
+    }
+    seen = []
+
+    def detect(**kwargs):
+        seen.append(kwargs)
+        if len(seen) == 1:
+            # The profile map records the worker, while the venv guard sees
+            # its distinct launcher parent (PID 303).
+            return [
+                (
+                    303,
+                    "python.exe",
+                    "python.exe -m hermes_cli.main gateway run",
+                )
+            ]
+        return []
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={303}
+    ), patch.object(
+        cli_main, "_venv_launcher_ancestors", return_value=[303]
+    ), patch("gateway.status.terminate_pid"), patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=True,
+            detector=detect,
+            windows_resume_token=token,
+            profile_gateways=[
+                SimpleNamespace(profile="work", path="C:/hermes", pid=202)
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert len(seen) == 2
+
+
 @pytest.mark.parametrize(
     "quiesce_token",
     [

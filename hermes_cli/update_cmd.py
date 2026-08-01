@@ -4315,6 +4315,19 @@ def _cmd_update_impl(
                             "Could not refresh Windows profile gateway identities",
                             exc_info=True,
                         )
+                if _verified_gateway_pids:
+                    try:
+                        _verified_gateway_pids.update(
+                            int(pid)
+                            for pid in _m()._venv_launcher_ancestors(
+                                sorted(_verified_gateway_pids)
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not refresh Windows gateway launcher identities",
+                            exc_info=True,
+                        )
 
             _raw_supervisor_pid = os.environ.get(
                 "_HERMES_UPDATE_SUPERVISOR_PID", ""
