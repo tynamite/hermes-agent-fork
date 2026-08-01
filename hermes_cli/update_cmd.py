@@ -237,7 +237,12 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
-        probe_env = os.environ.copy()
+        from tools.environments.local import build_subprocess_env
+
+        probe_env = build_subprocess_env(
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
         # The bootstrap launch gate sees the live marker held by this updater.
         # Attest the probe as our direct child so its intentional imports are
         # admitted without weakening the gate for arbitrary ``python -c``
