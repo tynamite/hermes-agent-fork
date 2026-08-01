@@ -2832,7 +2832,9 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     return True, ""
 
 def _detect_venv_python_processes(
-    *, exclude_pids: set[int] | None = None
+    *,
+    exclude_pids: set[int] | None = None,
+    exclude_process_start_times: dict[int, int] | None = None,
 ) -> list[tuple[int, str, str]]:
     """Find live processes running from the project venv's interpreter.
 
@@ -2845,8 +2847,10 @@ def _detect_venv_python_processes(
     ``Process.exe()`` alone is insufficient there. Inspect only ``argv[0]`` as
     the launcher path; never scan arbitrary arguments, which may merely mention
     the venv. Returns ``(pid, name, cmdline)`` tuples. The calling process is
-    always excluded; Windows also excludes its launcher ancestors. Never
-    raises.
+    always excluded; Windows also excludes its launcher ancestors. A PID
+    exclusion with a recorded process start time is honored only while that
+    same process identity is still live, so a replacement process that reuses
+    a quiesced gateway PID remains visible. Never raises.
     """
     is_windows = _m()._is_windows()
     try:
@@ -2886,6 +2890,17 @@ def _detect_venv_python_processes(
             root_prefix = str(_m().PROJECT_ROOT).lower().rstrip(os.sep) + os.sep
 
     skip: set[int] = set(exclude_pids or set())
+    expected_start_times = {
+        int(pid): int(start_time)
+        for pid, start_time in (exclude_process_start_times or {}).items()
+    }
+    get_process_start_time: Callable[[int], int | None] | None = None
+    try:
+        from gateway.status import get_process_start_time as _get_process_start_time
+
+        get_process_start_time = _get_process_start_time
+    except Exception:
+        pass
     skip.add(os.getpid())
     if is_windows:
         try:
@@ -2914,8 +2929,23 @@ def _detect_venv_python_processes(
             continue
         pid = info.get("pid")
         exe = info.get("exe")
-        if pid is None or int(pid) in skip:
+        if pid is None:
             continue
+        pid = int(pid)
+        if pid in skip:
+            expected_start_time = expected_start_times.get(pid)
+            if expected_start_time is None:
+                continue
+            try:
+                current_start_time = (
+                    get_process_start_time(pid)
+                    if get_process_start_time is not None
+                    else None
+                )
+            except Exception:
+                current_start_time = None
+            if current_start_time == expected_start_time:
+                continue
         cmdline = info.get("cmdline") or []
         cmdline_raw = " ".join(cmdline)
         exe_raw = str(exe or "")
@@ -4128,6 +4158,7 @@ def _cmd_update_impl(
     # explicit --force-venv escape hatch skips this coherence boundary.
     _posix_gateway_quiesce = None
     _profile_gateway_pids: set[int] = set()
+    _quiesced_gateway_start_times: dict[int, int] = {}
     _supervisor_pid = 0
     if not getattr(args, "force_venv", False):
         _venv_guard_exclude: set[int] = set()
@@ -4153,6 +4184,14 @@ def _cmd_update_impl(
                 _quiesced_gateway_pids = set(
                     (_posix_gateway_quiesce or {}).get("pids", set())
                 )
+                _quiesced_gateway_start_times = {
+                    int(pid): int(start_time)
+                    for pid, start_time in (
+                        (_posix_gateway_quiesce or {}).get(
+                            "process_start_times", {}
+                        )
+                    ).items()
+                }
                 if (
                     _profile_gateway_pids
                     and not _profile_gateway_pids.issubset(
@@ -4225,9 +4264,16 @@ def _cmd_update_impl(
                 _quiesced_gateway_pids
             )
             _quiesced_gateway_pids.clear()
-        _venv_holders = _m()._detect_venv_python_processes(
-            exclude_pids=_venv_guard_exclude
-        )
+            _quiesced_gateway_start_times.clear()
+        if _quiesced_gateway_start_times:
+            _venv_holders = _m()._detect_venv_python_processes(
+                exclude_pids=_venv_guard_exclude,
+                exclude_process_start_times=_quiesced_gateway_start_times,
+            )
+        else:
+            _venv_holders = _m()._detect_venv_python_processes(
+                exclude_pids=_venv_guard_exclude
+            )
         if _venv_holders:
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:

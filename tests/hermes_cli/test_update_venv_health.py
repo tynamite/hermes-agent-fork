@@ -395,6 +395,30 @@ def test_detect_venv_python_posix_excludes_only_self(_winp, tmp_path):
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_does_not_hide_reused_quiesced_gateway_pid(
+    _winp, tmp_path
+):
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    proc = _proc(555, "/usr/bin/python3", "python3", [venv_py, "worker"])
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ), patch(
+        "gateway.status.get_process_start_time", return_value=222
+    ):
+        matches = cli_main._detect_venv_python_processes(
+            exclude_pids={555},
+            exclude_process_start_times={555: 111},
+        )
+
+    assert [match[0] for match in matches] == [555]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
 def test_detect_venv_python_process_iteration_error_is_empty(_winp, tmp_path):
     def denied_process_iter(_attrs):
         raise PermissionError("process table denied")
@@ -592,6 +616,36 @@ def test_direct_posix_update_quiesces_mapped_gateways_without_supervisor(
     assert result == "past_guard", capsys.readouterr().out
     quiesce.assert_called_once_with({666})
     assert seen_holders == [{666}]
+
+
+def test_direct_posix_update_passes_gateway_identity_to_venv_guard(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    seen = []
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [],
+    }
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        # Model a replacement process that reused the quiesced gateway PID.
+        return [(555, "python", "venv/bin/python -m replacement")]
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+        detector=detect,
+        quiesce=MagicMock(return_value=token),
+        profile_gateways=[
+            SimpleNamespace(profile="default", path="/tmp/hermes", pid=555)
+        ],
+    )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
 
 
 @pytest.mark.parametrize(
