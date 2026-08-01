@@ -110,6 +110,39 @@ function markerOperationLockPath(file) {
   return path.join(path.dirname(file), '.hermes-update-in-progress.lock')
 }
 
+function isPidZombie(pid) {
+  if (process.platform === 'win32') {
+    return false
+  }
+
+  if (process.platform === 'linux') {
+    try {
+      const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const fields = raw.slice(raw.lastIndexOf(')') + 1).trim().split(/\s+/)
+
+      return fields[0] === 'Z'
+    } catch {
+      return false
+    }
+  }
+
+  try {
+    const output = execFileSync(
+      'ps',
+      ['-o', 'state=', '-p', String(pid)],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, LC_ALL: 'C' },
+        stdio: ['ignore', 'pipe', 'ignore']
+      }
+    )
+
+    return output.trim().startsWith('Z')
+  } catch {
+    return false
+  }
+}
+
 function reapStaleMarkerOperationLock(lockDir) {
   const ownerFile = path.join(lockDir, 'owner')
   let ownerPid = null
@@ -305,12 +338,63 @@ function reclaimStaleMarker(file, expectedRaw) {
   }
 }
 
+function publishOrReplaceMarkerLocked(file, body, now = Date.now) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      publishExclusive(file, body)
+
+      return
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') {
+        throw err
+      }
+    }
+
+    let existingRaw
+
+    try {
+      existingRaw = fs.readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+
+    const [pidLine, startedLine] = String(existingRaw).split('\n')
+    const existingPid = Number.parseInt((pidLine || '').trim(), 10)
+    const startedAt = Number.parseInt((startedLine || '').trim(), 10)
+    const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
+
+    // A live, fresh claim belongs to another updater (or to a handoff that
+    // already published the child pid). Preserve it instead of clobbering it.
+    if (
+      Number.isInteger(existingPid) &&
+      isPidAlive(existingPid) &&
+      ageMs <= UPDATE_MARKER_MAX_AGE_MS
+    ) {
+      return
+    }
+
+    // The sidecar is held by the caller, so compare-and-delete the stale
+    // contents and retry exclusive publication before releasing the sidecar.
+    if (!reclaimStaleMarkerLocked(file, existingRaw)) {
+      continue
+    }
+  }
+
+  // Preserve the historical best-effort contract if a racing writer keeps
+  // the path occupied; the caller will leave the existing claim untouched.
+  throw Object.assign(new Error('could not publish update marker'), { code: 'EEXIST' })
+}
+
 // True only if a host process with this pid is currently alive. Signal 0 does
 // not deliver a signal — it just probes existence/permission. ESRCH => dead;
 // EPERM => alive but owned by another user (still "alive" for our purposes).
 // Injectable `kill` keeps it unit-testable.
 export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(process)) {
   if (!Number.isInteger(pid) || pid <= 0) {
+    return false
+  }
+
+  if (isPidZombie(pid)) {
     return false
   }
 
@@ -450,7 +534,7 @@ export function writeUpdateMarker(hermesHome, pid, { now = Date.now } = {}) {
       // Publish with an exclusive create while the sidecar is held. Readers
       // treat that sidecar as an active operation until the complete body is
       // written, so no hard-link capability is required.
-      publishExclusive(file, `${pid}\n${startedAt}\n`)
+      publishOrReplaceMarkerLocked(file, `${pid}\n${startedAt}\n`, now)
     })
   } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The

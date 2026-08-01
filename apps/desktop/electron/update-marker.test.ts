@@ -174,13 +174,27 @@ test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () =
 test('writeUpdateMarker never overwrites an existing claim', () => {
   const home = tmpHome('write-existing')
   const now = 1_000_000_000_000
-  writeMarker(home, 1111, Math.floor(now / 1000) - 5)
+  writeMarker(home, process.pid, Math.floor(now / 1000) - 5)
 
   writeUpdateMarker(home, 2222, { now: () => now })
 
   assert.equal(
     fs.readFileSync(markerPath(home), 'utf8'),
-    `1111\n${Math.floor(now / 1000) - 5}`
+    `${process.pid}\n${Math.floor(now / 1000) - 5}`
+  )
+})
+
+test('writeUpdateMarker replaces a stale existing claim before releasing the sidecar', () => {
+  const home = tmpHome('write-replace-stale')
+  const now = 1_000_000_000_000
+  writeMarker(home, 999999, Math.floor(now / 1000) - 5)
+
+  writeUpdateMarker(home, 2222, { now: () => now })
+
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8'), `2222\n${Math.floor(now / 1000)}\n`)
+  assert.ok(
+    !fs.existsSync(path.join(home, '.hermes-update-in-progress.lock')),
+    'the replacement claim is published before releasing the sidecar'
   )
 })
 

@@ -450,6 +450,34 @@ fn write_marker_exclusive(path: &Path, body: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn pid_is_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some((_command, fields)) = raw.rsplit_once(')') {
+                return fields.split_whitespace().next() == Some("Z");
+            }
+        }
+        return false;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p"])
+            .arg(pid.to_string())
+            .output()
+        else {
+            return false;
+        };
+        return output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z');
+    }
+}
+
 /// True when a process with `pid` currently exists.
 #[cfg(windows)]
 fn pid_is_alive(pid: u32) -> bool {
@@ -475,6 +503,9 @@ fn pid_is_alive(pid: u32) -> bool {
 
 #[cfg(not(windows))]
 fn pid_is_alive(pid: u32) -> bool {
+    if pid_is_zombie(pid) {
+        return false;
+    }
     // signal 0 delivers nothing; it only probes existence/permission.
     // ESRCH => dead. EPERM => alive but owned by another user.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
