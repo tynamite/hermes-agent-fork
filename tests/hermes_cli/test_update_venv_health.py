@@ -510,6 +510,8 @@ def _run_update_until_guard(
     quiesce=None,
     release=None,
     profile_gateways=(),
+    windows_resume_token=None,
+    authorize_runtime_restarts=None,
 ):
     """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
 
@@ -538,7 +540,9 @@ def _run_update_until_guard(
     with patch.object(cli_main, "_is_windows", return_value=is_windows), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
     ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
-        cli_main, "_pause_windows_gateways_for_update", return_value=None
+        cli_main,
+        "_pause_windows_gateways_for_update",
+        return_value=windows_resume_token,
     ), patch.object(
         cli_main, "_resume_windows_gateways_after_update"
     ), patch.object(
@@ -558,9 +562,13 @@ def _run_update_until_guard(
     ), patch(
         "hermes_cli.gateway.find_profile_gateway_processes",
         return_value=list(profile_gateways),
-    ):
+    ), patch("atexit.register"):
         try:
-            cli_main._cmd_update_impl(args, gateway_mode=False)
+            cli_main._cmd_update_impl(
+                args,
+                gateway_mode=False,
+                authorize_runtime_restarts=authorize_runtime_restarts,
+            )
         except _PastGuard:
             return "past_guard"
         except SystemExit as exc:
@@ -646,6 +654,66 @@ def test_direct_posix_update_passes_gateway_identity_to_venv_guard(
 
     assert result == "exit_2", capsys.readouterr().out
     assert seen == [({555}, {555: 111})]
+
+
+def test_venv_holder_recheck_preserves_gateway_exclusions(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    seen = []
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [],
+    }
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        if len(seen) == 1:
+            # A separate gateway holder remains after the verified gateway
+            # identity (PID 555) was excluded from the first scan.
+            return [(777, "python", "venv/bin/python -m hermes_cli.main gateway run")]
+        # The leftover was stopped; the verified gateway must stay excluded.
+        return []
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={777}
+    ), patch("gateway.status.terminate_pid"), patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce=MagicMock(return_value=token),
+            profile_gateways=[
+                SimpleNamespace(profile="default", path="/tmp/hermes", pid=555)
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [({555}, {555: 111}), ({555}, {555: 111})]
+
+
+def test_windows_gateway_resume_is_authorized_before_venv_abort(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {},
+        "unmapped": [],
+    }
+    authorize = MagicMock(return_value=True)
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=True,
+        windows_resume_token=token,
+        authorize_runtime_restarts=authorize,
+    )
+
+    assert result == "exit_2", capsys.readouterr().out
+    authorize.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -990,8 +1058,9 @@ def test_venv_holder_guard_does_not_exclude_unquiesced_gateway_supervisor(
     assert result == "exit_2", capsys.readouterr().out
     # The first scan must not exclude the unquiesced supervisor. If it is
     # identified as a leftover gateway, the updater terminates it and performs
-    # one final unexcluded scan before refusing the update.
-    assert seen == [set(), None]
+    # one final scan with the same exclusion contract before refusing the
+    # update.
+    assert seen == [set(), set()]
 
 
 def test_venv_holder_guard_rejects_non_ancestor_supervisor(monkeypatch, capsys):

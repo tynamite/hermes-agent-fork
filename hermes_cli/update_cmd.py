@@ -4118,6 +4118,42 @@ def _cmd_update_impl(
     )
     assume_yes = bool(getattr(args, "yes", False))
 
+    # A Windows gateway paused at the start of the update must not be resumed
+    # while the install marker is still in its mutation phase: the restarted
+    # child would be rejected by the launch gate.  Keep authorization and
+    # resume coupled for every early-return path (venv-holder abort, ZIP
+    # fallback, no-op/repair, and the normal completion path).  If the marker
+    # cannot be authorized, leave the token for the atexit callback; the
+    # outer ``cmd_update`` releases the marker before that callback runs.
+    _runtime_restarts_authorized = False
+
+    def _authorize_runtime_restarts_once() -> bool:
+        nonlocal _runtime_restarts_authorized
+        if _runtime_restarts_authorized or authorize_runtime_restarts is None:
+            return True
+        try:
+            authorized = bool(authorize_runtime_restarts())
+        except Exception:
+            logger.debug(
+                "Could not authorize Windows gateway resumes",
+                exc_info=True,
+            )
+            return False
+        if authorized:
+            _runtime_restarts_authorized = True
+        return authorized
+
+    def _resume_windows_gateways_for_update(token: dict | None) -> bool:
+        if token and token.get("resume_needed"):
+            if not _authorize_runtime_restarts_once():
+                logger.warning(
+                    "Deferring Windows gateway resume until the update marker "
+                    "is released because runtime restart authorization failed"
+                )
+                return False
+        _m()._resume_windows_gateways_after_update(token)
+        return True
+
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
     # only non-interactive updates (desktop/chat app, gateway, `--yes`) consult
@@ -4168,7 +4204,7 @@ def _cmd_update_impl(
         import atexit as _atexit
 
         _atexit.register(
-            _m()._resume_windows_gateways_after_update,
+            _resume_windows_gateways_for_update,
             _windows_gateway_resume,
         )
 
@@ -4351,11 +4387,19 @@ def _cmd_update_impl(
                             "Could not stop leftover gateway %s: %s", _pid, exc
                         )
                 _time.sleep(1.0)
-                _venv_holders = _m()._detect_venv_python_processes()
+                if _quiesced_gateway_start_times:
+                    _venv_holders = _m()._detect_venv_python_processes(
+                        exclude_pids=_venv_guard_exclude,
+                        exclude_process_start_times=_quiesced_gateway_start_times,
+                    )
+                else:
+                    _venv_holders = _m()._detect_venv_python_processes(
+                        exclude_pids=_venv_guard_exclude
+                    )
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
             _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            _resume_windows_gateways_for_update(_windows_gateway_resume)
             sys.exit(2)
 
     # Try git-based update first, fall back to ZIP download on Windows
@@ -4422,7 +4466,7 @@ def _cmd_update_impl(
         try:
             _update_via_zip(args)
         finally:
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            _resume_windows_gateways_for_update(_windows_gateway_resume)
         return
 
     # Fetch and pull
@@ -4751,15 +4795,13 @@ def _cmd_update_impl(
                             )
                         except OSError:
                             pass
-                    _m()._resume_windows_gateways_after_update(
-                        _windows_gateway_resume
-                    )
+                    _resume_windows_gateways_for_update(_windows_gateway_resume)
                     sys.exit(1)
             else:
                 _m()._release_posix_gateway_quiesce(
                     _posix_gateway_quiesce
                 )
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            _resume_windows_gateways_for_update(_windows_gateway_resume)
             return
 
         print(f"→ Found {commit_count} new commit(s)")
@@ -5553,10 +5595,7 @@ def _cmd_update_impl(
             except OSError:
                 pass
 
-        if (
-            authorize_runtime_restarts is not None
-            and not authorize_runtime_restarts()
-        ):
+        if not _authorize_runtime_restarts_once():
             if gateway_mode:
                 try:
                     (get_hermes_home() / ".update_exit_code").write_text(
@@ -6315,7 +6354,7 @@ def _cmd_update_impl(
                     _exit_code_path.write_text("1", encoding="utf-8")
                 except OSError:
                     pass
-        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        _resume_windows_gateways_for_update(_windows_gateway_resume)
 
         # Warn if legacy Hermes gateway unit files are still installed.
         # When both hermes.service (from a pre-rename install) and the
