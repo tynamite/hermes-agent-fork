@@ -670,14 +670,14 @@ def test_venv_holder_recheck_preserves_gateway_exclusions(
     def detect(*, exclude_pids=None, exclude_process_start_times=None):
         seen.append((exclude_pids, exclude_process_start_times))
         if len(seen) == 1:
-            # A separate gateway holder remains after the verified gateway
-            # identity (PID 555) was excluded from the first scan.
-            return [(777, "python", "venv/bin/python -m hermes_cli.main gateway run")]
+            # PID 555 was reused by a replacement gateway after the verified
+            # pre-drain identity (start time 111) was excluded.
+            return [(555, "python", "venv/bin/python -m hermes_cli.main gateway run")]
         # The leftover was stopped; the verified gateway must stay excluded.
         return []
 
     with patch.object(
-        cli_main, "_leftover_pausable_gateway_pids", return_value={777}
+        cli_main, "_leftover_pausable_gateway_pids", return_value={555}
     ), patch("gateway.status.terminate_pid"), patch(
         "hermes_cli.update_cmd._time.sleep"
     ):
@@ -1056,11 +1056,10 @@ def test_venv_holder_guard_does_not_exclude_unquiesced_gateway_supervisor(
         )
 
     assert result == "exit_2", capsys.readouterr().out
-    # The first scan must not exclude the unquiesced supervisor. If it is
-    # identified as a leftover gateway, the updater terminates it and performs
-    # one final scan with the same exclusion contract before refusing the
-    # update.
-    assert seen == [set(), set()]
+    # The first scan must not exclude the unquiesced supervisor. Because it is
+    # outside the verified profile fleet, the updater refuses without
+    # terminating it or performing a second scan.
+    assert seen == [set()]
 
 
 def test_venv_holder_guard_rejects_non_ancestor_supervisor(monkeypatch, capsys):

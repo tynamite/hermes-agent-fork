@@ -4367,6 +4367,27 @@ def _cmd_update_impl(
         if _venv_holders:
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:
+                _unmapped_gateway_holders = sorted(
+                    set(_gateway_holders) - _profile_gateway_pids
+                )
+                if _unmapped_gateway_holders:
+                    # The updater has no quiesce token or restart
+                    # specification for a gateway outside the verified
+                    # profile fleet.  Refuse rather than terminating it and
+                    # leaving the user's manual/custom-home gateway down.
+                    print(
+                        "✗ A gateway outside the verified profile fleet still "
+                        "holds the Hermes venv."
+                    )
+                    print(
+                        "  Refusing to stop it automatically; stop that "
+                        "gateway, then re-run: hermes update"
+                    )
+                    _m()._release_posix_gateway_quiesce(
+                        _posix_gateway_quiesce
+                    )
+                    _resume_windows_gateways_for_update(_windows_gateway_resume)
+                    sys.exit(2)
                 # Every remaining holder is a gateway the pause machinery
                 # already owns — respawned by its supervisor inside the
                 # pause→guard window, or up through a spawn path discovery
