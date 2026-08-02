@@ -1881,6 +1881,27 @@ def test_systemd_restart_target_maps_profile_when_main_pid_lookup_fails(
     ) == {666}
 
 
+def test_systemd_restart_target_maps_rotated_main_pid_to_owned_marker(
+    monkeypatch,
+):
+    from hermes_cli import update_cmd
+
+    token = {
+        "created_markers": [
+            {"pid": 555, "home": "/hermes/profiles/coder"},
+        ]
+    }
+    monkeypatch.setattr(
+        update_cmd,
+        "_gateway_service_suffix_for_home",
+        lambda _home: "coder",
+    )
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "hermes-gateway-coder.service", 777, token
+    ) == {555}
+
+
 def test_systemd_restart_target_fails_closed_for_multiple_unmapped_markers():
     from hermes_cli import update_cmd
 

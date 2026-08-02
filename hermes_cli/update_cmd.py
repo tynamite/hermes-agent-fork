@@ -3675,9 +3675,6 @@ def _gateway_pids_for_systemd_unit(
         parsed_main_pid = int(main_pid)
     except (TypeError, ValueError):
         parsed_main_pid = 0
-    if parsed_main_pid > 0:
-        return {parsed_main_pid}
-
     markers = list((token or {}).get("created_markers", []))
     marker_pids: set[int] = set()
     marker_homes: dict[int, object] = {}
@@ -3728,6 +3725,15 @@ def _gateway_pids_for_systemd_unit(
         if mapped:
             return mapped
 
+    if parsed_main_pid > 0 and parsed_main_pid in marker_pids:
+        return {parsed_main_pid}
+    # A replaced service has no MainPID that matches the updater snapshot. If
+    # this unit is the only owned marker left, that marker is still the only
+    # safe drain to release before the cgroup restart.
+    if suffix is not None and parsed_main_pid > 0 and len(marker_pids) == 1:
+        return marker_pids
+    if parsed_main_pid > 0:
+        return {parsed_main_pid}
     if len(marker_pids) == 1:
         return marker_pids
     return set()

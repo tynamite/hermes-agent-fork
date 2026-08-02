@@ -781,6 +781,22 @@ def test_live_reclaimer_sentinel_blocks_a_second_reaper(marker):
     assert operation_lock.exists()
 
 
+def test_reclaimer_claims_use_new_immutable_generations(marker, monkeypatch):
+    from hermes_cli import update_lock
+
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    legacy_claim = operation_lock / update_lock.MARKER_OPERATION_RECLAIMER_NAME
+    legacy_claim.write_text(f"{DEAD_PID}\n", encoding="utf-8")
+    monkeypatch.setattr(update_lock, "_pid_alive", lambda _pid: False)
+
+    first = update_lock._acquire_marker_reclaimer(operation_lock)
+
+    assert first is not None
+    assert first.name == f"{update_lock.MARKER_OPERATION_RECLAIMER_PREFIX}1"
+    assert legacy_claim.exists(), "stale generations are never unlinked or reused"
+
+
 def test_live_operation_sidecar_blocks_readers_before_marker_is_published(marker):
     operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
     operation_lock.mkdir()

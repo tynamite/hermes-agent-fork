@@ -9,8 +9,9 @@
  * lines.
  * A short-lived `.hermes-update-in-progress.lock` sidecar serializes stale-
  * marker cleanup with replacement claims across the Python, Rust, and Electron
- * writers. Stale cleanup first claims an exclusive `.reclaimer` sentinel inside
- * that sidecar, so a delayed reaper cannot detach a replacement generation.
+ * writers. Stale cleanup first claims an immutable, monotonically numbered
+ * `.reclaimer-N` generation inside that sidecar, so a delayed reaper cannot
+ * unlink a replacement claim at a reused path.
  * Its owner file also carries a process-start identity, so a suspended live
  * updater remains authoritative without trusting a recycled PID.
  *
@@ -39,6 +40,7 @@ import path from 'path'
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 const MARKER_OPERATION_LOCK_STALE_MS = 30 * 1000
 const MARKER_OPERATION_RECLAIMER_NAME = '.reclaimer'
+const MARKER_OPERATION_RECLAIMER_PREFIX = '.reclaimer-'
 
 /**
  * Return a stable per-process start identity when the host exposes one.
@@ -161,15 +163,99 @@ function isPidZombie(pid) {
   }
 }
 
-function markerReclaimerPath(lockDir) {
-  return path.join(lockDir, MARKER_OPERATION_RECLAIMER_NAME)
+function markerReclaimerGeneration(fileName) {
+  if (fileName === MARKER_OPERATION_RECLAIMER_NAME) {
+    return 0
+  }
+
+  if (!fileName.startsWith(MARKER_OPERATION_RECLAIMER_PREFIX)) {
+    return null
+  }
+
+  const suffix = fileName.slice(MARKER_OPERATION_RECLAIMER_PREFIX.length)
+
+  if (!/^\d+$/.test(suffix)) {
+    return null
+  }
+
+  const generation = Number.parseInt(suffix, 10)
+
+  return Number.isSafeInteger(generation) ? generation : null
 }
 
-function acquireMarkerReclaimer(reclaimerPath) {
+function markerReclaimerIsLive(reclaimerPath) {
+  let stat
+
+  try {
+    stat = fs.statSync(reclaimerPath)
+  } catch (err) {
+    return err && err.code === 'ENOENT' ? false : true
+  }
+
+  const ageMs = Math.max(0, Date.now() - stat.mtimeMs)
+  let ownerPid = null
+  let ownerIdentity = null
+
+  try {
+    const [pidLine, , identityLine] = fs.readFileSync(reclaimerPath, 'utf8').split('\n')
+    const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
+    ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+    ownerIdentity = (identityLine || '').trim() || null
+  } catch {
+    // A partially-published claim is live for the short stale window.
+  }
+
+  if (ownerPid !== null && isPidAlive(ownerPid)) {
+    if (ownerIdentity) {
+      const currentIdentity = getProcessStartIdentity(ownerPid)
+
+      return currentIdentity === null || currentIdentity === ownerIdentity
+    }
+
+    // Without an identity, a live reclaimer may be suspended past the age
+    // ceiling. Keep it authoritative; never unlink a live claim by age.
+    return true
+  }
+
+  return ownerPid === null && ageMs < MARKER_OPERATION_LOCK_STALE_MS
+}
+
+function acquireMarkerReclaimer(lockDir) {
   const identity = getProcessStartIdentity(process.pid) || ''
   const body = `${process.pid}\n${Math.floor(Date.now() / 1000)}\n${identity}\n${randomUUID()}\n`
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    let claims
+
+    try {
+      claims = fs
+        .readdirSync(lockDir, { withFileTypes: true })
+        .map((entry) => {
+          const generation = markerReclaimerGeneration(entry.name)
+
+          return generation === null
+            ? null
+            : { generation, path: path.join(lockDir, entry.name) }
+        })
+        .filter(Boolean)
+    } catch {
+      return null
+    }
+
+    if (claims.some((claim) => markerReclaimerIsLive(claim.path))) {
+      return null
+    }
+
+    const nextGeneration = claims.reduce(
+      (max, claim) => Math.max(max, claim.generation),
+      0
+    ) + 1
+
+    const reclaimerPath = path.join(
+      lockDir,
+      `${MARKER_OPERATION_RECLAIMER_PREFIX}${nextGeneration}`
+    )
+
     try {
       fs.writeFileSync(reclaimerPath, body, {
         encoding: 'utf8',
@@ -177,81 +263,44 @@ function acquireMarkerReclaimer(reclaimerPath) {
         mode: 0o644
       })
 
-      return body
+      return reclaimerPath
     } catch (err) {
       if (!err || err.code !== 'EEXIST') {
         return null
       }
-    }
-
-    let stat
-
-    try {
-      stat = fs.statSync(reclaimerPath)
-    } catch (err) {
-      if (err && err.code === 'ENOENT') {
-        continue
-      }
-
-      return null
-    }
-
-    const ageMs = Math.max(0, Date.now() - stat.mtimeMs)
-    let ownerPid = null
-    let ownerIdentity = null
-
-    try {
-      const [pidLine, , identityLine] = fs.readFileSync(reclaimerPath, 'utf8').split('\n')
-      const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
-      ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
-      ownerIdentity = (identityLine || '').trim() || null
-    } catch {
-      // A partially-published sentinel is live for the short stale window.
-    }
-
-    let live = false
-
-    if (ownerPid !== null && isPidAlive(ownerPid)) {
-      if (ownerIdentity) {
-        const currentIdentity = getProcessStartIdentity(ownerPid)
-        live = currentIdentity === null || currentIdentity === ownerIdentity
-      } else {
-        // Without an identity, a live reclaimer may be suspended past the
-        // age ceiling. Keep it authoritative so another reaper cannot race
-        // its post-validation rename.
-        live = true
-      }
-    } else if (ownerPid === null) {
-      live = ageMs < MARKER_OPERATION_LOCK_STALE_MS
-    }
-
-    if (live) {
-      return null
-    }
-
-    try {
-      fs.unlinkSync(reclaimerPath)
-    } catch (err) {
-      if (err && err.code === 'ENOENT') {
-        continue
-      }
-
-      return null
     }
   }
 
   return null
 }
 
-function releaseMarkerReclaimer(reclaimerPath, body) {
+function removeMarkerReclaimerClaims(lockDir) {
+  let entries
+
   try {
-    if (fs.readFileSync(reclaimerPath, 'utf8') !== body) {
-      return
+    entries = fs.readdirSync(lockDir, { withFileTypes: true })
+  } catch {
+    return
+  }
+
+  for (const entry of entries) {
+    if (markerReclaimerGeneration(entry.name) === null) {
+      continue
     }
 
-    fs.unlinkSync(reclaimerPath)
-  } catch {
-    void 0
+    const claimPath = path.join(lockDir, entry.name)
+
+    try {
+      fs.unlinkSync(claimPath)
+    } catch (err) {
+      if (err && err.code === 'EISDIR') {
+        try {
+          fs.rmdirSync(claimPath)
+        } catch {
+          void 0
+        }
+      }
+    }
   }
 }
 
@@ -314,62 +363,47 @@ function reapStaleMarkerOperationLock(lockDir) {
     return false
   }
 
-  const reclaimerPath = markerReclaimerPath(lockDir)
-  const reclaimerBody = acquireMarkerReclaimer(reclaimerPath)
+  const reclaimerPath = acquireMarkerReclaimer(lockDir)
 
-  if (reclaimerBody === null) {
+  if (reclaimerPath === null) {
     return false
   }
 
-  let moved = false
+  const current = readOwnerState(initial.generationMtime)
+
+  if (current === null) {
+    return true
+  }
+
+  // Owner bytes identify the generation validated before the claim was
+  // published. A replacement claimant publishes different bytes and cannot
+  // be detached by this delayed reclaimer.
+  if (current.raw !== initial.raw || !current.stale) {
+    return false
+  }
+
+  const reclaimDir = `${lockDir}.reaping-${process.pid}-${randomUUID()}`
 
   try {
-    const current = readOwnerState(initial.generationMtime)
+    fs.renameSync(lockDir, reclaimDir)
+  } catch (err) {
+    return Boolean(err && err.code === 'ENOENT')
+  }
 
-    if (current === null) {
-      return true
-    }
+  try {
+    fs.unlinkSync(path.join(reclaimDir, 'owner'))
+  } catch {
+    void 0
+  }
 
-    // Owner bytes identify the generation validated before the sentinel was
-    // claimed. A replacement claimant publishes different bytes and cannot be
-    // detached by this delayed reclaimer.
-    if (current.raw !== initial.raw || !current.stale) {
-      return false
-    }
+  removeMarkerReclaimerClaims(reclaimDir)
 
-    const reclaimDir = `${lockDir}.reaping-${process.pid}-${randomUUID()}`
+  try {
+    fs.rmdirSync(reclaimDir)
 
-    try {
-      fs.renameSync(lockDir, reclaimDir)
-    } catch (err) {
-      return Boolean(err && err.code === 'ENOENT')
-    }
-
-    moved = true
-
-    try {
-      fs.unlinkSync(path.join(reclaimDir, 'owner'))
-    } catch {
-      void 0
-    }
-
-    try {
-      fs.unlinkSync(path.join(reclaimDir, MARKER_OPERATION_RECLAIMER_NAME))
-    } catch {
-      void 0
-    }
-
-    try {
-      fs.rmdirSync(reclaimDir)
-
-      return true
-    } catch (err) {
-      return Boolean(err && err.code === 'ENOENT')
-    }
-  } finally {
-    if (!moved) {
-      releaseMarkerReclaimer(reclaimerPath, reclaimerBody)
-    }
+    return true
+  } catch (err) {
+    return Boolean(err && err.code === 'ENOENT')
   }
 }
 

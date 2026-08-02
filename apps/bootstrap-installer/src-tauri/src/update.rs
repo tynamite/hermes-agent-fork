@@ -118,8 +118,9 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// overwriting — the pre-fix clobber is what let a dashboard `hermes update`
 /// keep running while install-mode bootstrap rewrote the tree underneath it.
 /// A short-lived sibling operation lock serializes marker reclamation with
-/// replacement claims. Stale cleanup first claims an exclusive `.reclaimer`
-/// sentinel inside that sidecar, so it cannot detach a newer owner's marker.
+/// replacement claims. Stale cleanup first claims an immutable, monotonically
+/// numbered `.reclaimer-N` generation inside that sidecar, so it cannot detach
+/// a newer owner's marker by unlinking a reused claim path.
 /// A verified process-start identity drives a bounded timestamp heartbeat so
 /// older desktop readers that only understand the first two lines do not
 /// expire a live long-running update.
@@ -144,6 +145,7 @@ struct UpdateMarkerGuard {
 const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
 const UPDATE_MARKER_OPERATION_LOCK_STALE_SECS: u64 = 30;
 const MARKER_OPERATION_RECLAIMER_NAME: &str = ".reclaimer";
+const MARKER_OPERATION_RECLAIMER_PREFIX: &str = ".reclaimer-";
 
 /// The pid + age of a confirmed-live update holding the marker.
 #[derive(Clone, Copy)]
@@ -353,8 +355,13 @@ impl Drop for MarkerOperationLock {
     }
 }
 
-fn marker_reclaimer_path(dir: &Path) -> PathBuf {
-    dir.join(MARKER_OPERATION_RECLAIMER_NAME)
+fn marker_reclaimer_generation(name: &std::ffi::OsStr) -> Option<u64> {
+    let name = name.to_str()?;
+    if name == MARKER_OPERATION_RECLAIMER_NAME {
+        return Some(0);
+    }
+    let suffix = name.strip_prefix(MARKER_OPERATION_RECLAIMER_PREFIX)?;
+    suffix.parse::<u64>().ok()
 }
 
 fn reclaimer_is_live(path: &Path) -> bool {
@@ -403,7 +410,7 @@ fn reclaimer_is_live(path: &Path) -> bool {
     }
 }
 
-fn acquire_marker_reclaimer(path: &Path) -> Option<String> {
+fn acquire_marker_reclaimer(dir: &Path) -> Option<PathBuf> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -417,29 +424,57 @@ fn acquire_marker_reclaimer(path: &Path) -> Option<String> {
         nonce
     );
 
-    for _attempt in 0..2 {
-        match write_marker_exclusive(path, &body) {
-            Ok(()) => return Some(body),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if reclaimer_is_live(path) {
-                    return None;
-                }
-                match std::fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(remove_err)
-                        if remove_err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return None,
-                }
-            }
+    for _attempt in 0..8 {
+        let claims = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    marker_reclaimer_generation(&entry.file_name())
+                        .map(|generation| (generation, entry.path()))
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => return None,
+        };
+        if claims
+            .iter()
+            .any(|(_generation, path)| reclaimer_is_live(path))
+        {
+            return None;
+        }
+        let next_generation = claims
+            .iter()
+            .map(|(generation, _path)| *generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let claim = dir.join(format!(
+            "{MARKER_OPERATION_RECLAIMER_PREFIX}{next_generation}"
+        ));
+        match write_marker_exclusive(&claim, &body) {
+            Ok(()) => return Some(claim),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return None,
         }
     }
     None
 }
 
-fn release_marker_reclaimer(path: &Path, body: &str) {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(body) {
-        let _ = std::fs::remove_file(path);
+fn remove_marker_reclaimer_claims(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if marker_reclaimer_generation(&entry.file_name()).is_none() {
+            continue;
+        }
+        let path = entry.path();
+        let _ = std::fs::remove_file(&path).or_else(|err| {
+            if err.kind() == std::io::ErrorKind::IsADirectory {
+                std::fs::remove_dir(&path)
+            } else {
+                Err(err)
+            }
+        });
     }
 }
 
@@ -463,58 +498,49 @@ fn reap_stale_marker_operation_lock(dir: &Path) -> bool {
         return false;
     }
 
-    let reclaimer = marker_reclaimer_path(dir);
-    let Some(reclaimer_body) = acquire_marker_reclaimer(&reclaimer) else {
+    let Some(_reclaimer) = acquire_marker_reclaimer(dir) else {
         return false;
     };
-    let mut moved = false;
 
-    let result = (|| {
-        if std::fs::metadata(dir).is_err() {
-            return true;
-        }
-        let current_raw = std::fs::read_to_string(&owner).ok();
-        if current_raw != initial_raw
-            || !sidecar_owner_stale(current_raw.as_deref(), initial_age)
-        {
-            return false;
-        }
-
-        let name = dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or(".hermes-update-in-progress.lock");
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let reclaim_dir = dir.with_file_name(format!(
-            "{name}.reaping-{}-{nonce}",
-            std::process::id()
-        ));
-
-        // The exclusive sentinel owns this reclamation generation. Rename the
-        // whole directory only after revalidating its owner bytes under that
-        // sentinel, so a delayed reaper cannot detach a replacement claimant.
-        match std::fs::rename(dir, &reclaim_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
-            Err(_) => return false,
-        }
-        moved = true;
-
-        let _ = std::fs::remove_file(reclaim_dir.join("owner"));
-        let _ = std::fs::remove_file(reclaim_dir.join(MARKER_OPERATION_RECLAIMER_NAME));
-        match std::fs::remove_dir(&reclaim_dir) {
-            Ok(()) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        }
-    })();
-    if !moved {
-        release_marker_reclaimer(&reclaimer, &reclaimer_body);
+    if std::fs::metadata(dir).is_err() {
+        return true;
     }
-    result
+    let current_raw = std::fs::read_to_string(&owner).ok();
+    if current_raw != initial_raw
+        || !sidecar_owner_stale(current_raw.as_deref(), initial_age)
+    {
+        return false;
+    }
+
+    let name = dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(".hermes-update-in-progress.lock");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let reclaim_dir = dir.with_file_name(format!(
+        "{name}.reaping-{}-{nonce}",
+        std::process::id()
+    ));
+
+    // The exclusive generation claim owns this reclamation attempt. Rename
+    // the whole directory only after revalidating its owner bytes under that
+    // immutable claim, so a delayed reaper cannot detach a replacement.
+    match std::fs::rename(dir, &reclaim_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    }
+
+    let _ = std::fs::remove_file(reclaim_dir.join("owner"));
+    remove_marker_reclaimer_claims(&reclaim_dir);
+    match std::fs::remove_dir(&reclaim_dir) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 fn sidecar_owner_stale(raw: Option<&str>, age_secs: u64) -> bool {

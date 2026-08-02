@@ -30,9 +30,9 @@ process-start identity, so a verified live updater remains authoritative past
 that ceiling while a recycled pid is rejected. A stale marker is removed on
 read by whoever notices it first. Marker operations use a short-lived
 ``.hermes-update-in-progress.lock`` sidecar acquired with atomic directory
-creation; stale sidecars first claim an exclusive ``.reclaimer`` sentinel and
-are then atomically renamed to a unique tombstone so two reclaimers cannot
-detach a replacement owner's lock.
+creation; stale sidecars first claim an immutable, monotonically numbered
+``.reclaimer-N`` generation and are then atomically renamed to a unique
+tombstone so two reclaimers cannot detach a replacement owner's lock.
 The sidecar owner file carries ``pid``, creation time, and a process-start
 identity; a matching live identity remains authoritative even if the updater
 is suspended past the short-operation age fallback.
@@ -74,6 +74,7 @@ UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 MARKER_NAME = ".hermes-update-in-progress"
 MARKER_OPERATION_LOCK_NAME = ".hermes-update-in-progress.lock"
 MARKER_OPERATION_RECLAIMER_NAME = ".reclaimer"
+MARKER_OPERATION_RECLAIMER_PREFIX = ".reclaimer-"
 MARKER_OPERATION_LOCK_STALE_SECONDS = 30
 # Older desktop bundles only understand the first two marker lines and expire
 # them after 20 minutes. Refresh the legacy timestamp well inside that window
@@ -500,89 +501,106 @@ def _live_marker_operation_holder(marker: Path) -> tuple[int, float] | None:
     return None
 
 
-def _acquire_marker_reclaimer(reclaimer_path: Path) -> str | None:
-    """Claim a sidecar's exclusive reclamation-generation sentinel.
+def _marker_reclaimer_is_live(reclaimer_path: Path) -> bool:
+    """Return whether one immutable reclamation-generation claim is live."""
+    try:
+        age = max(0.0, time.time() - reclaimer_path.stat().st_mtime)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    owner_pid = 0
+    owner_identity = ""
+    try:
+        lines = reclaimer_path.read_text(encoding="utf-8").splitlines()
+        owner_pid = int(lines[0].strip())
+        owner_identity = lines[2].strip() if len(lines) > 2 else ""
+    except (FileNotFoundError, IndexError, ValueError, OSError):
+        pass
+    if owner_pid > 0 and _pid_alive(owner_pid):
+        if owner_identity:
+            current_identity = _process_start_identity(owner_pid)
+            return current_identity is None or current_identity == owner_identity
+        # A live reclaimer without an identity may be suspended past the age
+        # ceiling. Keep it authoritative; never unlink a live claim by age.
+        return True
+    return owner_pid <= 0 and age < MARKER_OPERATION_LOCK_STALE_SECONDS
 
-    A stale sentinel may be removed only after its recorded process is dead,
-    its process-start identity is known to mismatch, or its legacy/malformed
-    record has exceeded the short stale ceiling.  An unavailable identity
-    probe is retained conservatively so a live reclaimer cannot be displaced.
+
+def _marker_reclaimer_generation(path: Path) -> int | None:
+    if path.name == MARKER_OPERATION_RECLAIMER_NAME:
+        return 0
+    if not path.name.startswith(MARKER_OPERATION_RECLAIMER_PREFIX):
+        return None
+    suffix = path.name[len(MARKER_OPERATION_RECLAIMER_PREFIX) :]
+    return int(suffix) if suffix.isdecimal() else None
+
+
+def _acquire_marker_reclaimer(lock_dir: Path) -> Path | None:
+    """Claim the next immutable reclamation generation without unlink races.
+
+    Each attempt gets a monotonically increasing claim filename. Stale claims
+    are intentionally retained until their sidecar is tombstoned; a delayed
+    reaper can therefore never unlink a fresh claim that another reaper just
+    published at the same path.
     """
     identity = _process_start_identity(os.getpid()) or ""
     body = (
         f"{os.getpid()}\n{int(time.time())}\n{identity}\n"
         f"{time.monotonic_ns()}\n"
     )
-    for _attempt in range(2):
+    for _attempt in range(8):
         try:
-            _write_marker_exclusive(reclaimer_path, body)
-            return body
+            claims = [
+                (generation, child)
+                for child in lock_dir.iterdir()
+                if (generation := _marker_reclaimer_generation(child)) is not None
+            ]
+        except (FileNotFoundError, OSError):
+            return None
+        if any(_marker_reclaimer_is_live(child) for _generation, child in claims):
+            return None
+        next_generation = max(
+            (generation for generation, _child in claims),
+            default=0,
+        ) + 1
+        claim = lock_dir / f"{MARKER_OPERATION_RECLAIMER_PREFIX}{next_generation}"
+        try:
+            _write_marker_exclusive(claim, body)
+            return claim
         except FileExistsError:
-            try:
-                stat = reclaimer_path.stat()
-                age = max(0.0, time.time() - stat.st_mtime)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return None
-
-            owner_pid = 0
-            owner_identity = ""
-            try:
-                lines = reclaimer_path.read_text(encoding="utf-8").splitlines()
-                owner_pid = int(lines[0].strip())
-                owner_identity = lines[2].strip() if len(lines) > 2 else ""
-            except (FileNotFoundError, IndexError, ValueError, OSError):
-                pass
-
-            live = False
-            if owner_pid > 0 and _pid_alive(owner_pid):
-                if owner_identity:
-                    current_identity = _process_start_identity(owner_pid)
-                    live = (
-                        current_identity is None
-                        or current_identity == owner_identity
-                    )
-                else:
-                    # A live reclaimer without an identity may be suspended
-                    # past the age ceiling. Keep it authoritative; otherwise
-                    # a second reaper could race its post-validation rename.
-                    live = True
-            elif owner_pid <= 0:
-                live = age < MARKER_OPERATION_LOCK_STALE_SECONDS
-            if live:
-                return None
-
-            try:
-                reclaimer_path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return None
+            # Another reaper won this generation. Re-read the immutable claim
+            # set and either wait for it or advance to the next generation.
+            continue
         except OSError:
             return None
     return None
 
 
-def _release_marker_reclaimer(reclaimer_path: Path, body: str) -> None:
-    """Release only the sentinel body this reaper actually published."""
-    try:
-        if reclaimer_path.read_text(encoding="utf-8") != body:
-            return
-        reclaimer_path.unlink()
-    except (FileNotFoundError, OSError):
-        return
+def _remove_marker_reclaimer_claims(lock_dir: Path) -> None:
+    for child in list(lock_dir.iterdir()):
+        if _marker_reclaimer_generation(child) is None:
+            continue
+        try:
+            child.unlink(missing_ok=True)
+        except IsADirectoryError:
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+        except OSError:
+            pass
 
 
 def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
     """Remove a crashed sidecar lock only when its owner is not alive.
 
-    A reclaimer first claims an exclusive sentinel *inside the sidecar*.
-    That sentinel is the reclamation-generation ownership record: competing
-    reapers cannot both validate the same stale generation and then race a
-    claimant that recreated the original path.  The winning reclaimer then
-    revalidates the owner bytes under that sentinel and moves the sidecar to a
-    unique sibling tombstone for cleanup.
+    A reclaimer first claims an immutable generation file *inside the
+    sidecar*. That file is the reclamation-generation ownership record:
+    competing reapers cannot both validate the same stale generation and then
+    unlink a claimant that reused the same path. The winning reclaimer then
+    revalidates the owner bytes under that generation claim and moves the
+    sidecar to a unique sibling tombstone for cleanup.
     """
     def owner_state(
         generation_mtime: float | None = None,
@@ -631,48 +649,38 @@ def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
     if not stale:
         return False
 
-    reclaimer_path = lock_dir / MARKER_OPERATION_RECLAIMER_NAME
-    reclaimer_body = _acquire_marker_reclaimer(reclaimer_path)
-    if reclaimer_body is None:
+    if _acquire_marker_reclaimer(lock_dir) is None:
         return False
 
-    moved = False
-    try:
-        current = owner_state(generation_mtime)
-        if current is None:
-            return True
-        current_raw, current_stale, _ = current
-        # The original owner bytes identify the generation we validated.  A
-        # replacement claimant gets a fresh owner file and cannot be detached
-        # by this delayed reclaimer.
-        if current_raw != expected_raw or not current_stale:
-            return False
-
-        reclaim_dir = lock_dir.with_name(
-            f"{lock_dir.name}.reaping-{os.getpid()}-{time.monotonic_ns()}"
-        )
-        try:
-            lock_dir.rename(reclaim_dir)
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
-        moved = True
-
-        try:
-            (reclaim_dir / "owner").unlink(missing_ok=True)
-            (reclaim_dir / MARKER_OPERATION_RECLAIMER_NAME).unlink(
-                missing_ok=True
-            )
-            reclaim_dir.rmdir()
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
+    current = owner_state(generation_mtime)
+    if current is None:
         return True
-    finally:
-        if not moved:
-            _release_marker_reclaimer(reclaimer_path, reclaimer_body)
+    current_raw, current_stale, _ = current
+    # The original owner bytes identify the generation we validated.  A
+    # replacement claimant gets a fresh owner file and cannot be detached by
+    # this delayed reclaimer.
+    if current_raw != expected_raw or not current_stale:
+        return False
+
+    reclaim_dir = lock_dir.with_name(
+        f"{lock_dir.name}.reaping-{os.getpid()}-{time.monotonic_ns()}"
+    )
+    try:
+        lock_dir.rename(reclaim_dir)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    try:
+        (reclaim_dir / "owner").unlink(missing_ok=True)
+        _remove_marker_reclaimer_claims(reclaim_dir)
+        reclaim_dir.rmdir()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 @contextmanager
