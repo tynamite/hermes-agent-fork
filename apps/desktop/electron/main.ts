@@ -3077,13 +3077,13 @@ async function applyUpdates(opts = {}) {
 
 async function handOffWindowsBootstrapRecovery(reason) {
   if (!IS_WINDOWS || !IS_PACKAGED) {
-    return false
+    return 'unavailable'
   }
 
   const updater = resolveUpdaterBinary()
 
   if (!updater) {
-    return false
+    return 'unavailable'
   }
 
   const updateRoot = resolveUpdateRoot()
@@ -3128,7 +3128,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
       `[bootstrap] ${reason} handoff canceled: another updater claimed the Hermes install`
     )
 
-    return false
+    return 'blocked'
   }
 
   rememberLog(
@@ -3142,7 +3142,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
     app.quit()
   }, UPDATE_HANDOFF_DWELL_MS)
 
-  return true
+  return 'handed-off'
 }
 
 // Resolve the hermes CLI to drive an in-app update: prefer the venv shim in
@@ -4062,7 +4062,9 @@ async function ensureRuntime(backend) {
   if (backend.kind === 'bootstrap-needed') {
     rememberLog('[bootstrap] no Hermes install found; starting first-launch bootstrap')
 
-    if (await handOffWindowsBootstrapRecovery('bootstrap-needed')) {
+    const recoveryHandoff = await handOffWindowsBootstrapRecovery('bootstrap-needed')
+
+    if (recoveryHandoff === 'handed-off') {
       const handoffError: Error & { isBootstrapFailure?: boolean; bootstrapHandedOff?: boolean } = new Error(
         'Hermes recovery was handed off to Hermes Setup. The desktop will restart when recovery completes.'
       )
@@ -4071,6 +4073,20 @@ async function ensureRuntime(backend) {
       handoffError.bootstrapHandedOff = true
       bootstrapFailure = handoffError
       throw handoffError
+    }
+
+    if (recoveryHandoff === 'blocked') {
+      const contentionError: Error & {
+        isBootstrapFailure?: boolean
+        bootstrapHandoffBlocked?: boolean
+      } = new Error(
+        'Hermes recovery is blocked by another updater. Wait for it to finish, then retry.'
+      )
+
+      contentionError.isBootstrapFailure = true
+      contentionError.bootstrapHandoffBlocked = true
+      bootstrapFailure = contentionError
+      throw contentionError
     }
 
     // Eagerly flip the bootstrap UI state to 'active' so the renderer
