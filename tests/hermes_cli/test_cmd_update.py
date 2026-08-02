@@ -3,7 +3,7 @@
 import hashlib
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -67,7 +67,8 @@ def _patch_managed_uv(request):
 
     with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
          patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
-         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
+         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv), \
+         patch("hermes_cli.main._detect_venv_python_processes", return_value=[]):
         yield
 
 
@@ -234,6 +235,43 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_unknown_fork_sync_head_identity_fails_closed(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(
+            hm,
+            "_capture_head_sha",
+            return_value=None,
+        ), patch.object(
+            hm,
+            "_sync_with_upstream_if_needed",
+        ), patch.object(
+            hm,
+            "_complete_posix_gateway_mutation",
+        ) as complete:
+            cmd_update(mock_args)
+
+        assert any(
+            call.kwargs.get("mutated") is True
+            for call in complete.call_args_list
+        )
+
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
@@ -263,6 +301,466 @@ class TestCmdUpdateBranchFallback:
             captured = capsys.readouterr()
             assert "applying safe config migrations" in captured.out
             assert "API keys require manual entry" in captured.out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_fails_closed_when_old_gateway_survives_restart(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+        with patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+            return_value={555},
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_update(mock_args)
+
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+        assert "Update drain retained" in output
+        assert "555" in output
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_commit_repair_fails_when_old_gateway_survives(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+        capsys,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.gateway = True
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+            "mutation_started": True,
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+            return_value={555},
+        ), patch(
+            "hermes_cli.update_cmd.get_hermes_home",
+            return_value=tmp_path,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_update(mock_args)
+
+        assert exc.value.code == 1
+        assert (tmp_path / ".update_exit_code").read_text() == "1"
+        assert "Update drain retained" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_commit_restored_checkout_disarms_gateway_drain(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.branch = "main"
+        mock_run.side_effect = _make_run_side_effect(
+            branch="feature",
+            verify_ok=True,
+            commit_count="0",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+        ) as finish:
+            cmd_update(mock_args)
+
+        finish.assert_not_called()
+        assert "mutation_started" not in token
+        assert token["retain_on_exit"] is False
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_same_branch_autostash_arms_mutation_guard_first(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        events = []
+
+        def begin(_token):
+            events.append(("begin", None))
+
+        def stash(*_args, **_kwargs):
+            events.append(("stash", None))
+            return None
+
+        def complete(_token, *, mutated):
+            events.append(("complete", mutated))
+
+        with patch.object(
+            hm,
+            "_begin_posix_gateway_mutation",
+            side_effect=begin,
+        ), patch.object(
+            hm,
+            "_stash_local_changes_if_needed",
+            side_effect=stash,
+        ), patch.object(
+            hm,
+            "_complete_posix_gateway_mutation",
+            side_effect=complete,
+        ):
+            cmd_update(mock_args)
+
+        assert events[:3] == [
+            ("begin", None),
+            ("stash", None),
+            ("complete", False),
+        ]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_same_branch_autostash_exception_leaves_guard_armed(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="0",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch.object(
+            hm,
+            "_stash_local_changes_if_needed",
+            side_effect=RuntimeError("stash interrupted"),
+        ):
+            with pytest.raises(RuntimeError, match="stash interrupted"):
+                cmd_update(mock_args)
+
+        assert token["retain_on_exit"] is True
+        assert "mutation_started" not in token
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_failed_branch_switch_restored_noop_disarms_gateway_drain(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.branch = "missing"
+        mock_run.side_effect = TestCmdUpdateBranchFlag()._branch_side_effect(
+            current_branch="feature",
+            target_branch="missing",
+            checkout_fails=True,
+            track_fails=True,
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(profile="default", path=tmp_path, pid=555)
+        with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch.object(
+            hm,
+            "_stash_local_changes_if_needed",
+            return_value="stash-oid",
+        ), patch.object(
+            hm,
+            "_restore_stashed_changes",
+            return_value=True,
+        ), patch(
+            "hermes_cli.update_cmd._capture_head_sha",
+            side_effect=["abc123", "abc123"],
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_update(mock_args)
+
+        assert exc.value.code == 1
+        assert "mutation_started" not in token
+        assert token["retain_on_exit"] is False
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_verified_syntax_rollback_disarms_gateway_drain(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="1",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(profile="default", path=tmp_path, pid=555)
+        with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch(
+            "hermes_cli.update_cmd._capture_head_sha",
+            side_effect=["abc123", "abc123"],
+        ), patch(
+            "hermes_cli.update_cmd._validate_critical_files_syntax",
+            return_value=(False, "hermes_cli/main.py", "SyntaxError"),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_update(mock_args)
+
+        assert exc.value.code == 1
+        assert "mutation_started" not in token
+        assert token["retain_on_exit"] is False
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_restart_authorization_failure_overwrites_gateway_success_marker(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.gateway = True
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="1",
+        )
+        with patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=None,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[],
+        ), patch(
+            "hermes_cli.update_lock.UpdateLock.authorize_runtime_restarts",
+            return_value=False,
+        ), patch(
+            "hermes_cli.update_cmd.get_hermes_home",
+            return_value=tmp_path,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_update(mock_args)
+
+        assert exc.value.code == 1
+        assert (tmp_path / ".update_exit_code").read_text() == "1"
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    @pytest.mark.parametrize("supervisor_pid", ("555", None))
+    @pytest.mark.parametrize(
+        "live_start_time, should_restart",
+        ((111, True), (222, False)),
+    )
+    def test_quiesced_profile_gateway_is_identity_checked_before_restart_fleet(
+        self,
+        mock_run,
+        _mock_which,
+        mock_args,
+        tmp_path,
+        monkeypatch,
+        supervisor_pid,
+        live_start_time,
+        should_restart,
+    ):
+        from hermes_cli import main as hm
+
+        mock_args.gateway = True
+        if supervisor_pid is None:
+            monkeypatch.delenv(
+                "_HERMES_UPDATE_SUPERVISOR_PID",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "_HERMES_UPDATE_SUPERVISOR_PID",
+                supervisor_pid,
+            )
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main",
+            verify_ok=True,
+            commit_count="1",
+        )
+        token = {
+            "pids": {555},
+            "process_start_times": {555: 111},
+            "created_markers": [],
+        }
+        proc = SimpleNamespace(
+            profile="default",
+            path=tmp_path,
+            pid=555,
+        )
+        prepare_restart = patch(
+            "hermes_cli.gateway._prepare_profile_gateway_update_restart",
+            return_value="external-supervisor",
+        )
+        with patch(
+            "hermes_cli.update_lock.UpdateLock.authorize_runtime_restarts",
+            return_value=True,
+        ) as authorize_restarts, patch(
+            "psutil.Process"
+        ) as psutil_process, patch.object(
+            hm,
+            "_is_windows",
+            return_value=False,
+        ), patch.object(
+            hm,
+            "_quiesce_posix_gateways_for_update",
+            return_value=token,
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[proc],
+        ), patch(
+            "hermes_cli.gateway.find_gateway_pids",
+            return_value=[],
+        ), patch(
+            "hermes_cli.gateway._get_service_pids",
+            return_value=set(),
+        ), prepare_restart as prepare_mock, patch(
+            "hermes_cli.gateway._graceful_restart_via_sigusr1",
+            return_value=True,
+        ), patch(
+            "hermes_cli.gateway._wait_for_gateway_exit",
+        ), patch.object(
+            hm,
+            "_finish_posix_gateway_quiesce",
+            return_value=set(),
+        ), patch(
+            "gateway.status.get_process_start_time",
+            return_value=live_start_time,
+        ):
+            psutil_process.return_value.parents.return_value = [
+                SimpleNamespace(pid=555)
+            ]
+            cmd_update(mock_args)
+
+        if should_restart:
+            prepare_mock.assert_called_with("default", 555)
+        else:
+            prepare_mock.assert_not_called()
+        authorize_restarts.assert_called_once_with()
 
 
 class TestCmdUpdateMigrationPrompt:
@@ -687,6 +1185,67 @@ termux = ["rich>=14"]
 class TestNodeRuntimeNpmResolution:
     """Regression tests for #30271 — WSL must not run Windows npm against the
     Linux checkout, and a failed Node refresh must not report success."""
+
+    def test_direct_update_attests_its_desktop_rebuild_child(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import update_cmd
+        from hermes_cli.update_lock import HANDOFF_PID_ENV, UpdateHolder
+
+        env = {}
+        monkeypatch.setattr(update_cmd.os, "getpid", lambda: 4321)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4321, age_seconds=3),
+        )
+
+        assert update_cmd._prepare_desktop_build_handoff(env) is False
+        assert env[HANDOFF_PID_ENV] == "4321"
+
+    def test_tauri_update_defers_duplicate_desktop_rebuild(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import update_cmd
+        from hermes_cli.update_lock import UpdateHolder
+
+        env = {}
+        monkeypatch.setattr(update_cmd.os, "getpid", lambda: 9000)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4321, age_seconds=3),
+        )
+        verified = Mock(return_value=True)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.is_verified_handoff",
+            verified,
+        )
+
+        assert update_cmd._prepare_desktop_build_handoff(env) is True
+        assert env == {}
+        verified.assert_called_once_with(4321)
+
+    def test_foreign_update_cannot_delegate_desktop_rebuild(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import update_cmd
+        from hermes_cli.update_lock import UpdateHolder
+
+        env = {}
+        monkeypatch.setattr(update_cmd.os, "getpid", lambda: 9000)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.read_live_update",
+            lambda: UpdateHolder(pid=4321, age_seconds=3),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_lock.is_verified_handoff",
+            lambda _pid: False,
+        )
+
+        assert update_cmd._prepare_desktop_build_handoff(env) is False
+        assert env == {}
 
 
 

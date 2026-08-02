@@ -992,6 +992,10 @@ def test_spawn_update_identifies_dashboard_supervisor(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ws.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
+    monkeypatch.setattr(
+        "gateway.status.get_process_start_time",
+        lambda _pid: 987,
+    )
 
     ws._spawn_hermes_action(["update"], "hermes-update")
 
@@ -1000,6 +1004,7 @@ def test_spawn_update_identifies_dashboard_supervisor(monkeypatch, tmp_path):
         captured["env"]["_HERMES_UPDATE_SUPERVISOR_QUIESCED"]
         == "dashboard"
     )
+    assert captured["env"]["_HERMES_UPDATE_SUPERVISOR_START_TIME"] == "987"
 
 
 def test_spawn_update_requires_dashboard_quiesce(monkeypatch, tmp_path):

@@ -201,7 +201,7 @@ import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
+import { readLiveUpdateMarker, spawnUpdaterWithMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
 import {
   buildRelaunchScript,
@@ -3024,28 +3024,31 @@ async function applyUpdates(opts = {}) {
       }
     }
 
-    // Detached so the updater outlives this process — it needs us GONE before
-    // `hermes update` will run (the venv shim is locked while we live).
-    const child = spawnUpdaterProcess(updater, updaterArgs, {
-      cwd: HERMES_HOME,
-      env: {
-        ...process.env,
-        HERMES_HOME,
-        PATH: pathWithHermesManagedNode(venvBin)
-      },
-      detached: true,
-      stdio: 'ignore'
-    })
+    // Spawn and publish the child PID while holding the shared sidecar. A
+    // foreign live claim is checked before spawn, so a second updater cannot
+    // slip into the repair/update handoff after the pre-flight wait.
+    const child = spawnUpdaterWithMarker(HERMES_HOME, () =>
+      spawnUpdaterProcess(updater, updaterArgs, {
+        cwd: HERMES_HOME,
+        env: {
+          ...process.env,
+          HERMES_HOME,
+          PATH: pathWithHermesManagedNode(venvBin)
+        },
+        detached: true,
+        stdio: 'ignore'
+      })
+    )
 
-    // Write the update-in-progress marker IMMEDIATELY — before the 2.5s
-    // quit dwell. The Tauri updater won't write its own marker for several
-    // seconds (window init + manifest), and during that gap our renderer
-    // can reconnect and spawn a fresh backend that re-locks .pyd files in
-    // the venv. By writing the marker ourselves the renderer's
-    // waitForUpdateToFinish() gate sees a live update and parks instead.
-    // The updater overwrites this with its own PID later; same format.
-    if (Number.isInteger(child.pid)) {
-      writeUpdateMarker(HERMES_HOME, child.pid)
+    if (!child) {
+      const message =
+        'Update aborted: another updater claimed the Hermes install before handoff. ' +
+        'Wait for it to finish and retry.'
+
+      emitUpdateProgress({ stage: 'error', message, percent: null })
+      startHermes().catch(() => {})
+
+      return { ok: false, error: 'update-claim', message }
     }
 
     rememberLog(`[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`)
@@ -3074,13 +3077,13 @@ async function applyUpdates(opts = {}) {
 
 async function handOffWindowsBootstrapRecovery(reason) {
   if (!IS_WINDOWS || !IS_PACKAGED) {
-    return false
+    return 'unavailable'
   }
 
   const updater = resolveUpdaterBinary()
 
   if (!updater) {
-    return false
+    return 'unavailable'
   }
 
   const updateRoot = resolveUpdateRoot()
@@ -3107,22 +3110,25 @@ async function handOffWindowsBootstrapRecovery(reason) {
 
   await releaseBackendLockForUpdate(updateRoot)
 
-  const child = spawnUpdaterProcess(updater, updaterArgs, {
-    cwd: HERMES_HOME,
-    env: {
-      ...process.env,
-      HERMES_HOME,
-      PATH: pathWithHermesManagedNode(venvBin)
-    },
-    detached: true,
-    stdio: 'ignore'
-  })
+  const child = spawnUpdaterWithMarker(HERMES_HOME, () =>
+    spawnUpdaterProcess(updater, updaterArgs, {
+      cwd: HERMES_HOME,
+      env: {
+        ...process.env,
+        HERMES_HOME,
+        PATH: pathWithHermesManagedNode(venvBin)
+      },
+      detached: true,
+      stdio: 'ignore'
+    })
+  )
 
-  // Same marker pre-write as applyUpdates — see comment there. The recovery
-  // hand-off has the same window where the renderer can respawn a backend
-  // before the updater writes its own marker.
-  if (Number.isInteger(child.pid)) {
-    writeUpdateMarker(HERMES_HOME, child.pid)
+  if (!child) {
+    rememberLog(
+      `[bootstrap] ${reason} handoff canceled: another updater claimed the Hermes install`
+    )
+
+    return 'blocked'
   }
 
   rememberLog(
@@ -3136,7 +3142,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
     app.quit()
   }, UPDATE_HANDOFF_DWELL_MS)
 
-  return true
+  return 'handed-off'
 }
 
 // Resolve the hermes CLI to drive an in-app update: prefer the venv shim in
@@ -4056,7 +4062,9 @@ async function ensureRuntime(backend) {
   if (backend.kind === 'bootstrap-needed') {
     rememberLog('[bootstrap] no Hermes install found; starting first-launch bootstrap')
 
-    if (await handOffWindowsBootstrapRecovery('bootstrap-needed')) {
+    const recoveryHandoff = await handOffWindowsBootstrapRecovery('bootstrap-needed')
+
+    if (recoveryHandoff === 'handed-off') {
       const handoffError: Error & { isBootstrapFailure?: boolean; bootstrapHandedOff?: boolean } = new Error(
         'Hermes recovery was handed off to Hermes Setup. The desktop will restart when recovery completes.'
       )
@@ -4065,6 +4073,20 @@ async function ensureRuntime(backend) {
       handoffError.bootstrapHandedOff = true
       bootstrapFailure = handoffError
       throw handoffError
+    }
+
+    if (recoveryHandoff === 'blocked') {
+      const contentionError: Error & {
+        isBootstrapFailure?: boolean
+        bootstrapHandoffBlocked?: boolean
+      } = new Error(
+        'Hermes recovery is blocked by another updater. Wait for it to finish, then retry.'
+      )
+
+      contentionError.isBootstrapFailure = true
+      contentionError.bootstrapHandoffBlocked = true
+      bootstrapFailure = contentionError
+      throw contentionError
     }
 
     // Eagerly flip the bootstrap UI state to 'active' so the renderer

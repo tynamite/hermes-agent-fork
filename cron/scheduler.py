@@ -8,21 +8,29 @@ Uses a file-based lock (~/.hermes/cron/.tick.lock) so only one tick
 runs at a time if multiple processes overlap.
 """
 
+import os
+import sys
+from pathlib import Path
+
+# Standalone ``python -m cron.scheduler`` is a supported runtime entrypoint.
+# Put the repository on sys.path, then enforce the install-wide update gate
+# before importing any Hermes module that can load or mutate managed state.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import hermes_bootstrap  # noqa: E402, F401
+
+# fcntl is Unix-only; on Windows use msvcrt for file locking
 import asyncio
 import atexit
 import concurrent.futures
 import contextvars
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 
-# fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
     import fcntl
 except ImportError:
@@ -31,13 +39,7 @@ except ImportError:
         import msvcrt
     except ImportError:
         msvcrt = None
-from pathlib import Path
 from typing import Any, List, Optional
-
-# Add parent directory to path for imports BEFORE repo-level imports.
-# Without this, standalone invocations (e.g. after `hermes update` reloads
-# the module) fail with ModuleNotFoundError for hermes_time et al.
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags

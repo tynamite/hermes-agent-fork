@@ -20,9 +20,11 @@ import path from 'path'
 import { test } from 'vitest'
 
 import {
+  getProcessStartIdentity,
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
+  spawnUpdaterWithMarker,
   UPDATE_MARKER_MAX_AGE_MS,
   writeUpdateMarker
 } from './update-marker'
@@ -37,6 +39,10 @@ function writeMarker(home, pid, startedAtSec) {
   fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}`)
 }
 
+function writeIdentityMarker(home, pid, startedAtSec, identity) {
+  fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}\n\n${identity}\n`)
+}
+
 const ALIVE: typeof process.kill = () => true // injected kill that "succeeds" => pid alive
 
 const DEAD: typeof process.kill = () => {
@@ -48,6 +54,62 @@ const DEAD: typeof process.kill = () => {
 
 test('absent marker => no live update', () => {
   const home = tmpHome('absent')
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
+})
+
+test('live operation sidecar blocks readers before marker publication', () => {
+  const home = tmpHome('operation-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n`)
+
+  const res = readLiveUpdateMarker(home, { kill: ALIVE })
+
+  assert.ok(res, 'a live sidecar is an in-flight update even before marker publish')
+  assert.equal(res.pid, process.pid)
+})
+
+test('old live-pid sidecar is bounded by the stale ceiling', () => {
+  const home = tmpHome('old-operation-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n`)
+  const old = fs.statSync(operationLock).mtimeMs
+  const now = old + 30 * 1000 + 1
+
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
+})
+
+test('old live sidecar with matching process identity stays active', () => {
+  const identity = getProcessStartIdentity(process.pid)
+
+  if (!identity) {
+    return
+  }
+
+  const home = tmpHome('old-live-identity-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n0\n${identity}\n`)
+  const old = fs.statSync(operationLock).mtimeMs
+  const now = old + 60 * 60 * 1000
+
+  const res = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+
+  assert.ok(res, 'a verified live owner remains active after the age ceiling')
+  assert.equal(res.pid, process.pid)
+})
+
+test('recycled live-pid sidecar is not treated as active', () => {
+  if (!getProcessStartIdentity(process.pid)) {
+    return
+  }
+
+  const home = tmpHome('recycled-live-identity-sidecar')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), `${process.pid}\n0\nold-start\n`)
+
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
 })
 
@@ -76,6 +138,44 @@ test('expired marker (past age ceiling) => no live update and pruned', () => {
   // Even though the pid is "alive", the marker is too old to trust.
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
   assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+})
+
+test('verified live marker survives the age ceiling', () => {
+  const identity = getProcessStartIdentity(process.pid)
+
+  if (!identity) {
+    return
+  }
+
+  const home = tmpHome('old-live-identity-marker')
+  const now = 1_000_000_000_000
+  writeIdentityMarker(
+    home,
+    process.pid,
+    Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000),
+    identity
+  )
+
+  const res = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+
+  assert.ok(res, 'a verified live owner remains active after the age ceiling')
+  assert.equal(res.pid, process.pid)
+  assert.ok(fs.existsSync(markerPath(home)))
+})
+
+test('recycled marker identity is pruned even while fresh', () => {
+  const identity = getProcessStartIdentity(process.pid)
+
+  if (!identity) {
+    return
+  }
+
+  const home = tmpHome('recycled-marker-identity')
+  const now = 1_000_000_000_000
+  writeIdentityMarker(home, process.pid, Math.floor(now / 1000), 'old-start')
+
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(!fs.existsSync(markerPath(home)))
 })
 
 test('malformed marker => no live update and pruned', () => {
@@ -112,6 +212,81 @@ test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () =
   assert.ok(res, 'marker written by writeUpdateMarker should be detected as live')
   assert.equal(res.pid, 4242)
   assert.ok(fs.existsSync(markerPath(home)), 'marker file should exist after write')
+})
+
+test('writeUpdateMarker never overwrites an existing claim', () => {
+  const home = tmpHome('write-existing')
+  const now = 1_000_000_000_000
+  writeMarker(home, process.pid, Math.floor(now / 1000) - 5)
+
+  writeUpdateMarker(home, 2222, { now: () => now })
+
+  assert.equal(
+    fs.readFileSync(markerPath(home), 'utf8'),
+    `${process.pid}\n${Math.floor(now / 1000) - 5}`
+  )
+})
+
+test('writeUpdateMarker replaces a stale existing claim before releasing the sidecar', () => {
+  const home = tmpHome('write-replace-stale')
+  const now = 1_000_000_000_000
+  writeMarker(home, 999999, Math.floor(now / 1000) - 5)
+
+  writeUpdateMarker(home, 2222, { now: () => now })
+
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8'), `2222\n${Math.floor(now / 1000)}\n`)
+  assert.ok(
+    !fs.existsSync(path.join(home, '.hermes-update-in-progress.lock')),
+    'the replacement claim is published before releasing the sidecar'
+  )
+})
+
+test('spawnUpdaterWithMarker refuses a foreign live claim before spawning', () => {
+  const home = tmpHome('spawn-foreign-claim')
+  const now = 1_000_000_000_000
+  writeMarker(home, process.pid, Math.floor(now / 1000) - 5)
+  let spawned = false
+
+  const child = spawnUpdaterWithMarker(
+    home,
+    () => {
+      spawned = true
+
+      return { pid: 4242, kill: () => true }
+    },
+    { now: () => now }
+  )
+
+  assert.equal(child, null)
+  assert.equal(spawned, false)
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8'), `${process.pid}\n${Math.floor(now / 1000) - 5}`)
+})
+
+test('spawnUpdaterWithMarker publishes the child claim before releasing the sidecar', () => {
+  const home = tmpHome('spawn-and-claim')
+  const now = 1_000_000_000_000
+
+  const child = spawnUpdaterWithMarker(
+    home,
+    () => ({ pid: 4242, kill: () => true }),
+    { now: () => now }
+  )
+
+  assert.ok(child)
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8'), `4242\n${Math.floor(now / 1000)}\n`)
+  assert.ok(!fs.existsSync(path.join(home, '.hermes-update-in-progress.lock')))
+})
+
+test('writeUpdateMarker reclaims a crashed marker-operation lock', () => {
+  const home = tmpHome('write-stale-operation-lock')
+  const operationLock = path.join(home, '.hermes-update-in-progress.lock')
+  fs.mkdirSync(operationLock)
+  fs.writeFileSync(path.join(operationLock, 'owner'), '4294967294\n')
+
+  writeUpdateMarker(home, 2222)
+
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8').split('\n')[0], '2222')
+  assert.ok(!fs.existsSync(operationLock), 'a dead sidecar owner must not wedge claims')
 })
 
 test('writeUpdateMarker is best-effort (no throw on bad path)', () => {

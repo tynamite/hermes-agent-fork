@@ -9,6 +9,11 @@ to various messaging platforms (Telegram, Discord, WhatsApp, Weixin, and more) w
 - Platform-specific toolsets (different capabilities per platform)
 """
 
+# ``python -m gateway.run`` imports this package before run.py. Enforce the
+# stdlib-only update gate before these re-exports can load managed dependencies
+# from an installation that is currently being mutated.
+import hermes_bootstrap  # noqa: F401
+
 from .config import GatewayConfig, PlatformConfig, HomeChannel, load_gateway_config
 from .session import (
     SessionContext,

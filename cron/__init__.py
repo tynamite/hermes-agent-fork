@@ -15,6 +15,11 @@ The gateway ticks the scheduler every 60 seconds. A file lock prevents
 duplicate execution if multiple processes overlap.
 """
 
+# ``python -m cron.scheduler`` imports this package before scheduler.py.
+# Enforce the stdlib-only update gate before these re-exports can load managed
+# dependencies from an installation that is currently being mutated.
+import hermes_bootstrap  # noqa: F401
+
 from cron.jobs import (
     create_job,
     get_job,

@@ -49,7 +49,13 @@ def _fake_venv_python(tmp_path, *, windows: bool = False):
 # ---------------------------------------------------------------------------
 
 
-def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: str = ""):
+def _proc(
+    pid: int,
+    exe: str | None,
+    name: str,
+    cmdline: list[str] | None = None,
+    cwd: str = "",
+):
     proc = MagicMock()
     proc.info = {
         "pid": pid,
@@ -58,9 +64,371 @@ def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: 
         "cmdline": cmdline or [],
         "cwd": cwd,
     }
+    proc.environ.return_value = {}
     return proc
 
 
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_finds_posix_venv_launcher(_winp, tmp_path):
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    venv_py_versioned = str(tmp_path / "venv" / "bin" / "python3.13")
+    base_py = "/usr/bin/python3.13"
+    me = MagicMock()
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [
+                _proc(101, base_py, "python3.13", [venv_py, "-m", "hermes_cli.main", "serve"]),
+                _proc(102, base_py, "python3.13", [base_py, "somescript.py"]),
+                _proc(103, venv_py_versioned, "python3.13"),
+                _proc(
+                    104,
+                    str(tmp_path / "venv-other" / "bin" / "python3.13"),
+                    "python3.13",
+                ),
+                _proc(
+                    105,
+                    base_py,
+                    "python3.13",
+                    ["venv/bin/python", "-m", "worker"],
+                    cwd=str(tmp_path),
+                ),
+                _proc(
+                    107,
+                    "/usr/bin/python3.14t",
+                    "python3.14t",
+                    [str(tmp_path / "venv" / "bin" / "python3.14t"), "worker.py"],
+                ),
+                _proc(
+                    109,
+                    "/usr/bin/python3.14td",
+                    "python3.14td",
+                    [str(tmp_path / "venv" / "bin" / "python3.14td"), "worker.py"],
+                ),
+            ]
+        ),
+        Process=lambda *a, **k: me,
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [m[0] for m in matches] == [101, 103, 105, 107, 109]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_matches_logical_launcher_under_canonical_root(
+    _winp, tmp_path
+):
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+    logical_root = tmp_path / "logical-root"
+    logical_root.symlink_to(real_root, target_is_directory=True)
+    logical_venv_python = str(
+        logical_root / "venv" / "bin" / "python"
+    )
+    venv_versioned_python = str(real_root / "venv" / "bin" / "python3.13")
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [
+                _proc(
+                    108,
+                    "/usr/bin/python3",
+                    "python3",
+                    [logical_venv_python, "worker.py"],
+                ),
+                _proc(110, venv_versioned_python, "python3.13"),
+            ]
+        ),
+        Process=MagicMock(),
+    )
+
+    # Production canonicalizes PROJECT_ROOT with Path.resolve(), while a
+    # process launched through the symlink can retain the logical argv[0].
+    with patch.object(cli_main, "PROJECT_ROOT", real_root), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [match[0] for match in matches] == [108, 110]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_finds_posix_dot_venv_launcher(_winp, tmp_path):
+    dot_venv_python = str(tmp_path / ".venv" / "bin" / "python")
+    proc = _proc(
+        106,
+        "/usr/bin/python3",
+        "python3",
+        [dot_venv_python, "-m", "hermes_cli.main", "serve"],
+    )
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [match[0] for match in matches] == [106]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_ignores_non_python_mentions(_winp, tmp_path):
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    me = MagicMock()
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [
+                _proc(201, "/bin/bash", "bash", ["bash", "-c", f"{venv_py} -m worker"]),
+                _proc(
+                    202,
+                    "/bin/sh",
+                    "sh",
+                    ["sh", "-c", "python -m hermes_cli.main"],
+                    cwd=str(tmp_path),
+                ),
+            ]
+        ),
+        Process=lambda *a, **k: me,
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_relative_argv0_requires_target_cwd(
+    _winp, tmp_path
+):
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [
+                _proc(
+                    202,
+                    "/usr/bin/python3",
+                    "python3",
+                    ["venv/bin/python", "-m", "worker"],
+                    cwd="",
+                )
+            ]
+        ),
+        Process=MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_resolves_bare_argv0_from_target_path(
+    _winp, tmp_path
+):
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.write_text("#!/bin/sh\n")
+    venv_python.chmod(0o755)
+    proc = _proc(
+        203,
+        "/usr/bin/python3",
+        "python3",
+        ["python", "-m", "hermes_cli.main", "serve"],
+        cwd=str(tmp_path),
+    )
+    proc.environ.return_value = {
+        "PATH": os.pathsep.join(
+            [str(venv_bin), "/usr/local/bin", "/usr/bin"]
+        )
+    }
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [match[0] for match in matches] == [203]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_bare_argv0_path_denied_is_ignored(
+    _winp, tmp_path
+):
+    proc = _proc(
+        204,
+        "/usr/bin/python3",
+        "python3",
+        ["python", "-m", "hermes_cli.main", "serve"],
+        cwd=str(tmp_path),
+    )
+    proc.environ.side_effect = PermissionError("environment denied")
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_bare_argv0_honors_path_order(_winp, tmp_path):
+    outside_bin = tmp_path / "outside-bin"
+    venv_bin = tmp_path / "venv" / "bin"
+    outside_bin.mkdir()
+    venv_bin.mkdir(parents=True)
+    for python_path in (outside_bin / "python", venv_bin / "python"):
+        python_path.write_text("#!/bin/sh\n")
+        python_path.chmod(0o755)
+    proc = _proc(
+        205,
+        "/usr/bin/python3",
+        "python3",
+        ["python", "-m", "worker"],
+        cwd=str(tmp_path),
+    )
+    proc.environ.return_value = {
+        "PATH": os.pathsep.join([str(outside_bin), str(venv_bin)])
+    }
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_finds_retitled_hermes_venv_map(
+    _winp, tmp_path
+):
+    proc = _proc(
+        206,
+        "/usr/bin/python3",
+        "hermes",
+        ["hermes"],
+        cwd="/tmp",
+    )
+    proc.environ.return_value = {"PATH": "/usr/local/bin:/usr/bin"}
+    proc.memory_maps.return_value = [
+        SimpleNamespace(
+            path=str(
+                tmp_path
+                / "venv"
+                / "lib"
+                / "python3.13"
+                / "site-packages"
+                / "setproctitle.cpython-313.so"
+            )
+        )
+    ]
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [match[0] for match in matches] == [206]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_ignores_unrelated_retitled_hermes_map(
+    _winp, tmp_path
+):
+    proc = _proc(
+        207,
+        "/usr/bin/python3",
+        "hermes",
+        ["hermes"],
+        cwd="/tmp",
+    )
+    proc.environ.return_value = {"PATH": "/usr/local/bin:/usr/bin"}
+    proc.memory_maps.return_value = [
+        SimpleNamespace(path="/opt/other/lib/setproctitle.so")
+    ]
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_excludes_only_self(_winp, tmp_path):
+    import os as _os
+
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    parent = MagicMock()
+    parent.pid = 555
+    me = MagicMock()
+    me.parents.return_value = [parent]
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [
+                _proc(_os.getpid(), "/usr/bin/python3", "python3", [venv_py, "update"]),
+                _proc(555, "/usr/bin/python3", "python3", [venv_py, "gateway"]),
+            ]
+        ),
+        Process=lambda *a, **k: me,
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [m[0] for m in matches] == [555]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_does_not_hide_reused_quiesced_gateway_pid(
+    _winp, tmp_path
+):
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    proc = _proc(555, "/usr/bin/python3", "python3", [venv_py, "worker"])
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([proc]),
+        Process=MagicMock(),
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ), patch(
+        "gateway.status.get_process_start_time", return_value=222
+    ):
+        matches = cli_main._detect_venv_python_processes(
+            exclude_pids={555},
+            exclude_process_start_times={555: 111},
+        )
+
+    assert [match[0] for match in matches] == [555]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_process_iteration_error_is_empty(_winp, tmp_path):
+    def denied_process_iter(_attrs):
+        raise PermissionError("process table denied")
+        yield  # pragma: no cover
+
+    fake_psutil = types.SimpleNamespace(process_iter=denied_process_iter)
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
@@ -87,6 +455,30 @@ def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
         assert cli_main._detect_venv_python_processes() == []
 
 
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_windows_ignores_missing_exe(_winp, tmp_path):
+    venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [_proc(101, None, "python.exe", [venv_py, "-m", "hermes_cli.main"])]
+        ),
+        Process=lambda *a, **k: me,
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_format_venv_holders_message_explains_posix_runtime_mixing(_winp):
+    msg = cli_main._format_venv_python_holders_message(
+        [(101, "python3", "venv/bin/python -m hermes_cli.main serve")]
+    )
+    assert "already-loaded modules" in msg
+    assert "newly-written package files" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +501,18 @@ def _update_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _run_update_until_guard(args):
+def _run_update_until_guard(
+    args,
+    *,
+    is_windows=True,
+    detector=None,
+    quiesce_token=None,
+    quiesce=None,
+    release=None,
+    profile_gateways=(),
+    windows_resume_token=None,
+    authorize_runtime_restarts=None,
+):
     """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
 
     Everything before the guard is stubbed; the guard firing is observed via
@@ -124,21 +527,48 @@ def _run_update_until_guard(args):
         def __truediv__(self, _other):
             raise _PastGuard
 
-    with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
+    detector_effect = detector or (
+        lambda **_kw: [
+            (101, "python.exe", "python.exe -m hermes_cli.main serve")
+        ]
+    )
+    quiesce_effect = (
+        quiesce if quiesce is not None else lambda _pids: quiesce_token
+    )
+    release_effect = release or MagicMock()
+
+    with patch.object(cli_main, "_is_windows", return_value=is_windows), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
     ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
-        cli_main, "_pause_windows_gateways_for_update", return_value=None
+        cli_main,
+        "_pause_windows_gateways_for_update",
+        return_value=windows_resume_token,
     ), patch.object(
         cli_main, "_resume_windows_gateways_after_update"
     ), patch.object(
         cli_main,
+        "_quiesce_posix_gateways_for_update",
+        side_effect=quiesce_effect,
+    ), patch.object(
+        cli_main,
+        "_release_posix_gateway_quiesce",
+        side_effect=release_effect,
+    ), patch.object(
+        cli_main,
         "_detect_venv_python_processes",
-        return_value=[(101, "python.exe", "python.exe -m hermes_cli.main serve")],
+        side_effect=detector_effect,
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
-    ):
+    ), patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=list(profile_gateways),
+    ), patch("atexit.register"):
         try:
-            cli_main._cmd_update_impl(args, gateway_mode=False)
+            cli_main._cmd_update_impl(
+                args,
+                gateway_mode=False,
+                authorize_runtime_restarts=authorize_runtime_restarts,
+            )
         except _PastGuard:
             return "past_guard"
         except SystemExit as exc:
@@ -160,8 +590,646 @@ def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys):
     assert result == expected, capsys.readouterr().out
 
 
+def test_venv_holder_guard_runs_on_posix(capsys):
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+    )
+    assert result == "exit_2", capsys.readouterr().out
+
+
+def test_direct_posix_update_quiesces_mapped_gateways_without_supervisor(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    seen_holders = []
+    quiesce = MagicMock(
+        return_value={"pids": {666}, "created_markers": []}
+    )
+
+    def detect(*, exclude_pids=None):
+        seen_holders.append(exclude_pids)
+        return []
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+        detector=detect,
+        quiesce=quiesce,
+        profile_gateways=[
+            SimpleNamespace(profile="default", path="/tmp/hermes", pid=666)
+        ],
+    )
+
+    assert result == "past_guard", capsys.readouterr().out
+    quiesce.assert_called_once_with({666})
+    assert seen_holders == [{666}]
+
+
+def test_direct_posix_update_passes_gateway_identity_to_venv_guard(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    seen = []
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [],
+    }
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        # Model a replacement process that reused the quiesced gateway PID.
+        return [(555, "python", "venv/bin/python -m replacement")]
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+        detector=detect,
+        quiesce=MagicMock(return_value=token),
+        profile_gateways=[
+            SimpleNamespace(profile="default", path="/tmp/hermes", pid=555)
+        ],
+    )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
+
+
+def test_venv_holder_recheck_refuses_reused_gateway_pid(monkeypatch, capsys):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    seen = []
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [],
+    }
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        # PID 555 was reused by a replacement gateway after the verified
+        # pre-drain identity (start time 111) was excluded.
+        return [(555, "python", "venv/bin/python -m hermes_cli.main gateway run")]
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={555}
+    ), patch("gateway.status.get_process_start_time", return_value=222), patch(
+        "gateway.status.terminate_pid"
+    ) as terminate_pid, patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce=MagicMock(return_value=token),
+            profile_gateways=[
+                SimpleNamespace(profile="default", path="/tmp/hermes", pid=555)
+            ],
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
+    terminate_pid.assert_not_called()
+
+
+def test_windows_gateway_resume_is_authorized_before_venv_abort(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {},
+        "unmapped": [],
+    }
+    authorize = MagicMock(return_value=True)
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=True,
+        windows_resume_token=token,
+        authorize_runtime_restarts=authorize,
+    )
+
+    assert result == "exit_2", capsys.readouterr().out
+    authorize.assert_called_once_with()
+
+
+def test_windows_gateway_resume_verifies_profile_replacement(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {"work": 101},
+        "unmapped": [],
+    }
+    seen = []
+
+    def detect(**kwargs):
+        seen.append(kwargs)
+        if len(seen) == 1:
+            # The supervisor replaced the paused worker with PID 202, while
+            # the pause token still records the original PID 101.
+            return [
+                (202, "python.exe", "python.exe -m hermes_cli.main gateway run")
+            ]
+        return []
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={202}
+    ), patch("gateway.status.terminate_pid"), patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=True,
+            detector=detect,
+            windows_resume_token=token,
+            profile_gateways=[
+                SimpleNamespace(profile="work", path="C:/hermes", pid=202)
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert len(seen) == 2
+
+
+def test_windows_gateway_resume_verifies_profile_launcher(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {"work": 101},
+        "unmapped": [],
+        "launcher_start_times": {303: 111},
+    }
+    seen = []
+
+    def detect(**kwargs):
+        seen.append(kwargs)
+        if len(seen) == 1:
+            # The profile map records the worker, while the venv guard sees
+            # its distinct launcher parent (PID 303).
+            return [
+                (
+                    303,
+                    "python.exe",
+                    "python.exe -m hermes_cli.main gateway run",
+                )
+            ]
+        return []
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={303}
+    ), patch.object(
+        cli_main, "_venv_launcher_ancestors", return_value=[303]
+    ), patch("gateway.status.get_process_start_time", return_value=111), patch(
+        "gateway.status.terminate_pid"
+    ), patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=True,
+            detector=detect,
+            windows_resume_token=token,
+            profile_gateways=[
+                SimpleNamespace(profile="work", path="C:/hermes", pid=202)
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert len(seen) == 2
+
+
+def test_windows_gateway_resume_verifies_unmapped_launcher(
+    capsys,
+):
+    token = {
+        "resume_needed": True,
+        "profiles": {},
+        "unmapped_pids": [202],
+        "unmapped": [
+            {
+                "pid": 202,
+                "argv": [
+                    "pythonw.exe",
+                    "-m",
+                    "hermes_cli.main",
+                    "gateway",
+                    "run",
+                ],
+            }
+        ],
+        "unmapped_launcher_pids": [303],
+        "launcher_start_times": {303: 111},
+    }
+    seen = []
+
+    def detect(**kwargs):
+        seen.append(kwargs)
+        if len(seen) == 1:
+            return [
+                (
+                    303,
+                    "python.exe",
+                    "python.exe -m hermes_cli.main gateway run",
+                )
+            ]
+        return []
+
+    with patch.object(
+        cli_main, "_leftover_pausable_gateway_pids", return_value={303}
+    ), patch("gateway.status.get_process_start_time", return_value=111), patch(
+        "gateway.status.terminate_pid"
+    ), patch(
+        "hermes_cli.update_cmd._time.sleep"
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=True,
+            detector=detect,
+            windows_resume_token=token,
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize(
+    "quiesce_token",
+    [
+        None,
+        {"pids": {666}, "created_markers": []},
+    ],
+)
+def test_direct_posix_update_aborts_when_any_mapped_gateway_cannot_quiesce(
+    monkeypatch, capsys, quiesce_token
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    detector = MagicMock(return_value=[])
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+        detector=detector,
+        quiesce=MagicMock(return_value=quiesce_token),
+        profile_gateways=[
+            SimpleNamespace(profile="default", path="/tmp/hermes", pid=666),
+            SimpleNamespace(profile="work", path="/tmp/work", pid=777),
+        ],
+    )
+
+    assert result == "exit_2"
+    detector.assert_not_called()
+    assert "Could not establish" in capsys.readouterr().out
+
+
+def test_partial_posix_quiescence_is_released_before_abort(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
+    token = {"pids": {666}, "created_markers": []}
+    release = MagicMock()
+
+    result = _run_update_until_guard(
+        _update_args(force=False, force_venv=False),
+        is_windows=False,
+        detector=MagicMock(return_value=[]),
+        quiesce=MagicMock(return_value=token),
+        release=release,
+        profile_gateways=[
+            SimpleNamespace(profile="default", path="/tmp/hermes", pid=666),
+            SimpleNamespace(profile="work", path="/tmp/work", pid=777),
+        ],
+    )
+
+    assert result == "exit_2", capsys.readouterr().out
+    release.assert_called_once_with(token)
+
+
+def test_released_quiescence_removes_gateway_pid_exclusions(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    seen = []
+    token = {"pids": {666}, "created_markers": []}
+    release = MagicMock()
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(
+            parents=MagicMock(side_effect=PermissionError("denied"))
+        )
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return []
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce=MagicMock(return_value=token),
+            release=release,
+            profile_gateways=[
+                SimpleNamespace(
+                    profile="default",
+                    path="/tmp/hermes",
+                    pid=666,
+                )
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [set()]
+    release.assert_called_once_with(token)
+
+
+def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        return []
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[555, 666]
+    ), patch("gateway.status.get_process_start_time", return_value=111):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token={"pids": {555, 666}, "created_markers": []},
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [({555, 666}, {555: 111})]
+
+
+def test_venv_holder_guard_quiesces_mapped_foreground_gateway_supervisor(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        return []
+
+    # find_gateway_pids deliberately omits ancestors, matching the real
+    # foreground `/update` topology. The independently validated profile PID
+    # mapping must restore the gateway to the drain set before exclusion.
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=111):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token={
+                "pids": {555},
+                "process_start_times": {555: 111},
+                "created_markers": [],
+            },
+            profile_gateways=[
+                SimpleNamespace(profile="default", path="/tmp/hermes", pid=555)
+            ],
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
+
+
+def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        # A profile-scoped dashboard TUI can have a slash worker or compute
+        # host that intentionally called setsid(). It is not the attested
+        # dashboard supervisor or a drained gateway and must still block.
+        return [
+            (
+                777,
+                "python",
+                "venv/bin/python -m tui_gateway.slash_worker",
+            )
+        ]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=111):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
+
+
+def test_venv_holder_guard_binds_attested_dashboard_to_process_identity(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        # PID 555 was attested at start time 111, then reused by this holder.
+        return [(555, "python", "venv/bin/python -m replacement")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=111):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
+
+
+def test_venv_holder_guard_requires_dashboard_pre_spawn_identity(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", raising=False)
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None, exclude_process_start_times=None):
+        seen.append((exclude_pids, exclude_process_start_times))
+        return [(555, "python", "venv/bin/python -m replacement")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=111):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [(set(), None)]
+
+
+def test_venv_holder_guard_keeps_dashboard_visible_without_process_identity(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_START_TIME", "111")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return []
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch("gateway.status.get_process_start_time", return_value=None):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [set()]
+
+
+def test_venv_holder_guard_does_not_trust_unquiesced_dashboard_supervisor(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", raising=False)
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return [(555, "python", "venv/bin/python -m hermes_cli.main serve")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [set()]
+
+
+def test_venv_holder_guard_does_not_exclude_unquiesced_gateway_supervisor(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    seen = []
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(
+            parents=lambda: [SimpleNamespace(pid=555)]
+        )
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return [(555, "python", "venv/bin/python -m hermes_cli.main gateway run")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[555]
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    # The first scan must not exclude the unquiesced supervisor. Because it is
+    # outside the verified profile fleet, the updater refuses without
+    # terminating it or performing a second scan.
+    assert seen == [set()]
+
+
+def test_venv_holder_guard_rejects_non_ancestor_supervisor(monkeypatch, capsys):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "777")
+    seen = []
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(
+            parents=lambda: [SimpleNamespace(pid=555)]
+        )
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return []
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids"
+    ) as find_gateways:
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+        )
+
+    assert result == "past_guard", capsys.readouterr().out
+    assert seen == [set()]
+    find_gateways.assert_not_called()
+
+
 @patch.object(cli_main, "_is_windows", return_value=False)
-def test_quiesce_posix_gateway_confirms_live_drain_state_before_returning(
+def test_quiesce_posix_gateway_confirms_live_drain_state_before_exclusion(
     _winp, tmp_path
 ):
     from gateway.drain_control import drain_request_path
@@ -172,11 +1240,12 @@ def test_quiesce_posix_gateway_confirms_live_drain_state_before_returning(
     marker = drain_request_path(profile_home)
 
     def read_live_state(_path):
-        # The real marker write must happen before the PID is returned as
-        # quiesced to the supervised updater.
+        # The real marker write must happen before the PID becomes eligible
+        # for exclusion from the process guard.
         assert marker.exists()
         return {
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         }
@@ -188,6 +1257,9 @@ def test_quiesce_posix_gateway_confirms_live_drain_state_before_returning(
         "hermes_cli.gateway._get_restart_drain_timeout",
         return_value=1,
     ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
+    ), patch(
         "gateway.status.read_runtime_status",
         side_effect=read_live_state,
     ):
@@ -195,6 +1267,7 @@ def test_quiesce_posix_gateway_confirms_live_drain_state_before_returning(
 
     assert token is not None
     assert token["pids"] == {555}
+    assert token["process_start_times"] == {555: 111}
     assert marker.exists()
 
     cli_main._release_posix_gateway_quiesce(token)
@@ -220,6 +1293,7 @@ def test_quiesce_posix_gateway_refreshes_stale_drain_marker(
         )
         return {
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         }
@@ -233,6 +1307,9 @@ def test_quiesce_posix_gateway_refreshes_stale_drain_marker(
     ), patch(
         "gateway.drain_control.drain_requested",
         return_value=False,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
     ), patch(
         "gateway.status.read_runtime_status",
         side_effect=read_live_state,
@@ -248,7 +1325,7 @@ def test_quiesce_posix_gateway_refreshes_stale_drain_marker(
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
-def test_quiesce_posix_gateway_preserves_active_operator_drain(
+def test_quiesce_posix_gateway_rejects_active_operator_drain(
     _winp, tmp_path
 ):
     from gateway.drain_control import drain_request_path
@@ -272,6 +1349,7 @@ def test_quiesce_posix_gateway_preserves_active_operator_drain(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -301,6 +1379,9 @@ def test_quiesce_posix_gateway_reclaims_orphaned_update_marker(
         owner_pid=999999,
     )
 
+    def process_start_time(pid):
+        return None if pid == 999999 else 111
+
     with patch(
         "hermes_cli.gateway.find_profile_gateway_processes",
         return_value=[proc],
@@ -309,11 +1390,12 @@ def test_quiesce_posix_gateway_reclaims_orphaned_update_marker(
         return_value=1,
     ), patch(
         "gateway.status.get_process_start_time",
-        return_value=None,
+        side_effect=process_start_time,
     ), patch(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -366,6 +1448,7 @@ def test_quiesce_posix_gateway_reclaims_reused_owner_pid(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 333,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -416,6 +1499,7 @@ def test_quiesce_posix_gateway_rejects_live_foreign_updater(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -446,9 +1530,13 @@ def test_release_posix_gateway_preserves_replacement_drain(
         "hermes_cli.gateway._get_restart_drain_timeout",
         return_value=1,
     ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
+    ), patch(
         "gateway.status.read_runtime_status",
         return_value={
             "pid": 555,
+            "start_time": 111,
             "gateway_state": "draining",
             "active_agents": 0,
         },
@@ -463,3 +1551,377 @@ def test_release_posix_gateway_preserves_replacement_drain(
     body = read_drain_request(home=profile_home)
     assert body is not None
     assert body["principal"] == "operator"
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_cleans_up_when_wait_is_interrupted(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=1,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        side_effect=KeyboardInterrupt,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert not marker.exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_rejects_pid_reuse_during_wait(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+    gateway_start_times = iter((111, 222))
+
+    def process_start_time(pid):
+        if pid == 555:
+            return next(gateway_start_times, 222)
+        return 333
+
+    monotonic_values = iter((0.0, 0.0, 4.0))
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=0,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        side_effect=process_start_time,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        return_value={
+            "pid": 555,
+            "start_time": 111,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    ), patch.object(
+        cli_main._time,
+        "monotonic",
+        side_effect=lambda: next(monotonic_values, 4.0),
+    ), patch.object(cli_main._time, "sleep"):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is None
+    assert not marker.exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_rejects_stale_runtime_identity(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+    monotonic_values = iter((0.0, 0.0, 4.0))
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=0,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=222,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        return_value={
+            "pid": 555,
+            "start_time": 111,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    ), patch.object(
+        cli_main._time,
+        "monotonic",
+        side_effect=lambda: next(monotonic_values, 4.0),
+    ), patch.object(cli_main._time, "sleep"):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is None
+    assert not marker.exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_finish_posix_quiesce_retains_drain_for_live_old_gateway(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    with patch("gateway.status._pid_exists", return_value=True), patch(
+        "gateway.status.get_process_start_time", return_value=111
+    ):
+        surviving = cli_main._finish_posix_gateway_quiesce(token)
+
+    assert surviving == {555}
+    assert token["retain_on_exit"] is True
+    assert drain_request_path(profile_home).exists()
+
+    cli_main._release_posix_gateway_quiesce_at_exit(token)
+    assert drain_request_path(profile_home).exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_mutation_guard_retains_drain_on_early_exit_until_finish(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": set(),
+        "process_start_times": {},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    cli_main._mark_posix_gateway_mutation(token)
+    cli_main._release_posix_gateway_quiesce_at_exit(token)
+
+    assert token["mutation_started"] is True
+    assert token["retain_on_exit"] is True
+    assert drain_request_path(profile_home).exists()
+
+    assert cli_main._finish_posix_gateway_quiesce(token) == set()
+    assert token["retain_on_exit"] is False
+    assert not drain_request_path(profile_home).exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_proven_noop_disarms_mutation_exit_guard(_winp, tmp_path):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": set(),
+        "process_start_times": {},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    cli_main._begin_posix_gateway_mutation(token)
+    cli_main._complete_posix_gateway_mutation(token, mutated=False)
+    cli_main._release_posix_gateway_quiesce_at_exit(token)
+
+    assert token["retain_on_exit"] is False
+    assert not drain_request_path(profile_home).exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_finish_posix_quiesce_releases_drain_after_pid_reuse(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        drain_request_path,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    marker = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="owned",
+        owner_pid=os.getpid(),
+    )
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [
+            {"home": profile_home, "marker": marker, "pid": 555}
+        ],
+    }
+
+    with patch("gateway.status._pid_exists", return_value=True), patch(
+        "gateway.status.get_process_start_time", return_value=222
+    ):
+        surviving = cli_main._finish_posix_gateway_quiesce(token)
+
+    assert surviving == set()
+    assert token["retain_on_exit"] is False
+    assert not drain_request_path(profile_home).exists()
+
+
+def test_disarm_posix_quiesce_before_forced_restart_clears_token(
+    monkeypatch,
+):
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [{"pid": 555}],
+        "retain_on_exit": True,
+    }
+    release = MagicMock()
+    monkeypatch.setattr(cli_main, "_release_posix_gateway_quiesce", release)
+
+    cli_main._disarm_posix_gateway_quiesce_before_forced_restart(token)
+
+    release.assert_called_once_with(token)
+    assert token["pids"] == set()
+    assert token["process_start_times"] == {}
+    assert token["retain_on_exit"] is False
+
+
+def test_disarm_posix_quiesce_before_forced_restart_preserves_other_gateways(
+    monkeypatch,
+):
+    token = {
+        "pids": {555, 666},
+        "process_start_times": {555: 111, 666: 222},
+        "created_markers": [
+            {"pid": 555, "home": "/tmp/one", "marker": {}},
+            {"pid": 666, "home": "/tmp/two", "marker": {}},
+        ],
+        "retain_on_exit": True,
+    }
+    release = MagicMock()
+    monkeypatch.setattr(cli_main, "_release_posix_gateway_quiesce", release)
+
+    cli_main._disarm_posix_gateway_quiesce_before_forced_restart(
+        token,
+        gateway_pids={555},
+    )
+
+    release.assert_called_once()
+    released = release.call_args.args[0]
+    assert [entry["pid"] for entry in released["created_markers"]] == [555]
+    assert token["pids"] == {666}
+    assert token["process_start_times"] == {666: 222}
+    assert [entry["pid"] for entry in token["created_markers"]] == [666]
+    assert token["retain_on_exit"] is True
+
+
+def test_systemd_restart_target_maps_profile_when_main_pid_lookup_fails(
+    monkeypatch,
+):
+    from hermes_cli import update_cmd
+
+    token = {
+        "created_markers": [
+            {"pid": 555, "home": "/hermes/default"},
+            {"pid": 666, "home": "/hermes/profiles/coder"},
+        ]
+    }
+    monkeypatch.setattr(
+        update_cmd,
+        "_gateway_service_suffix_for_home",
+        lambda home: "" if str(home) == "/hermes/default" else "coder",
+    )
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "hermes-gateway-coder.service", 0, token
+    ) == {666}
+
+
+def test_systemd_restart_target_maps_rotated_main_pid_to_owned_marker(
+    monkeypatch,
+):
+    from hermes_cli import update_cmd
+
+    token = {
+        "created_markers": [
+            {"pid": 555, "home": "/hermes/profiles/coder"},
+        ]
+    }
+    monkeypatch.setattr(
+        update_cmd,
+        "_gateway_service_suffix_for_home",
+        lambda _home: "coder",
+    )
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "hermes-gateway-coder.service", 777, token
+    ) == {555}
+
+
+def test_systemd_restart_target_fails_closed_for_multiple_unmapped_markers():
+    from hermes_cli import update_cmd
+
+    token = {
+        "created_markers": [
+            {"pid": 555, "home": "/hermes/one"},
+            {"pid": 666, "home": "/hermes/two"},
+        ]
+    }
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "unrelated.service", 0, token
+    ) == set()
+
+
+def test_systemd_restart_target_uses_single_marker_when_main_pid_missing():
+    from hermes_cli import update_cmd
+
+    token = {"created_markers": [{"pid": 555, "home": "/hermes/one"}]}
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "unrelated.service", 0, token
+    ) == {555}

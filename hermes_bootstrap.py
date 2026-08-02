@@ -226,12 +226,216 @@ def activate_durable_lazy_target() -> None:
         pass
 
 
+def _raw_cli_command_path(argv: list[str]) -> list[str]:
+    """Return positional command tokens without importing the CLI parser."""
+    value_flags = {
+        "-c",
+        "--continue",
+        "-m",
+        "--model",
+        "--profile",
+        "-p",
+        "--provider",
+        "-r",
+        "--resume",
+        "-s",
+        "--skills",
+        "-t",
+        "--toolsets",
+        "--usage-file",
+        "-z",
+        "--oneshot",
+    }
+    positionals: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            positionals.extend(argv[i + 1 :])
+            break
+        if token.startswith("-"):
+            if "=" not in token and token in value_flags and i + 1 < len(argv):
+                i += 2
+            else:
+                i += 1
+            continue
+        positionals.append(token)
+        i += 1
+    return positionals
+
+
+def _module_invocation_entrypoint() -> str:
+    """Classify ``python -m`` before the target package finishes importing.
+
+    During a module launch, CPython temporarily exposes ``sys.argv[0]`` as
+    ``-m`` while it imports the target package's ``__init__.py``.  The original
+    interpreter arguments retain the requested module name, so package-level
+    gates can still identify the runtime before any package re-exports load
+    managed dependencies.
+    """
+    original = getattr(sys, "orig_argv", ())
+    try:
+        module_flag = original.index("-m")
+        module = original[module_flag + 1]
+    except (AttributeError, IndexError, ValueError):
+        return "other"
+    return {
+        "hermes_cli.main": "cli",
+        "gateway.run": "gateway",
+        "tui_gateway.entry": "dashboard",
+        "cron.scheduler": "cron",
+    }.get(module, "other")
+
+
+def _update_gate_entrypoint(argv0: str) -> str:
+    """Classify entry points that may start an updater-managed runtime."""
+    if argv0 == "-m":
+        return _module_invocation_entrypoint()
+    normalized = os.path.abspath(argv0).replace("\\", "/").lower()
+    name = os.path.basename(normalized)
+    if (
+        name in {"hermes", "hermes.exe", "hermes-script.py"}
+        or normalized.endswith("/hermes_cli/main.py")
+    ):
+        return "cli"
+    if normalized.endswith("/gateway/run.py"):
+        return "gateway"
+    if normalized.endswith("/tui_gateway/entry.py"):
+        return "dashboard"
+    if normalized.endswith("/cron/scheduler.py"):
+        return "cron"
+    return "other"
+
+
+def _invokes_update(argv: list[str], entrypoint: str) -> bool:
+    command_path = _raw_cli_command_path(argv)
+    return (
+        entrypoint == "cli"
+        and bool(command_path)
+        and command_path[0] == "update"
+    )
+
+
+def _invokes_updater_desktop_rebuild(
+    argv: list[str],
+    entrypoint: str,
+) -> bool:
+    """Whether this is Tauri's exact updater-owned desktop rebuild stage."""
+    return entrypoint == "cli" and argv == ["desktop", "--build-only"]
+
+
+def _invokes_managed_runtime(argv: list[str], entrypoint: str) -> bool:
+    """Whether this process starts, rather than manages, a runtime."""
+    if entrypoint == "gateway":
+        return True
+    if entrypoint == "dashboard":
+        # tui_gateway.entry is shared by the dashboard and the standalone
+        # native TUI. Only the dashboard restart is updater-owned.
+        return os.environ.get("HERMES_TUI_DASHBOARD", "").strip() == "1"
+    if entrypoint != "cli":
+        return False
+    command_path = _raw_cli_command_path(argv)
+    if not command_path:
+        return False
+    if command_path[0] in {"dashboard", "serve"}:
+        if any(flag in argv for flag in ("--status", "--stop")):
+            return False
+        return not (
+            command_path[0] == "dashboard"
+            and len(command_path) > 1
+            and command_path[1] == "register"
+        )
+    return (
+        command_path[0] == "gateway"
+        and (len(command_path) == 1 or command_path[1] == "run")
+    )
+
+
+def enforce_update_launch_gate(
+    argv: list[str] | None = None,
+    *,
+    entrypoint: str | None = None,
+) -> None:
+    """Block every Hermes entry point while its install is being mutated.
+
+    This function is intentionally stdlib-only through ``update_lock`` and is
+    called during this bootstrap import, before ``hermes_cli.main`` can run
+    interrupted-install recovery or any sibling entry point can import its
+    runtime dependencies.
+    """
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    kind = entrypoint or _update_gate_entrypoint(sys.argv[0])
+    invokes_update = _invokes_update(raw_argv, kind)
+    invokes_updater_rebuild = _invokes_updater_desktop_rebuild(
+        raw_argv,
+        kind,
+    )
+    try:
+        from hermes_cli.update_lock import (
+            HANDOFF_PID_ENV,
+            UPDATE_EXIT_CONCURRENT,
+            describe_holder,
+            is_verified_handoff,
+            is_verified_import_probe,
+            read_live_update,
+        )
+
+        holder = read_live_update()
+    except Exception:
+        # Preserve the lock's best-effort contract: unreadable state must not
+        # permanently wedge every Hermes command.
+        return
+    if holder is None:
+        return
+    # The post-update skew probe is deliberately run as ``python -c`` while
+    # its updater parent owns the marker.  Admit only that exact interpreter
+    # shape plus a parent-pid attestation; ordinary sibling imports remain
+    # blocked until the updater explicitly authorizes runtime restarts.
+    if (
+        sys.argv[0] == "-c"
+        and is_verified_import_probe(holder.pid)
+    ):
+        return
+    if invokes_update or invokes_updater_rebuild:
+        # A Tauri updater holds the marker while its Python child stage starts.
+        # It invokes both ``hermes update`` and the exact
+        # ``hermes desktop --build-only`` follow-up under that claim. Admit
+        # only that verified owner/child pairing before recovery; every
+        # foreign command is blocked here, and the update is checked again
+        # atomically by UpdateLock.acquire() to close the read-to-acquire race.
+        try:
+            handoff_pid = int(os.environ.get(HANDOFF_PID_ENV, "").strip())
+        except ValueError:
+            handoff_pid = -1
+        if (
+            (
+                handoff_pid > 0
+                and holder.pid == handoff_pid
+                and is_verified_handoff(holder.pid)
+            )
+            or (handoff_pid <= 0 and is_verified_handoff(holder.pid))
+        ):
+            return
+    if (
+        holder.runtime_restarts_authorized
+        and _invokes_managed_runtime(raw_argv, kind)
+    ):
+        return
+    print(describe_holder(holder))
+    raise SystemExit(UPDATE_EXIT_CONCURRENT)
+
+
 # Apply on import — entry points just need ``import hermes_bootstrap``
 # (or ``from hermes_bootstrap import apply_windows_utf8_bootstrap``) at
 # the very top of their module, before importing anything else.  The
 # import side effect does the right thing.
 apply_windows_utf8_bootstrap()
 suppress_platform_ver_console()
+
+# Keep all supported Hermes runtimes out of a mutating install before any
+# recovery or dependency import can run. The updater itself is admitted and
+# takes the authoritative cross-process lock in ``cmd_update``.
+enforce_update_launch_gate()
 
 # Activate the durable lazy-install target (immutable Docker images) so
 # packages installed into the data volume on a previous run are importable

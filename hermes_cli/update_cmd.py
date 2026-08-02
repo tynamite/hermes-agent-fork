@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -35,7 +36,7 @@ import time as _time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
@@ -198,6 +199,11 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
     Returns ``(ok, failing_module, error_message)``.
     """
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
+    from hermes_cli.update_lock import (
+        IMPORT_PROBE_MARKER_PID_ENV,
+        IMPORT_PROBE_PARENT_PID_ENV,
+        read_live_update,
+    )
 
     probe = (
         "import importlib, sys\n"
@@ -231,9 +237,25 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
+        from tools.environments.local import build_subprocess_env
+
+        probe_env = build_subprocess_env(
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
+        # The bootstrap launch gate sees the live marker held by this updater.
+        # Attest the probe as our direct child so its intentional imports are
+        # admitted without weakening the gate for arbitrary ``python -c``
+        # processes.
+        probe_env.pop(IMPORT_PROBE_MARKER_PID_ENV, None)
+        probe_env[IMPORT_PROBE_PARENT_PID_ENV] = str(os.getpid())
+        marker_holder = read_live_update()
+        if marker_holder is not None and marker_holder.pid > 0:
+            probe_env[IMPORT_PROBE_MARKER_PID_ENV] = str(marker_holder.pid)
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
+            env=probe_env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -2831,68 +2853,250 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     return True, ""
 
 def _detect_venv_python_processes(
-    *, exclude_pids: set[int] | None = None
+    *,
+    exclude_pids: set[int] | None = None,
+    exclude_process_start_times: dict[int, int] | None = None,
 ) -> list[tuple[int, str, str]]:
     """Find live processes running from the project venv's interpreter.
 
-    The hermes.exe shim guard misses the biggest lock-holder class on
-    Windows: the Desktop app's backend (``python.exe -m hermes_cli.main
-    serve``) and anything else running straight off ``venv\\Scripts\\python
-    (w).exe``. Those processes keep native ``.pyd`` extensions mapped, so a
+    On Windows, those processes keep native ``.pyd`` extensions mapped, so a
     dependency sync mid-update dies with access-denied and strands the venv
-    half-updated (ryanc's brotlicffi/_sodium.pyd incidents, July 2026).
+    half-updated. On POSIX, replacing package files is allowed, but a surviving
+    process can then mix already-imported modules with newly-written modules.
 
-    Killing them from here is pointless — the Desktop app supervises its
-    backend and respawns it within seconds — so the caller should refuse and
-    tell the user to close the app instead. Returns ``(pid, name, cmdline)``
-    tuples; empty off-Windows / without psutil / when nothing matches. The
-    calling process and its ancestors are always excluded (a CLI ``hermes
-    update`` itself runs from the venv python). Never raises.
+    POSIX venv launchers are commonly symlinks to a base interpreter, so
+    ``Process.exe()`` alone is insufficient there. Inspect only ``argv[0]`` as
+    the launcher path; never scan arbitrary arguments, which may merely mention
+    the venv. Returns ``(pid, name, cmdline)`` tuples. The calling process is
+    always excluded; Windows also excludes its launcher ancestors. A PID
+    exclusion with a recorded process start time is honored only while that
+    same process identity is still live, so a replacement process that reuses
+    a quiesced gateway PID remains visible. Never raises.
     """
-    if not _m()._is_windows():
-        return []
+    is_windows = _m()._is_windows()
     try:
         import psutil
     except Exception:
         return []
 
     venv_dir = _m().PROJECT_ROOT / "venv"
-    try:
-        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
-    except OSError:
-        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
-    try:
-        root_prefix = str(_m().PROJECT_ROOT.resolve()).lower().rstrip(os.sep) + os.sep
-    except OSError:
-        root_prefix = str(_m().PROJECT_ROOT).lower().rstrip(os.sep) + os.sep
+    posix_venv_prefixes: tuple[str, ...] = ()
+    if is_windows:
+        try:
+            venv_root = str(venv_dir.resolve()).lower()
+        except OSError:
+            venv_root = str(venv_dir).lower()
+        venv_prefix = venv_root.rstrip(os.sep) + os.sep
+    else:
+        # Keep paths case-sensitive and do not resolve Python symlinks to their
+        # base interpreter. Include both the logical and resolved project roots
+        # so installs reached through a symlink still match kernel-normalized
+        # process metadata.
+        project_roots = {
+            os.path.abspath(str(_m().PROJECT_ROOT)),
+            os.path.realpath(str(_m().PROJECT_ROOT)),
+        }
+        posix_venv_prefixes = tuple(
+            os.path.join(root, name).rstrip(os.sep) + os.sep
+            for root in project_roots
+            for name in ("venv", ".venv")
+        )
+    root_prefix = ""
+    if is_windows:
+        try:
+            root_prefix = (
+                str(_m().PROJECT_ROOT.resolve()).lower().rstrip(os.sep) + os.sep
+            )
+        except OSError:
+            root_prefix = str(_m().PROJECT_ROOT).lower().rstrip(os.sep) + os.sep
 
     skip: set[int] = set(exclude_pids or set())
-    skip.add(os.getpid())
+    expected_start_times = {
+        int(pid): int(start_time)
+        for pid, start_time in (exclude_process_start_times or {}).items()
+    }
+    get_process_start_time: Callable[[int], int | None] | None = None
     try:
-        for anc in psutil.Process().parents():
-            skip.add(int(anc.pid))
+        from gateway.status import get_process_start_time as _get_process_start_time
+
+        get_process_start_time = _get_process_start_time
     except Exception:
         pass
+    skip.add(os.getpid())
+    if is_windows:
+        try:
+            for anc in psutil.Process().parents():
+                skip.add(int(anc.pid))
+        except Exception:
+            pass
 
     matches: list[tuple[int, str, str]] = []
     try:
         proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
     except Exception:
         return []
-    for proc in proc_iter:
+    while True:
+        try:
+            proc = next(proc_iter)
+        except StopIteration:
+            break
+        except Exception:
+            # Process enumeration may be denied by a sandboxed macOS sysctl.
+            # The guard is best-effort and must never make updates unusable.
+            break
         try:
             info = proc.info
         except Exception:
             continue
         pid = info.get("pid")
         exe = info.get("exe")
-        if not exe or pid is None or int(pid) in skip:
+        if pid is None:
+            continue
+        pid = int(pid)
+        if pid in skip:
+            expected_start_time = expected_start_times.get(pid)
+            if expected_start_time is None:
+                continue
+            try:
+                current_start_time = (
+                    get_process_start_time(pid)
+                    if get_process_start_time is not None
+                    else None
+                )
+            except Exception:
+                current_start_time = None
+            if current_start_time == expected_start_time:
+                continue
+        cmdline = info.get("cmdline") or []
+        cmdline_raw = " ".join(cmdline)
+        exe_raw = str(exe or "")
+
+        if not is_windows:
+            process_markers = [
+                Path(value).name.lower()
+                for value in (
+                    exe_raw,
+                    info.get("name") or "",
+                    cmdline[0] if cmdline else "",
+                )
+                if value
+            ]
+            if not any(
+                re.fullmatch(
+                    r"(?:python(?:w)?(?:\d+(?:\.\d+)*t?d?)?|pypy(?:\d+(?:\.\d+)*)?)(?:\.exe)?",
+                    marker,
+                )
+                for marker in process_markers
+            ):
+                continue
+
+            argv0 = str(cmdline[0]) if cmdline else ""
+            if argv0 and not os.path.isabs(argv0):
+                cwd = str(info.get("cwd") or "")
+                if cwd and not os.path.isabs(cwd):
+                    cwd = ""
+                if os.sep in argv0:
+                    # Relative launch paths are meaningful only in the target
+                    # process's cwd. Never fall back to the updater's cwd when
+                    # psutil could not read that metadata.
+                    argv0 = os.path.join(cwd, argv0) if cwd else ""
+                else:
+                    # A process launched after activating the venv commonly
+                    # retains a bare argv[0] such as ``python`` even though
+                    # its executable resolves to the base interpreter. Use
+                    # that process's PATH (not ours) to recover the launcher
+                    # path without scanning unrelated command arguments.
+                    try:
+                        target_path = (proc.environ() or {}).get("PATH", "")
+                    except Exception:
+                        target_path = ""
+                    resolved_argv0 = ""
+                    if target_path:
+                        for path_entry in target_path.split(os.pathsep):
+                            if not path_entry:
+                                if not cwd:
+                                    continue
+                                search_dir = cwd
+                            elif os.path.isabs(path_entry):
+                                search_dir = path_entry
+                            elif cwd:
+                                search_dir = os.path.join(cwd, path_entry)
+                            else:
+                                continue
+                            candidate = os.path.abspath(
+                                os.path.join(search_dir, argv0)
+                            )
+                            if os.path.isfile(candidate) and os.access(
+                                candidate, os.X_OK
+                            ):
+                                resolved_argv0 = candidate
+                                break
+                    argv0 = resolved_argv0
+            argv0_norm = os.path.abspath(argv0) if argv0 else ""
+            # PROJECT_ROOT is canonicalized during startup, but argv[0] can
+            # retain a symlinked checkout alias. Resolve only the launcher
+            # directory so ``<alias>/venv/bin/python`` maps back under the
+            # canonical venv without following the Python launcher symlink to
+            # its external base interpreter.
+            argv0_canonical_dir = (
+                os.path.join(
+                    os.path.realpath(os.path.dirname(argv0_norm)),
+                    os.path.basename(argv0_norm),
+                )
+                if argv0_norm
+                else ""
+            )
+            exe_path_norm = os.path.abspath(exe_raw) if exe_raw else ""
+            is_holder = any(
+                path.startswith(prefix)
+                for path in (
+                    argv0_norm,
+                    argv0_canonical_dir,
+                    exe_path_norm,
+                )
+                for prefix in posix_venv_prefixes
+            )
+            # setproctitle rewrites a Hermes process's argv to bare ``hermes``,
+            # hiding the venv launcher while Process.exe() may resolve its
+            # symlink to the base interpreter. The loaded setproctitle native
+            # extension remains mapped from the venv, providing a strict
+            # install-specific fallback without scanning arbitrary arguments.
+            is_retitled_hermes = any(
+                marker == "hermes"
+                for marker in (
+                    Path(str(info.get("name") or "")).name.lower(),
+                    Path(str(cmdline[0] if cmdline else "")).name.lower(),
+                )
+            )
+            if not is_holder and is_retitled_hermes:
+                try:
+                    for mapping in proc.memory_maps():
+                        mapped_raw = str(getattr(mapping, "path", "") or "")
+                        if not mapped_raw:
+                            continue
+                        mapped_path = os.path.abspath(mapped_raw)
+                        if any(
+                            mapped_path.startswith(prefix)
+                            for prefix in posix_venv_prefixes
+                        ):
+                            is_holder = True
+                            break
+                except Exception:
+                    pass
+            if not is_holder:
+                continue
+            name = info.get("name") or Path(exe_raw or argv0).name
+            matches.append((int(pid), str(name), cmdline_raw[:120]))
+            continue
+
+        # Preserve the original Windows contract: inaccessible executable
+        # metadata is not enough to classify a process as a venv holder.
+        if not exe_raw:
             continue
         try:
-            exe_norm = str(Path(exe).resolve()).lower()
+            exe_norm = str(Path(exe_raw).resolve()).lower()
         except (OSError, ValueError):
-            exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
+            exe_norm = exe_raw.lower()
         cmdline_low = cmdline_raw.lower()
         cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
 
@@ -2911,7 +3115,7 @@ def _detect_venv_python_processes(
                 is_holder = True
         if not is_holder:
             continue
-        name = info.get("name") or Path(exe).name
+        name = info.get("name") or Path(exe_raw).name
         matches.append((int(pid), str(name), cmdline_raw[:120]))
     return matches
 
@@ -2931,12 +3135,20 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     if len(matches) > 6:
         lines.append(f"  ... and {len(matches) - 6} more")
     lines.append("")
-    lines.append(
-        "  On Windows these keep native extension files (.pyd) locked, so the"
-    )
-    lines.append(
-        "  dependency update would fail partway and leave a broken install."
-    )
+    if _m()._is_windows():
+        lines.append(
+            "  On Windows these keep native extension files (.pyd) locked, so the"
+        )
+        lines.append(
+            "  dependency update would fail partway and leave a broken install."
+        )
+    else:
+        lines.append(
+            "  Updating now could mix the process's already-loaded modules with"
+        )
+        lines.append(
+            "  newly-written package files and leave the running process inconsistent."
+        )
     lines.append(
         "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
     )
@@ -3058,11 +3270,11 @@ def _leftover_pausable_gateway_pids(
 def _quiesce_posix_gateways_for_update(
     gateway_pids: set[int],
 ) -> dict | None:
-    """Drain mapped POSIX gateways before a supervised update mutates files.
+    """Drain mapped POSIX gateways before excluding them from the venv guard.
 
     The external-drain marker makes each gateway refuse new work while its
-    aggregate active-work count reaches zero. Only PIDs whose persisted
-    runtime state confirms that boundary are returned in the ownership token.
+    aggregate active-work count reaches zero.  Only PIDs whose persisted
+    runtime state confirms that boundary are returned as safe exclusions.
     Existing operator/NAS drain markers are preserved and never cleared here.
     """
     if _m()._is_windows() or not gateway_pids:
@@ -3095,6 +3307,18 @@ def _quiesce_posix_gateways_for_update(
     ]
     if not processes:
         return None
+
+    process_start_times: dict[int, int] = {}
+    for proc in processes:
+        pid = int(proc.pid)
+        start_time = get_process_start_time(pid)
+        if start_time is None:
+            logger.debug(
+                "Could not capture gateway PID %s identity before drain",
+                pid,
+            )
+            return None
+        process_start_times[pid] = start_time
 
     created_markers: list[dict] = []
     try:
@@ -3150,7 +3374,11 @@ def _quiesce_posix_gateways_for_update(
                 # earlier machine epoch or terminated updater.
                 if owned_by_this_update:
                     created_markers.append(
-                        {"home": home, "marker": body}
+                        {
+                            "home": home,
+                            "marker": body,
+                            "pid": int(proc.pid),
+                        }
                     )
                     break
                 if (
@@ -3179,6 +3407,7 @@ def _quiesce_posix_gateways_for_update(
                         {
                             "home": home,
                             "marker": payload,
+                            "pid": int(proc.pid),
                         }
                     )
                     break
@@ -3186,11 +3415,13 @@ def _quiesce_posix_gateways_for_update(
                 raise RuntimeError(
                     f"drain marker ownership kept changing for {home}"
                 )
-    except Exception as exc:
-        logger.debug("Could not request pre-update gateway drain: %s", exc)
+    except BaseException as exc:
         _m()._release_posix_gateway_quiesce(
             {"created_markers": created_markers}
         )
+        if not isinstance(exc, Exception):
+            raise
+        logger.debug("Could not request pre-update gateway drain: %s", exc)
         return None
 
     try:
@@ -3199,22 +3430,35 @@ def _quiesce_posix_gateways_for_update(
         timeout = 62.0
     deadline = _time.monotonic() + timeout
     remaining = {int(proc.pid): Path(proc.path) for proc in processes}
-    while remaining and _time.monotonic() < deadline:
-        for pid, home in list(remaining.items()):
-            state = read_runtime_status(home / "gateway_state.json") or {}
-            try:
-                state_pid = int(state.get("pid", 0) or 0)
-                active_agents = int(state.get("active_agents", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if (
-                state_pid == pid
-                and state.get("gateway_state") == "draining"
-                and active_agents == 0
-            ):
-                remaining.pop(pid, None)
-        if remaining:
-            _time.sleep(0.25)
+    try:
+        while remaining and _time.monotonic() < deadline:
+            for pid, home in list(remaining.items()):
+                state = read_runtime_status(home / "gateway_state.json") or {}
+                try:
+                    state_pid = int(state.get("pid", 0) or 0)
+                    state_start_time = int(state["start_time"])
+                    active_agents = int(state.get("active_agents", 0) or 0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                live_start_time = get_process_start_time(pid)
+                if (
+                    state_pid == pid
+                    and state_start_time == process_start_times[pid]
+                    and live_start_time == process_start_times[pid]
+                    and state.get("gateway_state") == "draining"
+                    and active_agents == 0
+                ):
+                    remaining.pop(pid, None)
+            if remaining:
+                _time.sleep(0.25)
+    except BaseException as exc:
+        _m()._release_posix_gateway_quiesce(
+            {"created_markers": created_markers}
+        )
+        if not isinstance(exc, Exception):
+            raise
+        logger.debug("Could not confirm pre-update gateway drain: %s", exc)
+        return None
 
     if remaining:
         logger.warning(
@@ -3228,11 +3472,16 @@ def _quiesce_posix_gateways_for_update(
 
     return {
         "pids": {int(proc.pid) for proc in processes},
+        "process_start_times": process_start_times,
         "created_markers": created_markers,
     }
 
-def _release_posix_gateway_quiesce(token: dict | None) -> None:
-    """Clear only update-owned external-drain markers."""
+def _release_posix_gateway_quiesce(
+    token: dict | None,
+    *,
+    retain_pids: set[int] | None = None,
+) -> None:
+    """Clear update-owned drains except those protecting live old gateways."""
     if not token:
         return
     try:
@@ -3241,8 +3490,16 @@ def _release_posix_gateway_quiesce(token: dict | None) -> None:
         )
     except Exception:
         return
+    retained: list[dict] = []
     markers = token.pop("created_markers", [])
     for owned_marker in markers:
+        try:
+            marker_pid = int(owned_marker.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            marker_pid = 0
+        if retain_pids and marker_pid in retain_pids:
+            retained.append(owned_marker)
+            continue
         home = Path(owned_marker["home"])
         expected = owned_marker.get("marker")
         if not isinstance(expected, dict):
@@ -3264,6 +3521,292 @@ def _release_posix_gateway_quiesce(token: dict | None) -> None:
                 home,
                 exc_info=True,
             )
+    if retained:
+        token["created_markers"] = retained
+
+def _release_posix_gateway_quiesce_at_exit(token: dict | None) -> None:
+    """Release on ordinary exits, preserving drains deliberately retained."""
+    if token and token.get("retain_on_exit"):
+        return
+    _m()._release_posix_gateway_quiesce(token)
+
+
+def _begin_posix_gateway_mutation(token: dict | None) -> None:
+    """Fail closed if an operation exits before reporting whether it mutated."""
+    if token:
+        token["retain_on_exit"] = True
+
+
+def _complete_posix_gateway_mutation(
+    token: dict | None,
+    *,
+    mutated: bool,
+) -> None:
+    """Record a completed mutation probe and disarm a proven no-op."""
+    if not token:
+        return
+    if mutated:
+        token["mutation_started"] = True
+        token["retain_on_exit"] = True
+    elif not token.get("mutation_started"):
+        token["retain_on_exit"] = False
+
+
+def _mark_posix_gateway_mutation(token: dict | None) -> None:
+    """Mark the update boundary as mutating before an irreversible operation."""
+    _m()._begin_posix_gateway_mutation(token)
+    _m()._complete_posix_gateway_mutation(token, mutated=True)
+
+
+def _complete_posix_gateway_noop(token: dict | None) -> None:
+    """Disarm retention after temporary mutations are fully reversed."""
+    if not token:
+        return
+    token.pop("mutation_started", None)
+    token["retain_on_exit"] = False
+
+
+def _prepare_desktop_build_handoff(env: dict[str, str]) -> bool:
+    """Authorize our exact rebuild child, or defer it to the Tauri owner.
+
+    Returns True when a verified parent orchestrator owns the marker and will
+    perform its own rebuild stage. A direct CLI updater instead owns the
+    marker itself, so its PID is added to the child environment for the
+    bootstrap gate's existing owner/child verification.
+    """
+    try:
+        from hermes_cli.update_lock import (
+            HANDOFF_PID_ENV,
+            is_verified_handoff,
+            read_live_update,
+        )
+
+        holder = read_live_update()
+        if holder is None:
+            return False
+        current_pid = os.getpid()
+        if holder.pid == current_pid:
+            env[HANDOFF_PID_ENV] = str(current_pid)
+            return False
+        return is_verified_handoff(holder.pid)
+    except Exception:
+        # Marker creation is best-effort. If it is unavailable, the child sees
+        # no live gate either; an unverifiable foreign holder is not delegated.
+        return False
+
+
+def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
+    """Release drains only after every original gateway identity is gone."""
+    if not token:
+        return set()
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+    except Exception:
+        surviving = {
+            int(pid) for pid in token.get("pids", set())
+        }
+    else:
+        recorded = token.get("process_start_times", {})
+        surviving = set()
+        for raw_pid in token.get("pids", set()):
+            try:
+                pid = int(raw_pid)
+            except (TypeError, ValueError):
+                continue
+            if not _pid_exists(pid):
+                continue
+            before = recorded.get(pid)
+            if before is None:
+                before = recorded.get(str(pid))
+            current = get_process_start_time(pid)
+            if (
+                before is not None
+                and current is not None
+                and current != before
+            ):
+                continue
+            surviving.add(pid)
+
+    token["retain_on_exit"] = bool(surviving)
+    _m()._release_posix_gateway_quiesce(
+        token,
+        retain_pids=surviving,
+    )
+    return surviving
+
+
+def _gateway_service_suffix_for_home(home: object) -> str | None:
+    """Mirror gateway service naming for an arbitrary profile home."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        resolved = Path(home).expanduser().resolve()
+        default = get_default_hermes_root().resolve()
+    except Exception:
+        return None
+    if resolved == default:
+        return ""
+    try:
+        relative = resolved.relative_to(default / "profiles")
+    except ValueError:
+        relative = None
+    if relative is not None and len(relative.parts) == 1:
+        profile = relative.parts[0]
+        if re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", profile):
+            return profile
+    return hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
+
+
+def _gateway_pids_for_systemd_unit(
+    svc_name: str,
+    main_pid: int,
+    token: dict | None,
+) -> set[int]:
+    """Identify the updater-owned gateway marker for a forced restart.
+
+    ``systemctl show MainPID`` can fail while a unit is still active.  The
+    quiesce token retains the original profile homes and PIDs, so use the
+    service-name/profile mapping (and the live PID-file mapping when available)
+    before falling back to a single unambiguous marker.  Returning an empty
+    set for multiple unmapped markers makes the caller fail closed instead of
+    restarting a unit while leaving one of its drains armed.
+    """
+    try:
+        parsed_main_pid = int(main_pid)
+    except (TypeError, ValueError):
+        parsed_main_pid = 0
+    markers = list((token or {}).get("created_markers", []))
+    marker_pids: set[int] = set()
+    marker_homes: dict[int, object] = {}
+    for marker in markers:
+        try:
+            pid = int(marker.get("pid", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        marker_pids.add(pid)
+        marker_homes[pid] = marker.get("home")
+
+    normalized = str(svc_name).removesuffix(".service")
+    prefix = "hermes-gateway"
+    if normalized == prefix:
+        suffix = ""
+    elif normalized.startswith(f"{prefix}-"):
+        suffix = normalized[len(prefix) + 1 :]
+        if suffix == "default":
+            suffix = ""
+    else:
+        suffix = None
+
+    if suffix is not None:
+        by_home = {
+            pid
+            for pid, home in marker_homes.items()
+            if _gateway_service_suffix_for_home(home) == suffix
+        }
+        if by_home:
+            return by_home
+
+        # A gateway can rotate its PID between the update's quiesce snapshot
+        # and the failed MainPID query.  Prefer its profile PID-file mapping,
+        # restricted to markers this update actually owns.
+        try:
+            from hermes_cli.gateway import find_profile_gateway_processes
+
+            live_matches = {
+                int(proc.pid)
+                for proc in find_profile_gateway_processes()
+                if _gateway_service_suffix_for_home(proc.path) == suffix
+            }
+        except Exception:
+            live_matches = set()
+        mapped = live_matches & marker_pids if marker_pids else live_matches
+        if mapped:
+            return mapped
+
+    if parsed_main_pid > 0 and parsed_main_pid in marker_pids:
+        return {parsed_main_pid}
+    # A replaced service has no MainPID that matches the updater snapshot. If
+    # this unit is the only owned marker left, that marker is still the only
+    # safe drain to release before the cgroup restart.
+    if suffix is not None and parsed_main_pid > 0 and len(marker_pids) == 1:
+        return marker_pids
+    if parsed_main_pid > 0:
+        return {parsed_main_pid}
+    if len(marker_pids) == 1:
+        return marker_pids
+    return set()
+
+
+def _disarm_posix_gateway_quiesce_before_forced_restart(
+    token: dict | None,
+    *,
+    gateway_pids: set[int] | None = None,
+) -> None:
+    """Release update drains before a service-manager restart can kill us.
+
+    A POSIX updater launched inside a systemd gateway unit shares that unit's
+    cgroup.  The ``systemctl restart`` fallback kills every remaining member
+    of the cgroup, including this updater, so neither its normal cleanup nor
+    its ``atexit`` callback can clear the updater-owned drain markers.  Clear
+    the markers while we still have a process and disarm the token so the
+    later cleanup path cannot report a drain that was already handed back.
+
+    When a terminal updater is restarting one member of a gateway fleet, pass
+    that unit's original gateway PID. Only that unit's marker is released;
+    drains for gateways that will be restarted later remain armed. Omitting
+    ``gateway_pids`` retains the historical all-gateways behavior for callers
+    that are themselves being terminated with the whole fleet.
+    """
+    if not token:
+        return
+    if gateway_pids is None:
+        _m()._release_posix_gateway_quiesce(token)
+        token["pids"] = set()
+        token["process_start_times"] = {}
+        token["retain_on_exit"] = False
+        return
+
+    target_pids = {int(pid) for pid in gateway_pids if int(pid) > 0}
+    if not target_pids:
+        return
+
+    markers = list(token.get("created_markers", []))
+    target_markers: list[dict] = []
+    remaining_markers: list[dict] = []
+    released_pids: set[int] = set()
+    for marker in markers:
+        try:
+            marker_pid = int(marker.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            marker_pid = 0
+        if marker_pid in target_pids:
+            target_markers.append(marker)
+            released_pids.add(marker_pid)
+        else:
+            remaining_markers.append(marker)
+    if not target_markers:
+        return
+
+    # Use a temporary token so _release_posix_gateway_quiesce cannot pop the
+    # unrelated markers out of the shared fleet token.
+    _m()._release_posix_gateway_quiesce(
+        {"created_markers": target_markers}
+    )
+    token["created_markers"] = remaining_markers
+    token["pids"] = {
+        int(pid)
+        for pid in token.get("pids", set())
+        if int(pid) not in released_pids
+    }
+    recorded = token.get("process_start_times", {})
+    token["process_start_times"] = {
+        pid: start_time
+        for pid, start_time in recorded.items()
+        if int(pid) not in released_pids
+    }
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -3276,7 +3819,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        from gateway.status import terminate_pid
+        from gateway.status import get_process_start_time, terminate_pid
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
@@ -3311,6 +3854,8 @@ def _pause_windows_gateways_for_update() -> dict | None:
                     "profiles": {},
                     "unmapped_pids": [],
                     "unmapped": [],
+                    "unmapped_launcher_pids": [],
+                    "launcher_start_times": {},
                     "cold_start_if_installed": True,
                 }
         except Exception as exc:
@@ -3362,6 +3907,19 @@ def _pause_windows_gateways_for_update() -> dict | None:
         timeout=drain_timeout,
     )
     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
+    # Capture venv-side launcher ancestors before force-killing unmapped
+    # workers, just as for profile-mapped workers above.  The launcher can
+    # outlive its worker and is what the venv-holder guard reports.
+    unmapped_launcher_pids = _m()._venv_launcher_ancestors(unmapped_pids)
+    launcher_pids_all = set(launcher_pids).union(unmapped_launcher_pids)
+    launcher_start_times: dict[int, int] = {}
+    for launcher_pid in launcher_pids_all:
+        try:
+            start_time = get_process_start_time(int(launcher_pid))
+        except Exception:
+            start_time = None
+        if start_time is not None:
+            launcher_start_times[int(launcher_pid)] = int(start_time)
 
     # Snapshot each unmapped gateway's command line *before* we force-kill it,
     # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
@@ -3384,7 +3942,30 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # already exited with its drained worker raises ProcessLookupError below
     # and is skipped.
     force_killed = []
-    for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
+    for pid in sorted(
+        set(survivors)
+        .union(unmapped_pids)
+        .union(launcher_pids)
+        .union(unmapped_launcher_pids)
+    ):
+        if pid in launcher_pids_all:
+            expected_start_time = launcher_start_times.get(int(pid))
+            if expected_start_time is None:
+                logger.debug(
+                    "Skipping launcher PID %s without a verified start time",
+                    pid,
+                )
+                continue
+            try:
+                live_start_time = get_process_start_time(int(pid))
+            except Exception:
+                live_start_time = None
+            if live_start_time != expected_start_time:
+                logger.debug(
+                    "Skipping launcher PID %s after process identity changed",
+                    pid,
+                )
+                continue
         try:
             terminate_pid(int(pid), force=True)
             force_killed.append(int(pid))
@@ -3411,6 +3992,8 @@ def _pause_windows_gateways_for_update() -> dict | None:
         "profiles": profiles,
         "unmapped_pids": unmapped_pids,
         "unmapped": unmapped,
+        "unmapped_launcher_pids": unmapped_launcher_pids,
+        "launcher_start_times": launcher_start_times,
     }
 
 def _cold_start_windows_gateway_after_update() -> None:
@@ -3732,7 +4315,12 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
-def _cmd_update_impl(args, gateway_mode: bool):
+def _cmd_update_impl(
+    args,
+    gateway_mode: bool,
+    *,
+    authorize_runtime_restarts: Callable[[], bool] | None = None,
+):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
     # In gateway mode, use file-based IPC for prompts instead of stdin
@@ -3742,6 +4330,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else None
     )
     assume_yes = bool(getattr(args, "yes", False))
+
+    # A Windows gateway paused at the start of the update must not be resumed
+    # while the install marker is still in its mutation phase: the restarted
+    # child would be rejected by the launch gate.  Keep authorization and
+    # resume coupled for every early-return path (venv-holder abort, ZIP
+    # fallback, no-op/repair, and the normal completion path).  If the marker
+    # cannot be authorized, leave the token for the atexit callback; the
+    # outer ``cmd_update`` releases the marker before that callback runs.
+    _runtime_restarts_authorized = False
+
+    def _authorize_runtime_restarts_once() -> bool:
+        nonlocal _runtime_restarts_authorized
+        if _runtime_restarts_authorized or authorize_runtime_restarts is None:
+            return True
+        try:
+            authorized = bool(authorize_runtime_restarts())
+        except Exception:
+            logger.debug(
+                "Could not authorize Windows gateway resumes",
+                exc_info=True,
+            )
+            return False
+        if authorized:
+            _runtime_restarts_authorized = True
+        return authorized
+
+    def _resume_windows_gateways_for_update(token: dict | None) -> bool:
+        if token and token.get("resume_needed"):
+            if not _authorize_runtime_restarts_once():
+                logger.warning(
+                    "Deferring Windows gateway resume until the update marker "
+                    "is released because runtime restart authorization failed"
+                )
+                return False
+        _m()._resume_windows_gateways_after_update(token)
+        return True
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -3793,25 +4417,323 @@ def _cmd_update_impl(args, gateway_mode: bool):
         import atexit as _atexit
 
         _atexit.register(
-            _m()._resume_windows_gateways_after_update,
+            _resume_windows_gateways_for_update,
             _windows_gateway_resume,
         )
 
-    # With gateways paused, anything still running from the venv interpreter
-    # (most commonly the Desktop app's `hermes serve` backend) will keep .pyd
-    # files locked and corrupt the dependency sync below. Refuse rather than
-    # race: killing the desktop backend is futile (the app supervises and
-    # respawns it), so the user must close the app. Deliberately NOT bypassed
-    # by plain --force: the desktop bootstrap updater passes --force to skip
-    # the hermes.exe shim guard above, but its lock probe only checks the shim
-    # and app.asar — a non-desktop venv python holding a .pyd would sail
-    # through and corrupt the sync (the exact failure this guard exists for).
-    # --force-venv is the explicit escape hatch.
-    if _m()._is_windows() and not getattr(args, "force_venv", False):
-        _venv_holders = _m()._detect_venv_python_processes()
+    # Anything still running from the venv interpreter can make dependency
+    # mutation unsafe: Windows holders lock .pyd files, while POSIX holders can
+    # survive the rewrite and mix old in-memory modules with new files. Refuse
+    # rather than race. Deliberately NOT bypassed by plain --force; only the
+    # explicit --force-venv escape hatch skips this coherence boundary.
+    _posix_gateway_quiesce = None
+    _profile_gateway_pids: set[int] = set()
+    _verified_gateway_pids: set[int] = set()
+    _verified_launcher_start_times: dict[int, int] = {}
+    _quiesced_gateway_start_times: dict[int, int] = {}
+    _supervisor_pid = 0
+    if not getattr(args, "force_venv", False):
+        _venv_guard_exclude: set[int] = set()
+        _quiesced_gateway_pids: set[int] = set()
+        try:
+            if not _m()._is_windows():
+                from hermes_cli.gateway import find_profile_gateway_processes
+
+                _profile_gateway_pids = {
+                    int(proc.pid)
+                    for proc in find_profile_gateway_processes()
+                }
+                _verified_gateway_pids.update(_profile_gateway_pids)
+                # A direct terminal update has no supervisor environment
+                # claim, but it must still drain every profile-mapped gateway
+                # before the venv-holder guard decides whether mutation is
+                # safe. Unmapped holders remain visible to the guard and abort
+                # the update rather than being trusted without an idle proof.
+                _posix_gateway_quiesce = (
+                    _m()._quiesce_posix_gateways_for_update(
+                        _profile_gateway_pids
+                    )
+                )
+                _quiesced_gateway_pids = set(
+                    (_posix_gateway_quiesce or {}).get("pids", set())
+                )
+                _quiesced_gateway_start_times = {
+                    int(pid): int(start_time)
+                    for pid, start_time in (
+                        (_posix_gateway_quiesce or {}).get(
+                            "process_start_times", {}
+                        )
+                    ).items()
+                }
+                if (
+                    _profile_gateway_pids
+                    and not _profile_gateway_pids.issubset(
+                        _quiesced_gateway_pids
+                    )
+                ):
+                    _m()._release_posix_gateway_quiesce(
+                        _posix_gateway_quiesce
+                    )
+                    _posix_gateway_quiesce = None
+                    print(
+                        "✗ Could not establish an updater-owned idle "
+                        "boundary for every running gateway."
+                    )
+                    print(
+                        "  Stop or restart the active gateways, then "
+                        "re-run: hermes update"
+                    )
+                    sys.exit(2)
+                _venv_guard_exclude.update(
+                    _quiesced_gateway_pids
+                )
+                if _posix_gateway_quiesce:
+                    import atexit as _atexit
+
+                    _atexit.register(
+                        _m()._release_posix_gateway_quiesce_at_exit,
+                        _posix_gateway_quiesce,
+                    )
+
+            if _m()._is_windows() and _windows_gateway_resume:
+                # Windows pause/resume owns the mapped profile fleet even
+                # though the POSIX profile scan above is intentionally skipped.
+                # Include the original PIDs and any profile-mapped replacement
+                # discovered after a supervisor respawn before applying the
+                # unmapped-holder refusal below.
+                _windows_profiles = {
+                    str(profile)
+                    for profile in (
+                        _windows_gateway_resume.get("profiles") or {}
+                    )
+                }
+                _verified_gateway_pids.update(
+                    int(pid)
+                    for pid in (
+                        _windows_gateway_resume.get("profiles") or {}
+                    ).values()
+                    if str(pid).isdigit()
+                )
+                _verified_gateway_pids.update(
+                    int(entry["pid"])
+                    for entry in (_windows_gateway_resume.get("unmapped") or [])
+                    if isinstance(entry, dict)
+                    and entry.get("argv")
+                    and str(entry.get("pid", "")).isdigit()
+                )
+                _launcher_start_times = {
+                    int(pid): int(start_time)
+                    for pid, start_time in (
+                        _windows_gateway_resume.get("launcher_start_times")
+                        or {}
+                    ).items()
+                    if str(pid).isdigit() and str(start_time).isdigit()
+                }
+                try:
+                    from gateway.status import get_process_start_time
+                except Exception:
+                    get_process_start_time = None
+                for pid in _launcher_start_times:
+                    if not str(pid).isdigit() or get_process_start_time is None:
+                        continue
+                    expected_start_time = _launcher_start_times.get(int(pid))
+                    if expected_start_time is None:
+                        continue
+                    try:
+                        live_start_time = get_process_start_time(int(pid))
+                    except Exception:
+                        live_start_time = None
+                    if live_start_time == expected_start_time:
+                        _verified_gateway_pids.add(int(pid))
+                        _verified_launcher_start_times[int(pid)] = int(
+                            expected_start_time
+                        )
+                if _windows_profiles:
+                    try:
+                        from hermes_cli.gateway import find_profile_gateway_processes
+
+                        _verified_gateway_pids.update(
+                            int(proc.pid)
+                            for proc in find_profile_gateway_processes()
+                            if str(getattr(proc, "profile", ""))
+                            in _windows_profiles
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not refresh Windows profile gateway identities",
+                            exc_info=True,
+                        )
+                if _verified_gateway_pids:
+                    try:
+                        _launcher_pids = _m()._venv_launcher_ancestors(
+                            sorted(_verified_gateway_pids)
+                        )
+                        if get_process_start_time is not None:
+                            for pid in _launcher_pids:
+                                try:
+                                    start_time = get_process_start_time(int(pid))
+                                except Exception:
+                                    start_time = None
+                                if start_time is not None:
+                                    _verified_gateway_pids.add(int(pid))
+                                    _verified_launcher_start_times[int(pid)] = int(
+                                        start_time
+                                    )
+                    except Exception:
+                        logger.debug(
+                            "Could not refresh Windows gateway launcher identities",
+                            exc_info=True,
+                        )
+
+            _raw_supervisor_pid = os.environ.get(
+                "_HERMES_UPDATE_SUPERVISOR_PID", ""
+            ).strip()
+            _supervisor_pid = (
+                int(_raw_supervisor_pid)
+                if _raw_supervisor_pid.isdigit()
+                else 0
+            )
+            _raw_supervisor_start_time = os.environ.get(
+                "_HERMES_UPDATE_SUPERVISOR_START_TIME", ""
+            ).strip()
+            _supervisor_start_time = (
+                int(_raw_supervisor_start_time)
+                if _raw_supervisor_start_time.isdigit()
+                else None
+            )
+            if _supervisor_pid > 0:
+                import psutil
+
+                _ancestor_pids = {
+                    int(parent.pid) for parent in psutil.Process().parents()
+                }
+                if _supervisor_pid in _ancestor_pids:
+                    # A dashboard supervisor is not a gateway and has no
+                    # gateway drain state. Exclude it only when the dashboard
+                    # launcher attests that its HTTP/WebSocket admission gate
+                    # reached idle before spawning this updater. A gateway
+                    # supervisor is excluded only if its drain was confirmed.
+                    _dashboard_quiesced = (
+                        os.environ.get(
+                            "_HERMES_UPDATE_SUPERVISOR_QUIESCED",
+                            "",
+                        )
+                        == "dashboard"
+                    )
+                    if (
+                        _supervisor_pid not in _profile_gateway_pids
+                        and _dashboard_quiesced
+                    ):
+                        try:
+                            from gateway.status import get_process_start_time
+
+                            _live_supervisor_start_time = (
+                                get_process_start_time(_supervisor_pid)
+                                if _supervisor_start_time is not None
+                                else None
+                            )
+                        except Exception:
+                            _live_supervisor_start_time = None
+                        if (
+                            _supervisor_start_time is not None
+                            and _live_supervisor_start_time
+                            == _supervisor_start_time
+                        ):
+                            _venv_guard_exclude.add(_supervisor_pid)
+                            _quiesced_gateway_start_times[
+                                _supervisor_pid
+                            ] = int(_supervisor_start_time)
+                        else:
+                            logger.debug(
+                                "Could not verify dashboard supervisor PID %s "
+                                "identity against its pre-spawn start time; "
+                                "leaving it visible to the venv-holder guard",
+                                _supervisor_pid,
+                            )
+        except Exception:
+            # Gateway discovery/quiescence and supervisor ancestry validation
+            # both fail closed: no PID is excluded without a verified idle
+            # boundary (psutil missing, AccessDenied, process exited, etc.).
+            _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
+            _posix_gateway_quiesce = None
+            # The handler releases every update-owned boundary, including a
+            # separately attested dashboard supervisor; no holder exclusion
+            # remains valid after that release.
+            _venv_guard_exclude.clear()
+            _quiesced_gateway_pids.clear()
+            _quiesced_gateway_start_times.clear()
+        if _quiesced_gateway_start_times:
+            _venv_holders = _m()._detect_venv_python_processes(
+                exclude_pids=_venv_guard_exclude,
+                exclude_process_start_times=_quiesced_gateway_start_times,
+            )
+        else:
+            _venv_holders = _m()._detect_venv_python_processes(
+                exclude_pids=_venv_guard_exclude
+            )
         if _venv_holders:
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:
+                _verified_gateway_pids_now = set(_verified_gateway_pids)
+                if _quiesced_gateway_start_times:
+                    try:
+                        from gateway.status import get_process_start_time
+                    except Exception:
+                        get_process_start_time = None
+                    for _gateway_pid, _expected_start_time in (
+                        _quiesced_gateway_start_times.items()
+                    ):
+                        if _gateway_pid not in _verified_gateway_pids_now:
+                            continue
+                        try:
+                            _live_start_time = (
+                                get_process_start_time(_gateway_pid)
+                                if get_process_start_time is not None
+                                else None
+                            )
+                        except Exception:
+                            _live_start_time = None
+                        if _live_start_time != _expected_start_time:
+                            _verified_gateway_pids_now.discard(_gateway_pid)
+                if _verified_launcher_start_times:
+                    try:
+                        from gateway.status import get_process_start_time
+                    except Exception:
+                        get_process_start_time = None
+                    for _launcher_pid, _expected_start_time in (
+                        _verified_launcher_start_times.items()
+                    ):
+                        try:
+                            _live_start_time = (
+                                get_process_start_time(_launcher_pid)
+                                if get_process_start_time is not None
+                                else None
+                            )
+                        except Exception:
+                            _live_start_time = None
+                        if _live_start_time != _expected_start_time:
+                            _verified_gateway_pids_now.discard(_launcher_pid)
+                _unmapped_gateway_holders = sorted(
+                    set(_gateway_holders) - _verified_gateway_pids_now
+                )
+                if _unmapped_gateway_holders:
+                    # The updater has no quiesce token or restart
+                    # specification for a gateway outside the verified
+                    # profile fleet.  Refuse rather than terminating it and
+                    # leaving the user's manual/custom-home gateway down.
+                    print(
+                        "✗ A gateway outside the verified profile fleet still "
+                        "holds the Hermes venv."
+                    )
+                    print(
+                        "  Refusing to stop it automatically; stop that "
+                        "gateway, then re-run: hermes update"
+                    )
+                    _m()._release_posix_gateway_quiesce(
+                        _posix_gateway_quiesce
+                    )
+                    _resume_windows_gateways_for_update(_windows_gateway_resume)
+                    sys.exit(2)
                 # Every remaining holder is a gateway the pause machinery
                 # already owns — respawned by its supervisor inside the
                 # pause→guard window, or up through a spawn path discovery
@@ -3832,10 +4754,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             "Could not stop leftover gateway %s: %s", _pid, exc
                         )
                 _time.sleep(1.0)
-                _venv_holders = _m()._detect_venv_python_processes()
+                if _quiesced_gateway_start_times:
+                    _venv_holders = _m()._detect_venv_python_processes(
+                        exclude_pids=_venv_guard_exclude,
+                        exclude_process_start_times=_quiesced_gateway_start_times,
+                    )
+                else:
+                    _venv_holders = _m()._detect_venv_python_processes(
+                        exclude_pids=_venv_guard_exclude
+                    )
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
+            _resume_windows_gateways_for_update(_windows_gateway_resume)
             sys.exit(2)
 
     # Try git-based update first, fall back to ZIP download on Windows
@@ -3902,7 +4833,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         try:
             _update_via_zip(args)
         finally:
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            _resume_windows_gateways_for_update(_windows_gateway_resume)
         return
 
     # Fetch and pull
@@ -3948,6 +4879,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        _temporary_checkout_mutated = False
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -3955,6 +4887,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the same thing — get HEAD onto the requested branch first, then
         # fast-forward.
         if current_branch != branch:
+            pre_checkout_sha = _capture_head_sha(
+                git_cmd,
+                _m().PROJECT_ROOT,
+            )
+            _m()._mark_posix_gateway_mutation(_posix_gateway_quiesce)
+            _temporary_checkout_mutated = True
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
@@ -3983,20 +4921,53 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if track_result.returncode != 0:
                     # Restore the user's prior branch + stash before bailing
                     # so we don't leave them stranded in a weird state.
+                    stash_restored = auto_stash_ref is None
                     if auto_stash_ref is not None:
-                        _m()._restore_stashed_changes(
+                        stash_restored = _m()._restore_stashed_changes(
                             git_cmd,
                             _m().PROJECT_ROOT,
                             auto_stash_ref,
                             prompt_user=False,
                             input_fn=gw_input_fn,
                         )
+                    post_checkout_sha = _capture_head_sha(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                    )
+                    branch_result = subprocess.run(
+                        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                        check=False,
+                    )
+                    if (
+                        stash_restored
+                        and pre_checkout_sha is not None
+                        and post_checkout_sha == pre_checkout_sha
+                        and branch_result.returncode == 0
+                        and branch_result.stdout.strip() == current_branch
+                    ):
+                        _m()._complete_posix_gateway_noop(
+                            _posix_gateway_quiesce
+                        )
                     print(f"✗ Branch '{branch}' does not exist locally or on origin.")
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            _m()._begin_posix_gateway_mutation(
+                _posix_gateway_quiesce
+            )
+            auto_stash_ref = _m()._stash_local_changes_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+            )
+            _m()._complete_posix_gateway_mutation(
+                _posix_gateway_quiesce,
+                mutated=auto_stash_ref is not None,
+            )
+            _temporary_checkout_mutated = auto_stash_ref is not None
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -4016,27 +4987,69 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         if commit_count == 0:
             _invalidate_update_cache()
+            _fork_sync_mutated = False
 
             # Even if origin is up to date, the fork may be behind upstream
             if is_fork and branch == "main":
+                pre_sync_sha = _capture_head_sha(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                )
+                _m()._begin_posix_gateway_mutation(
+                    _posix_gateway_quiesce
+                )
                 _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+                post_sync_sha = _capture_head_sha(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                )
+                _m()._complete_posix_gateway_mutation(
+                    _posix_gateway_quiesce,
+                    mutated=(
+                        pre_sync_sha is None
+                        or post_sync_sha is None
+                        or pre_sync_sha != post_sync_sha
+                    ),
+                )
+                _fork_sync_mutated = (
+                    pre_sync_sha is None
+                    or post_sync_sha is None
+                    or pre_sync_sha != post_sync_sha
+                )
 
             # Restore stash and switch back to original branch if we moved
+            _stash_restored = auto_stash_ref is None
             if auto_stash_ref is not None:
-                _m()._restore_stashed_changes(
+                _stash_restored = _m()._restore_stashed_changes(
                     git_cmd,
                     _m().PROJECT_ROOT,
                     auto_stash_ref,
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
+            _checkout_restored = current_branch == branch
             if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
+                _restore_checkout = subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     check=False,
+                )
+                _checkout_restored = _restore_checkout.returncode == 0
+
+            # The target-branch checkout and autostash are temporary
+            # mutations. Once both are proven restored, and fork sync did not
+            # change HEAD, the original gateways can safely resume if the
+            # remaining runtime probes are also no-ops.
+            if (
+                _temporary_checkout_mutated
+                and _checkout_restored
+                and _stash_restored
+                and not _fork_sync_mutated
+            ):
+                _m()._complete_posix_gateway_noop(
+                    _posix_gateway_quiesce
                 )
 
             # "No new commits" does not mean the managed interpreter is safe.
@@ -4046,11 +5059,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
             runtime_repairs = []
+            _m()._begin_posix_gateway_mutation(_posix_gateway_quiesce)
             update_managed_uv(repair_observer=runtime_repairs.append)
             ensure_uv(repair_observer=runtime_repairs.append)
             runtime_repaired = next(
                 (result for result in runtime_repairs if result.repaired),
                 None,
+            )
+            _m()._complete_posix_gateway_mutation(
+                _posix_gateway_quiesce,
+                mutated=runtime_repaired is not None,
             )
 
             # A current checkout does NOT imply a healthy install: a previous
@@ -4062,6 +5080,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
             if not healthy:
+                _m()._mark_posix_gateway_mutation(
+                    _posix_gateway_quiesce
+                )
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
@@ -4112,7 +5133,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "long-lived processes still use the previous runtime."
                 )
                 print("  Restart each of them to pick up the repaired runtime.")
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            if (
+                _posix_gateway_quiesce
+                and _posix_gateway_quiesce.get("mutation_started")
+            ):
+                surviving = _m()._finish_posix_gateway_quiesce(
+                    _posix_gateway_quiesce
+                )
+                if surviving:
+                    print()
+                    print(
+                        "  ⚠ Update drain retained for gateway PID(s) still "
+                        "running the previous version: "
+                        + ", ".join(str(pid) for pid in sorted(surviving))
+                    )
+                    print(
+                        "    Restart those gateways before cancelling their "
+                        "update drain."
+                    )
+                    if gateway_mode:
+                        _exit_code_path = (
+                            get_hermes_home() / ".update_exit_code"
+                        )
+                        try:
+                            _exit_code_path.write_text(
+                                "1",
+                                encoding="utf-8",
+                            )
+                        except OSError:
+                            pass
+                    _resume_windows_gateways_for_update(_windows_gateway_resume)
+                    sys.exit(1)
+            else:
+                _m()._release_posix_gateway_quiesce(
+                    _posix_gateway_quiesce
+                )
+            _resume_windows_gateways_for_update(_windows_gateway_resume)
             return
 
         print(f"→ Found {commit_count} new commit(s)")
@@ -4125,6 +5181,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        _m()._mark_posix_gateway_mutation(_posix_gateway_quiesce)
         try:
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
@@ -4190,6 +5247,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     if rollback_result.returncode == 0:
                         print("  ✓ Rollback complete — your install is unchanged.")
                         print("  Try ``hermes update`` again later once a fix lands.")
+                        if (
+                            not _temporary_checkout_mutated
+                            and _capture_head_sha(
+                                git_cmd,
+                                _m().PROJECT_ROOT,
+                            )
+                            == pre_pull_sha
+                        ):
+                            _m()._complete_posix_gateway_noop(
+                                _posix_gateway_quiesce
+                            )
                     else:
                         print("  ✗ Rollback failed. Recover manually with:")
                         print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
@@ -4392,14 +5460,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # subprocess would run with source_mode=False — mirror that here.
             # Any error in the pre-check falls through to the subprocess.
             _skip_desktop_build = False
-            try:
-                _skip_desktop_build = not _m()._desktop_build_needed(
-                    desktop_dir, _m().PROJECT_ROOT, source_mode=False
-                )
-            except Exception:
-                _skip_desktop_build = False
+            from hermes_constants import with_hermes_node_path
+
+            _build_env = with_hermes_node_path()
+            _desktop_build_delegated = _prepare_desktop_build_handoff(
+                _build_env
+            )
+            if _desktop_build_delegated:
+                _skip_desktop_build = True
+            else:
+                try:
+                    _skip_desktop_build = not _m()._desktop_build_needed(
+                        desktop_dir, _m().PROJECT_ROOT, source_mode=False
+                    )
+                except Exception:
+                    _skip_desktop_build = False
             if _skip_desktop_build:
-                print("  ✓ Desktop app up to date")
+                if _desktop_build_delegated:
+                    print("  → Desktop rebuild delegated to the app updater")
+                else:
+                    print("  ✓ Desktop app up to date")
             else:
                 _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
                 # Capture the (very loud) Electron/vite build output into
@@ -4414,9 +5494,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # (Desktop → hermes-setup → hermes update), the shell PATH
                 # customizations are lost, so a bare-PATH child would fail with
                 # `node: not found` before cmd_gui can self-heal.
-                from hermes_constants import with_hermes_node_path
-
-                _build_env = with_hermes_node_path()
                 build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
                 if build_result.returncode != 0:
                     build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
@@ -4885,6 +5962,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
             except OSError:
                 pass
 
+        if not _authorize_runtime_restarts_once():
+            if gateway_mode:
+                try:
+                    (get_hermes_home() / ".update_exit_code").write_text(
+                        "1",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            print(
+                "✗ Could not authorize post-update runtime restarts; "
+                "leaving existing processes untouched."
+            )
+            sys.exit(1)
+
         gateway_fleet_restart_incomplete = False
 
         # Auto-restart ALL gateways after update.
@@ -5160,7 +6252,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 text=True, encoding="utf-8", errors="replace",
                                 timeout=5,
                             )
-                            _main_pid = int((_show.stdout or "").strip() or 0)
+                            if _show.returncode != 0:
+                                _main_pid = 0
+                            else:
+                                _main_pid = int((_show.stdout or "").strip() or 0)
                         except (
                             ValueError,
                             subprocess.TimeoutExpired,
@@ -5280,6 +6375,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 f"    passwordless sudo for systemctl, or run updates with sudo."
                             )
                             return
+
+                        # A service-manager restart can SIGKILL this updater
+                        # with the gateway unit's cgroup. Release the affected
+                        # updater-owned drain before entering that fallback;
+                        # otherwise the replacement gateway can inherit a
+                        # marker that this process never gets to clear.
+                        _target_gateway_pids = _gateway_pids_for_systemd_unit(
+                            svc_name,
+                            _main_pid,
+                            _posix_gateway_quiesce,
+                        )
+                        if (
+                            _main_pid <= 0
+                            and _posix_gateway_quiesce
+                            and _posix_gateway_quiesce.get("created_markers")
+                            and not _target_gateway_pids
+                        ):
+                            failed_or_stale_units.append(svc_name)
+                            print(
+                                f"  ⚠ {svc_name}: could not identify its updater-owned "
+                                "drain after MainPID lookup failed; skipping forced "
+                                "restart to avoid stranding another gateway's drain."
+                            )
+                            return
+                        _m()._disarm_posix_gateway_quiesce_before_forced_restart(
+                            _posix_gateway_quiesce,
+                            gateway_pids=_target_gateway_pids,
+                        )
 
                         # Fallback: blunt systemctl restart.  This is
                         # what the old code always did; we get here only
@@ -5414,8 +6537,46 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
+            manual_pids = set(
+                find_gateway_pids(
+                    exclude_pids=service_pids,
+                    all_profiles=True,
+                )
+            )
+            # Generic discovery intentionally excludes updater ancestors and
+            # can miss gateways whose process title was shortened to bare
+            # ``hermes``. Restore every PID that was independently
+            # profile-mapped and quiesced before mutation, while leaving
+            # service-owned processes to their managers above.
+            quiesced_profile_pids = set()
+            _recorded_quiesced_start_times = (
+                (_posix_gateway_quiesce or {}).get("process_start_times", {})
+            )
+            try:
+                from gateway.status import get_process_start_time
+            except Exception:
+                get_process_start_time = None
+            if get_process_start_time is not None:
+                for _raw_pid in (
+                    set((_posix_gateway_quiesce or {}).get("pids", set()))
+                    & _profile_gateway_pids
+                ):
+                    try:
+                        _pid = int(_raw_pid)
+                        _expected_start_time = _recorded_quiesced_start_times.get(
+                            _pid,
+                            _recorded_quiesced_start_times.get(str(_pid)),
+                        )
+                        _live_start_time = get_process_start_time(_pid)
+                    except Exception:
+                        continue
+                    if (
+                        _expected_start_time is not None
+                        and _live_start_time == _expected_start_time
+                    ):
+                        quiesced_profile_pids.add(_pid)
+            manual_pids.update(
+                quiesced_profile_pids - set(service_pids)
             )
             profile_processes = {
                 proc.pid: proc
@@ -5565,7 +6726,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
 
-        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        _surviving_quiesced_pids = (
+            _m()._finish_posix_gateway_quiesce(
+                _posix_gateway_quiesce
+            )
+        )
+        if _surviving_quiesced_pids:
+            gateway_fleet_restart_incomplete = True
+            print()
+            print(
+                "  ⚠ Update drain retained for gateway PID(s) still "
+                "running the previous version: "
+                + ", ".join(
+                    str(pid)
+                    for pid in sorted(_surviving_quiesced_pids)
+                )
+            )
+            print(
+                "    Restart those gateways before cancelling their "
+                "update drain."
+            )
+            if gateway_mode:
+                _exit_code_path = get_hermes_home() / ".update_exit_code"
+                try:
+                    _exit_code_path.write_text("1", encoding="utf-8")
+                except OSError:
+                    pass
+        _resume_windows_gateways_for_update(_windows_gateway_resume)
 
         # Warn if legacy Hermes gateway unit files are still installed.
         # When both hermes.service (from a pre-rename install) and the

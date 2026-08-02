@@ -5016,23 +5016,30 @@ def _clear_bytecode_cache(root: Path) -> int:
 from hermes_cli.update_cmd import (  # noqa: F401
     _add_upstream_remote,
     _atomic_replace_dir,
+    _begin_posix_gateway_mutation,
     _capture_head_sha,
     _cmd_update_check,
     _cmd_update_impl,
     _cold_start_windows_gateway_after_update,
+    _complete_posix_gateway_noop,
+    _complete_posix_gateway_mutation,
     _count_commits_between,
     _detect_venv_python_processes,
     _discard_lockfile_churn,
     _discard_stashed_changes,
+    _disarm_posix_gateway_quiesce_before_forced_restart,
     _ensure_acp_launcher,
     _ensure_fhs_path_guard,
     _ensure_uv_for_termux,
     _finish_dashboard_update_cleanup,
+    _finish_posix_gateway_quiesce,
     _for_each_systemd_gateway_unit,
     _format_concurrent_instances_message,
     _format_time_ago,
     _format_venv_python_holders_message,
     _gateway_prompt,
+    _gateway_pids_for_systemd_unit,
+    _gateway_service_suffix_for_home,
     _get_origin_url,
     _has_upstream_remote,
     _install_psutil_android_compat,
@@ -5041,6 +5048,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _is_fork,
     _leftover_pausable_gateway_pids,
     _log_only_write,
+    _mark_posix_gateway_mutation,
     _mark_skip_upstream_prompt,
     _npm_bin_exists,
     _npm_lockfile_changed,
@@ -5057,6 +5065,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _refresh_active_memory_provider_dependencies,
     _refresh_windows_gateway_launchers,
     _release_posix_gateway_quiesce,
+    _release_posix_gateway_quiesce_at_exit,
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
     _resolve_stash_selector,
@@ -9105,9 +9114,16 @@ def cmd_update(args):
         print(describe_holder(_update_lock.holder))
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
+    _update_lock.start_heartbeat()
 
     try:
-        _cmd_update_impl(args, gateway_mode=gateway_mode)
+        _cmd_update_impl(
+            args,
+            gateway_mode=gateway_mode,
+            authorize_runtime_restarts=(
+                _update_lock.authorize_runtime_restarts
+            ),
+        )
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)

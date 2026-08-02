@@ -254,6 +254,8 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
                 "argv": ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"],
             }
         ],
+        "unmapped_launcher_pids": [],
+        "launcher_start_times": {},
     }
     assert waited_for == [101]
     assert terminated == [(202, True)]
@@ -410,6 +412,7 @@ def test_pause_kill_set_covers_venv_guard_abort_set(
         "terminate_pid",
         lambda pid, force=False: terminated.append(int(pid)),
     )
+    monkeypatch.setattr(status_mod, "get_process_start_time", lambda _pid: 123)
 
     cli_main._pause_windows_gateways_for_update()
 
@@ -522,7 +525,5 @@ def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
 # ---------------------------------------------------------------------------
 # cmd_update integration — concurrent-instance gate
 # ---------------------------------------------------------------------------
-
-
 
 

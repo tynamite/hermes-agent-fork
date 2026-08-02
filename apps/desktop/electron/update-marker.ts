@@ -3,8 +3,17 @@
  *
  * The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
  * duration of an `--update` run (see apps/bootstrap-installer/src-tauri/src/
- * update.rs `UpdateMarkerGuard`). The marker body is two lines: the updater's
- * pid and the unix-seconds it started.
+ * update.rs `UpdateMarkerGuard`). The marker starts with the updater's pid and
+ * unix start time. Python may append a third `runtime-restarts` phase line and
+ * a fourth process-start identity; legacy readers intentionally ignore extra
+ * lines.
+ * A short-lived `.hermes-update-in-progress.lock` sidecar serializes stale-
+ * marker cleanup with replacement claims across the Python, Rust, and Electron
+ * writers. Stale cleanup first claims an immutable, monotonically numbered
+ * `.reclaimer-N` generation inside that sidecar, so a delayed reaper cannot
+ * unlink a replacement claim at a reused path.
+ * Its owner file also carries a process-start identity, so a suspended live
+ * updater remains authoritative without trusting a recycled PID.
  *
  * Why: if the user relaunches the desktop mid-update — the window vanished with
  * no progress and looks crashed — a fresh instance must NOT spawn its own local
@@ -21,16 +30,638 @@
  */
 
 import fs from 'fs'
+import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import path from 'path'
 
-// Even with a live-looking PID, never treat a marker older than this as a live
-// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
-// of minutes; past this the marker is almost certainly stale (e.g. the OS
-// recycled the pid onto an unrelated process), so the gate self-heals.
+// Legacy markers without a process-start identity use this age ceiling. New
+// markers retain a verified live owner past the ceiling while rejecting a
+// recycled PID.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+const MARKER_OPERATION_LOCK_STALE_MS = 30 * 1000
+const MARKER_OPERATION_RECLAIMER_NAME = '.reclaimer'
+const MARKER_OPERATION_RECLAIMER_PREFIX = '.reclaimer-'
+
+/**
+ * Return a stable per-process start identity when the host exposes one.
+ *
+ * Sidecar readers must not expire a suspended live updater. Pairing the PID
+ * with this identity preserves that safety while rejecting a recycled PID.
+ * The helper intentionally uses only OS facilities available to the desktop
+ * process; an unavailable probe is treated conservatively by the caller.
+ */
+export function getProcessStartIdentity(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null
+  }
+
+  if (process.platform === 'linux') {
+    try {
+      const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const fields = raw.slice(raw.lastIndexOf(')') + 1).trim().split(/\s+/)
+
+      // After the command name, field 22 (starttime) is index 19.
+      return fields[19] || null
+    } catch {
+      return null
+    }
+  }
+
+  if (process.platform !== 'win32') {
+    try {
+      const output = execFileSync(
+        'ps',
+        ['-o', 'lstart=', '-p', String(pid)],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, LC_ALL: 'C' },
+          stdio: ['ignore', 'pipe', 'ignore']
+        }
+      )
+
+      return output.trim() || null
+    } catch {
+      return null
+    }
+  }
+
+  try {
+    const output = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToFileTimeUtc()`
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 2_000,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore']
+      }
+    )
+
+    return output.trim() || null
+  } catch {
+    return null
+  }
+}
+
+function markerBody(pid: number, startedAt: number, phase = '') {
+  const identity = getProcessStartIdentity(pid)
+
+  if (identity) {
+    return `${pid}\n${startedAt}\n${phase}\n${identity}\n`
+  }
+
+  if (phase) {
+    return `${pid}\n${startedAt}\n${phase}\n`
+  }
+
+  return `${pid}\n${startedAt}\n`
+}
 
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
+}
+
+function markerOperationLockPath(file) {
+  return path.join(path.dirname(file), '.hermes-update-in-progress.lock')
+}
+
+function isPidZombie(pid) {
+  if (process.platform === 'win32') {
+    return false
+  }
+
+  if (process.platform === 'linux') {
+    try {
+      const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const fields = raw.slice(raw.lastIndexOf(')') + 1).trim().split(/\s+/)
+
+      return fields[0] === 'Z'
+    } catch {
+      return false
+    }
+  }
+
+  try {
+    const output = execFileSync(
+      'ps',
+      ['-o', 'state=', '-p', String(pid)],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, LC_ALL: 'C' },
+        stdio: ['ignore', 'pipe', 'ignore']
+      }
+    )
+
+    return output.trim().startsWith('Z')
+  } catch {
+    return false
+  }
+}
+
+function markerReclaimerGeneration(fileName) {
+  if (fileName === MARKER_OPERATION_RECLAIMER_NAME) {
+    return 0
+  }
+
+  if (!fileName.startsWith(MARKER_OPERATION_RECLAIMER_PREFIX)) {
+    return null
+  }
+
+  const suffix = fileName.slice(MARKER_OPERATION_RECLAIMER_PREFIX.length)
+
+  if (!/^\d+$/.test(suffix)) {
+    return null
+  }
+
+  const generation = Number.parseInt(suffix, 10)
+
+  return Number.isSafeInteger(generation) ? generation : null
+}
+
+function markerReclaimerIsLive(reclaimerPath) {
+  let stat
+
+  try {
+    stat = fs.statSync(reclaimerPath)
+  } catch (err) {
+    return err && err.code === 'ENOENT' ? false : true
+  }
+
+  const ageMs = Math.max(0, Date.now() - stat.mtimeMs)
+  let ownerPid = null
+  let ownerIdentity = null
+
+  try {
+    const [pidLine, , identityLine] = fs.readFileSync(reclaimerPath, 'utf8').split('\n')
+    const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
+    ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+    ownerIdentity = (identityLine || '').trim() || null
+  } catch {
+    // A partially-published claim is live for the short stale window.
+  }
+
+  if (ownerPid !== null && isPidAlive(ownerPid)) {
+    if (ownerIdentity) {
+      const currentIdentity = getProcessStartIdentity(ownerPid)
+
+      return currentIdentity === null || currentIdentity === ownerIdentity
+    }
+
+    // Without an identity, a live reclaimer may be suspended past the age
+    // ceiling. Keep it authoritative; never unlink a live claim by age.
+    return true
+  }
+
+  return ownerPid === null && ageMs < MARKER_OPERATION_LOCK_STALE_MS
+}
+
+function acquireMarkerReclaimer(lockDir) {
+  const identity = getProcessStartIdentity(process.pid) || ''
+  const body = `${process.pid}\n${Math.floor(Date.now() / 1000)}\n${identity}\n${randomUUID()}\n`
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    let claims
+
+    try {
+      claims = fs
+        .readdirSync(lockDir, { withFileTypes: true })
+        .map((entry) => {
+          const generation = markerReclaimerGeneration(entry.name)
+
+          return generation === null
+            ? null
+            : { generation, path: path.join(lockDir, entry.name) }
+        })
+        .filter(Boolean)
+    } catch {
+      return null
+    }
+
+    if (claims.some((claim) => markerReclaimerIsLive(claim.path))) {
+      return null
+    }
+
+    const nextGeneration = claims.reduce(
+      (max, claim) => Math.max(max, claim.generation),
+      0
+    ) + 1
+
+    const reclaimerPath = path.join(
+      lockDir,
+      `${MARKER_OPERATION_RECLAIMER_PREFIX}${nextGeneration}`
+    )
+
+    try {
+      fs.writeFileSync(reclaimerPath, body, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o644
+      })
+
+      return reclaimerPath
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') {
+        return null
+      }
+    }
+  }
+
+  return null
+}
+
+function removeMarkerReclaimerClaims(lockDir) {
+  let entries
+
+  try {
+    entries = fs.readdirSync(lockDir, { withFileTypes: true })
+  } catch {
+    return
+  }
+
+  for (const entry of entries) {
+    if (markerReclaimerGeneration(entry.name) === null) {
+      continue
+    }
+
+    const claimPath = path.join(lockDir, entry.name)
+
+    try {
+      fs.unlinkSync(claimPath)
+    } catch (err) {
+      if (err && err.code === 'EISDIR') {
+        try {
+          fs.rmdirSync(claimPath)
+        } catch {
+          void 0
+        }
+      }
+    }
+  }
+}
+
+function reapStaleMarkerOperationLock(lockDir) {
+  const ownerFile = path.join(lockDir, 'owner')
+
+  const readOwnerState = (generationMtime = null) => {
+    if (generationMtime === null) {
+      try {
+        generationMtime = fs.statSync(ownerFile).mtimeMs
+      } catch {
+        try {
+          generationMtime = fs.statSync(lockDir).mtimeMs
+        } catch {
+          return null
+        }
+      }
+    }
+
+    const lockAgeMs = Math.max(0, Date.now() - generationMtime)
+
+    let raw = null
+    let ownerPid = null
+    let ownerIdentity = null
+
+    try {
+      raw = fs.readFileSync(ownerFile, 'utf8')
+      const [pidLine, , identityLine] = raw.split('\n')
+      const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
+      ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+      ownerIdentity = (identityLine || '').trim() || null
+    } catch {
+      // A partially-published owner is bounded by the short stale window.
+    }
+
+    if (ownerPid !== null && isPidAlive(ownerPid)) {
+      if (ownerIdentity) {
+        const currentIdentity = getProcessStartIdentity(ownerPid)
+
+        if (currentIdentity === null || currentIdentity === ownerIdentity) {
+          return { raw, stale: false, generationMtime }
+        }
+      } else if (lockAgeMs < MARKER_OPERATION_LOCK_STALE_MS) {
+        return { raw, stale: false, generationMtime }
+      }
+    } else if (ownerPid === null && lockAgeMs < MARKER_OPERATION_LOCK_STALE_MS) {
+      return { raw, stale: false, generationMtime }
+    }
+
+    return { raw, stale: true, generationMtime }
+  }
+
+  const initial = readOwnerState()
+
+  if (initial === null) {
+    return true
+  }
+
+  if (!initial.stale) {
+    return false
+  }
+
+  const reclaimerPath = acquireMarkerReclaimer(lockDir)
+
+  if (reclaimerPath === null) {
+    return false
+  }
+
+  const current = readOwnerState(initial.generationMtime)
+
+  if (current === null) {
+    return true
+  }
+
+  // Owner bytes identify the generation validated before the claim was
+  // published. A replacement claimant publishes different bytes and cannot
+  // be detached by this delayed reclaimer.
+  if (current.raw !== initial.raw || !current.stale) {
+    return false
+  }
+
+  const reclaimDir = `${lockDir}.reaping-${process.pid}-${randomUUID()}`
+
+  try {
+    fs.renameSync(lockDir, reclaimDir)
+  } catch (err) {
+    return Boolean(err && err.code === 'ENOENT')
+  }
+
+  try {
+    fs.unlinkSync(path.join(reclaimDir, 'owner'))
+  } catch {
+    void 0
+  }
+
+  removeMarkerReclaimerClaims(reclaimDir)
+
+  try {
+    fs.rmdirSync(reclaimDir)
+
+    return true
+  } catch (err) {
+    return Boolean(err && err.code === 'ENOENT')
+  }
+}
+
+function liveMarkerOperationLock(file, { kill, now }) {
+  const lockDir = markerOperationLockPath(file)
+  let lockStat
+
+  try {
+    lockStat = fs.statSync(lockDir)
+  } catch {
+    return null
+  }
+
+  let ownerPid = null
+  let ownerIdentity = null
+
+  try {
+    const [pidLine, , identityLine] = fs.readFileSync(path.join(lockDir, 'owner'), 'utf8').split('\n')
+    const parsedPid = Number.parseInt((pidLine || '').trim(), 10)
+    ownerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null
+    ownerIdentity = (identityLine || '').trim() || null
+  } catch {
+    // The owner file is written immediately after mkdir. Treat that tiny
+    // interval as active, but only until the stale-lock ceiling expires.
+  }
+
+  const ageMs = Math.max(0, now() - lockStat.mtimeMs)
+
+  if (ownerPid !== null) {
+    if (!isPidAlive(ownerPid, kill)) {
+      return null
+    }
+
+    if (ownerIdentity) {
+      const currentIdentity = getProcessStartIdentity(ownerPid)
+
+      if (currentIdentity === null || currentIdentity === ownerIdentity) {
+        return { pid: ownerPid, ageMs }
+      }
+
+      return null
+    }
+
+    return ageMs < MARKER_OPERATION_LOCK_STALE_MS ? { pid: ownerPid, ageMs } : null
+  }
+
+  return ageMs < MARKER_OPERATION_LOCK_STALE_MS
+    ? { pid: -1, ageMs }
+    : null
+}
+
+function withMarkerOperationLock(file, operation) {
+  const lockDir = markerOperationLockPath(file)
+  const ownerFile = path.join(lockDir, 'owner')
+
+  // Marker operations are intentionally short. Avoid blocking Electron's
+  // event loop while another process holds the sidecar; the caller can retry
+  // or re-read the marker when acquisition loses.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.mkdirSync(lockDir)
+    } catch (err) {
+      if (err && err.code === 'EEXIST' && reapStaleMarkerOperationLock(lockDir)) {
+        continue
+      }
+
+      return { acquired: false, value: undefined }
+    }
+
+    try {
+      const identity = getProcessStartIdentity(process.pid) || ''
+      fs.writeFileSync(
+        ownerFile,
+        `${process.pid}\n${Math.floor(Date.now() / 1000)}\n${identity}\n`,
+        {
+          encoding: 'utf8',
+          flag: 'wx',
+          mode: 0o644
+        }
+      )
+
+      return { acquired: true, value: operation() }
+    } finally {
+      try {
+        fs.unlinkSync(ownerFile)
+      } catch {
+        void 0
+      }
+
+      try {
+        fs.rmdirSync(lockDir)
+      } catch {
+        void 0
+      }
+    }
+  }
+
+  return { acquired: false, value: undefined }
+}
+
+function publishExclusive(file, body) {
+  // The sidecar is held by the caller, so an exclusive direct create is a
+  // no-clobber publication that also works on filesystems without hard-link
+  // support (FAT/exFAT and some network mounts).
+  fs.writeFileSync(file, body, {
+    encoding: 'utf8',
+    flag: 'wx',
+    mode: 0o644
+  })
+}
+
+function reclaimStaleMarkerLocked(file, expectedRaw) {
+  try {
+    if (fs.readFileSync(file, 'utf8') !== expectedRaw) {
+      return false
+    }
+  } catch {
+    return true
+  }
+
+  try {
+    fs.unlinkSync(file)
+
+    return true
+  } catch {
+    return !fs.existsSync(file)
+  }
+}
+
+function reclaimStaleMarker(file, expectedRaw) {
+  try {
+    return withMarkerOperationLock(file, () =>
+      reclaimStaleMarkerLocked(file, expectedRaw)
+    )
+  } catch {
+    return { acquired: false, value: false }
+  }
+}
+
+function publishOrReplaceMarkerLocked(file, body, now = Date.now) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      publishExclusive(file, body)
+
+      return true
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') {
+        throw err
+      }
+    }
+
+    let existingRaw
+
+    try {
+      existingRaw = fs.readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+
+    const existingLines = String(existingRaw).split('\n')
+    const [pidLine, startedLine] = existingLines
+    const existingPid = Number.parseInt((pidLine || '').trim(), 10)
+    const startedAt = Number.parseInt((startedLine || '').trim(), 10)
+    const existingIdentity = (existingLines[3] || '').trim() || null
+
+    // A live claim belongs to another updater (or to a handoff that already
+    // published the child pid). Preserve it instead of clobbering it.
+    if (markerOwnerIsLive(existingPid, startedAt, existingIdentity, {
+      now,
+      maxAgeMs: UPDATE_MARKER_MAX_AGE_MS
+    })) {
+      return false
+    }
+
+    // The sidecar is held by the caller, so compare-and-delete the stale
+    // contents and retry exclusive publication before releasing the sidecar.
+    if (!reclaimStaleMarkerLocked(file, existingRaw)) {
+      continue
+    }
+  }
+
+  // Preserve the historical best-effort contract if a racing writer keeps
+  // the path occupied; the caller will leave the existing claim untouched.
+  throw Object.assign(new Error('could not publish update marker'), { code: 'EEXIST' })
+}
+
+function hasLiveMarkerClaimLocked(file, now) {
+  let raw
+
+  try {
+    raw = fs.readFileSync(file, 'utf8')
+  } catch {
+    return false
+  }
+
+  const lines = String(raw).split('\n')
+  const [pidLine, startedLine] = lines
+  const pid = Number.parseInt((pidLine || '').trim(), 10)
+  const startedAt = Number.parseInt((startedLine || '').trim(), 10)
+  const identity = (lines[3] || '').trim() || null
+
+  return markerOwnerIsLive(pid, startedAt, identity, {
+    now,
+    maxAgeMs: UPDATE_MARKER_MAX_AGE_MS
+  })
+}
+
+/**
+ * Spawn an updater only while holding the shared sidecar, and publish its
+ * child PID before releasing that sidecar. A live foreign marker prevents the
+ * spawn entirely; if a legacy writer races the claim, the child is terminated
+ * before this helper returns.
+ */
+export function spawnUpdaterWithMarker(hermesHome, spawn, { now = Date.now } = {}) {
+  const file = markerPath(hermesHome)
+  let child
+  let returned = false
+
+  try {
+    const result = withMarkerOperationLock(file, () => {
+      if (hasLiveMarkerClaimLocked(file, now)) {
+        return null
+      }
+
+      child = spawn()
+
+      if (!child || !Number.isInteger(child.pid) || child.pid <= 0) {
+        return null
+      }
+
+      const startedAt = Math.floor(now() / 1000)
+
+      if (!publishOrReplaceMarkerLocked(file, markerBody(child.pid, startedAt), now)) {
+        return null
+      }
+
+      return child
+    })
+
+    if (result.acquired && result.value) {
+      returned = true
+
+      return result.value
+    }
+  } catch {
+    // Handoff callers fail closed when the shared claim cannot be acquired or
+    // published; an unmarked detached updater must never mutate the checkout.
+  } finally {
+    if (!returned && child && typeof child.kill === 'function') {
+      try {
+        child.kill()
+      } catch {
+        void 0
+      }
+    }
+  }
+
+  return null
 }
 
 // True only if a host process with this pid is currently alive. Signal 0 does
@@ -39,6 +670,10 @@ export function markerPath(hermesHome) {
 // Injectable `kill` keeps it unit-testable.
 export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(process)) {
   if (!Number.isInteger(pid) || pid <= 0) {
+    return false
+  }
+
+  if (isPidZombie(pid)) {
     return false
   }
 
@@ -51,14 +686,43 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
   }
 }
 
+function markerOwnerIsLive(
+  pid: number,
+  startedAt: number,
+  identity: string | null,
+  { now, maxAgeMs, kill }: {
+    now: () => number
+    maxAgeMs: number
+    kill?: typeof process.kill
+  }
+) {
+  if (!Number.isInteger(pid) || !isPidAlive(pid, kill)) {
+    return false
+  }
+
+  if (identity) {
+    const currentIdentity = getProcessStartIdentity(pid)
+
+    // An unavailable identity probe is not evidence of PID reuse. Retain the
+    // claim conservatively rather than opening a concurrent-update window.
+    return currentIdentity === null || currentIdentity === identity
+  }
+
+  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
+
+  return ageMs <= maxAgeMs
+}
+
 /**
  * Read + interpret the marker.
  *
- * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling). Returns `null` for
- * every "no live update" case — absent, unreadable, malformed, dead pid, or
- * past the ceiling — and, when a stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * Returns `{ pid, ageMs }` when an update is GENUINELY still running
+ * (parseable pid that is alive, with a matching identity or within the legacy
+ * age ceiling), or while the marker
+ * operation sidecar is held during publication. Returns `null` for every
+ * other "no live update" case — absent, unreadable, malformed, dead pid,
+ * recycled identity, or a legacy marker past the ceiling — and, when a stale
+ * marker file exists, deletes it so it cannot strand future launches.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -68,11 +732,13 @@ export function readLiveUpdateMarker(
   {
     kill,
     now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS
+    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
+    _retries = 0
   }: {
     now?: () => number
     maxAgeMs?: number
     kill?: typeof process.kill
+    _retries?: number
   } = {}
 ) {
   const file = markerPath(hermesHome)
@@ -81,23 +747,71 @@ export function readLiveUpdateMarker(
   try {
     raw = fs.readFileSync(file, 'utf8')
   } catch {
-    return null // absent or unreadable => no live update
+    const operation = liveMarkerOperationLock(file, { kill, now })
+
+    if (operation || _retries >= 2) {
+      return operation
+    }
+
+    // The sidecar may have been released just before the first marker read
+    // completed. Re-read once after it appears clear so a newly published live
+    // marker cannot be mistaken for absence.
+    return readLiveUpdateMarker(hermesHome, {
+      kill,
+      now,
+      maxAgeMs,
+      _retries: _retries + 1
+    })
   }
 
-  const [pidLine, startedLine] = String(raw).split('\n')
+  const lines = String(raw).split('\n')
+  const [pidLine, startedLine] = lines
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
+  const identity = (lines[3] || '').trim() || null
 
-  if (!alive || ageMs > maxAgeMs) {
-    try {
-      fs.unlinkSync(file)
-    } catch {
-      void 0
+  const alive = markerOwnerIsLive(pid, startedAt, identity, {
+    now,
+    maxAgeMs,
+    kill
+  })
+
+  if (!alive) {
+    const expectedRaw = String(raw)
+    const reclaimed = reclaimStaleMarker(file, expectedRaw)
+
+    if (!reclaimed.value && _retries < 2) {
+      let replacement = expectedRaw
+
+      try {
+        replacement = fs.readFileSync(file, 'utf8')
+      } catch {
+        void 0
+      }
+
+      if (replacement !== expectedRaw) {
+        return readLiveUpdateMarker(hermesHome, {
+          kill,
+          now,
+          maxAgeMs,
+          _retries: _retries + 1
+        })
+      }
     }
 
-    return null
+    const operation = liveMarkerOperationLock(file, { kill, now })
+
+    if (operation || _retries >= 2) {
+      return operation
+    }
+
+    return readLiveUpdateMarker(hermesHome, {
+      kill,
+      now,
+      maxAgeMs,
+      _retries: _retries + 1
+    })
   }
 
   return { pid, ageMs }
@@ -118,10 +832,10 @@ export function readLiveUpdateMarker(
  * files locked and the update bricks.
  *
  * Fix: the desktop writes the marker itself, using the spawned updater's
- * PID, immediately after `spawn()`. The updater's `UpdateMarkerGuard` will
- * later overwrite it with its own PID — that's fine, the marker body is
- * the same format and `readLiveUpdateMarker` only cares that *some* live
- * pid owns it. When the updater finishes it deletes the marker as before.
+ * PID, immediately after `spawn()`. The updater's `UpdateMarkerGuard` adopts
+ * that pre-claim rather than overwriting it; the marker body is the same
+ * format and `readLiveUpdateMarker` only cares that *some* live pid owns it.
+ * When the updater finishes it deletes the marker as before.
  * If the updater never starts (spawn failure) the marker still contains a
  * real PID, so `readLiveUpdateMarker` will self-heal once that PID exits.
  */
@@ -130,7 +844,12 @@ export function writeUpdateMarker(hermesHome, pid, { now = Date.now } = {}) {
   const startedAt = Math.floor(now() / 1000)
 
   try {
-    fs.writeFileSync(file, `${pid}\n${startedAt}\n`, 'utf8')
+    withMarkerOperationLock(file, () => {
+      // Publish with an exclusive create while the sidecar is held. Readers
+      // treat that sidecar as an active operation until the complete body is
+      // written, so no hard-link capability is required.
+      publishOrReplaceMarkerLocked(file, markerBody(pid, startedAt), now)
+    })
   } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The
     // updater will write its own when it reaches run_update.

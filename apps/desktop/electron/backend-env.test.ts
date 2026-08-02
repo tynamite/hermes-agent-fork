@@ -98,6 +98,10 @@ test('normalizeHermesHomeRoot maps profile homes back to the global Hermes root'
     'C:\\Users\\test\\AppData\\Local\\hermes'
   )
   assert.equal(normalizeHermesHomeRoot('/Users/test/.hermes', { pathModule: path.posix }), '/Users/test/.hermes')
+  assert.equal(
+    normalizeHermesHomeRoot('/Users/test/.hermes/team', { pathModule: path.posix }),
+    '/Users/test/.hermes/team'
+  )
 })
 
 test('Windows PATH casing and delimiter are preserved without POSIX sane entries', () => {
