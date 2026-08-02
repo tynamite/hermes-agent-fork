@@ -3634,6 +3634,26 @@ def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
     )
     return surviving
 
+
+def _disarm_posix_gateway_quiesce_before_forced_restart(
+    token: dict | None,
+) -> None:
+    """Release update drains before a service-manager restart can kill us.
+
+    A POSIX updater launched inside a systemd gateway unit shares that unit's
+    cgroup.  The ``systemctl restart`` fallback kills every remaining member
+    of the cgroup, including this updater, so neither its normal cleanup nor
+    its ``atexit`` callback can clear the updater-owned drain markers.  Clear
+    the markers while we still have a process and disarm the token so the
+    later cleanup path cannot report a drain that was already handed back.
+    """
+    if not token:
+        return
+    _m()._release_posix_gateway_quiesce(token)
+    token["pids"] = set()
+    token["process_start_times"] = {}
+    token["retain_on_exit"] = False
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -6199,6 +6219,15 @@ def _cmd_update_impl(
                                 f"    passwordless sudo for systemctl, or run updates with sudo."
                             )
                             return
+
+                        # A service-manager restart can SIGKILL this updater
+                        # with the gateway unit's cgroup.  Release every
+                        # updater-owned drain before entering that fallback;
+                        # otherwise the replacement gateway can inherit a
+                        # marker that this process never gets to clear.
+                        _m()._disarm_posix_gateway_quiesce_before_forced_restart(
+                            _posix_gateway_quiesce
+                        )
 
                         # Fallback: blunt systemctl restart.  This is
                         # what the old code always did; we get here only

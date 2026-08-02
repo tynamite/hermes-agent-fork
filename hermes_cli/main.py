@@ -5027,6 +5027,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _detect_venv_python_processes,
     _discard_lockfile_churn,
     _discard_stashed_changes,
+    _disarm_posix_gateway_quiesce_before_forced_restart,
     _ensure_acp_launcher,
     _ensure_fhs_path_guard,
     _ensure_uv_for_termux,

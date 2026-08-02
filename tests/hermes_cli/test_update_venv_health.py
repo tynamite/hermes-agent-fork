@@ -1808,3 +1808,23 @@ def test_finish_posix_quiesce_releases_drain_after_pid_reuse(
     assert surviving == set()
     assert token["retain_on_exit"] is False
     assert not drain_request_path(profile_home).exists()
+
+
+def test_disarm_posix_quiesce_before_forced_restart_clears_token(
+    monkeypatch,
+):
+    token = {
+        "pids": {555},
+        "process_start_times": {555: 111},
+        "created_markers": [{"pid": 555}],
+        "retain_on_exit": True,
+    }
+    release = MagicMock()
+    monkeypatch.setattr(cli_main, "_release_posix_gateway_quiesce", release)
+
+    cli_main._disarm_posix_gateway_quiesce_before_forced_restart(token)
+
+    release.assert_called_once_with(token)
+    assert token["pids"] == set()
+    assert token["process_start_times"] == {}
+    assert token["retain_on_exit"] is False
