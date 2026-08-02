@@ -105,9 +105,10 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// its `Drop` removes the marker on EVERY exit path — success, early
 /// `return Err`, or a panic that unwinds through `run_update` — so a crashed
 /// or aborted updater can never permanently strand the marker and block
-/// future desktop launches. The marker payload is `{pid}\n{started_at_unix}`
-/// so the desktop's launch gate can detect a stale marker (dead PID / past a
-/// hard ceiling) and self-heal rather than wait forever.
+/// future desktop launches. The marker payload starts with
+/// `{pid}\n{started_at_unix}` and may include a phase plus a process-start
+/// identity, so the desktop's launch gate can detect stale or recycled claims
+/// without expiring a verified live updater solely by age.
 ///
 /// The marker is also the cross-process update lock: `hermes update` claims
 /// the same file (see `hermes_cli/update_lock.py`) so a dashboard-spawned
@@ -127,11 +128,10 @@ struct UpdateMarkerGuard {
     claim_started_at: Option<u64>,
 }
 
-/// Never treat a marker older than this as a live update. Mirrors
-/// UPDATE_MARKER_MAX_AGE_MS in apps/desktop/electron/update-marker.ts and
-/// UPDATE_MARKER_MAX_AGE_SECONDS in hermes_cli/update_lock.py — all three read
-/// this one file, so a shorter ceiling in any of them would steal a lock the
-/// others still consider live.
+/// Legacy markers without a process-start identity use this age ceiling. New
+/// markers retain a live owner with a matching identity past the ceiling.
+/// Mirrors UPDATE_MARKER_MAX_AGE_MS in apps/desktop/electron/update-marker.ts
+/// and UPDATE_MARKER_MAX_AGE_SECONDS in hermes_cli/update_lock.py.
 const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
 const UPDATE_MARKER_OPERATION_LOCK_STALE_SECS: u64 = 30;
 
@@ -146,8 +146,9 @@ struct MarkerOwner {
 }
 
 /// Read the marker and report a live owner, including this process. `None` for
-/// every "no live update" case — absent, unreadable, malformed, dead pid, or
-/// past the ceiling — matching `readLiveUpdateMarker` in the Electron gate.
+/// every "no live update" case — absent, unreadable, malformed, dead pid,
+/// recycled identity, or a legacy marker past the ceiling — matching
+/// `readLiveUpdateMarker` in the Electron gate.
 /// Never panics.
 ///
 /// The caller can distinguish the desktop's pre-written self claim from a
@@ -160,12 +161,26 @@ fn marker_info(path: &Path) -> Option<MarkerOwner> {
     let mut lines = raw.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
     let started_at: u64 = lines.next().unwrap_or("").trim().parse().unwrap_or(0);
+    let _phase = lines.next();
+    let process_identity = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let age_secs = now.saturating_sub(started_at);
-    if age_secs > UPDATE_MARKER_MAX_AGE_SECS || !pid_is_alive(pid) {
+    if !pid_is_alive(pid) {
+        return None;
+    }
+    if let Some(expected) = process_identity {
+        if let Some(current) = process_start_identity(pid) {
+            if current != expected {
+                return None;
+            }
+        }
+    } else if age_secs > UPDATE_MARKER_MAX_AGE_SECS {
         return None;
     }
     Some(MarkerOwner {
@@ -515,6 +530,35 @@ fn pid_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+fn ensure_marker_process_identity_locked(path: &Path, pid: u32, started_at: u64) {
+    let Some(identity) = process_start_identity(pid) else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut lines = raw.lines();
+    if lines.next().and_then(|line| line.trim().parse::<u32>().ok()) != Some(pid) {
+        return;
+    }
+    if lines.next().and_then(|line| line.trim().parse::<u64>().ok()) != Some(started_at) {
+        return;
+    }
+    let phase = lines.next().map(str::trim).filter(|value| *value == "runtime-restarts");
+    let existing_identity = lines.next().map(str::trim).filter(|value| !value.is_empty());
+    if existing_identity == Some(identity.as_str()) {
+        return;
+    }
+    let phase_line = phase.unwrap_or("");
+    let body = format!("{pid}\n{started_at}\n{phase_line}\n{identity}\n");
+    let Ok(mut file) = std::fs::OpenOptions::new().write(true).truncate(true).open(path) else {
+        return;
+    };
+    if let Err(err) = file.write_all(body.as_bytes()).and_then(|()| file.sync_all()) {
+        tracing::debug!(?path, %err, "could not upgrade marker with process identity");
+    }
+}
+
 impl UpdateMarkerGuard {
     /// Claim the marker, or report the live updater that already owns it.
     ///
@@ -530,7 +574,12 @@ impl UpdateMarkerGuard {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let body = format!("{pid}\n{started_at}");
+        let identity = process_start_identity(pid).unwrap_or_default();
+        let body = if identity.is_empty() {
+            format!("{pid}\n{started_at}")
+        } else {
+            format!("{pid}\n{started_at}\n\n{identity}\n")
+        };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -567,6 +616,13 @@ impl UpdateMarkerGuard {
                             let claim_started_at = std::fs::read_to_string(&path)
                                 .ok()
                                 .and_then(|raw| raw.lines().nth(1)?.trim().parse().ok());
+                            if let Some(started_at) = claim_started_at {
+                                ensure_marker_process_identity_locked(
+                                    &path,
+                                    pid,
+                                    started_at,
+                                );
+                            }
                             return Ok(Self {
                                 path,
                                 owned: true,
@@ -1706,13 +1762,55 @@ mod tests {
                 std::process::id(),
                 "marker records our pid so the desktop can probe liveness"
             );
-            assert_eq!(body.lines().count(), 2, "marker is pid + started_at lines");
+            assert!(
+                matches!(body.lines().count(), 2 | 4),
+                "marker uses the legacy or identity-extended wire format"
+            );
         }
 
         assert!(
             !marker.exists(),
             "Drop must remove the marker on every exit path (incl. early return / panic unwind)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_live_marker_survives_age_ceiling() {
+        let Some(identity) = process_start_identity(std::process::id()) else {
+            return;
+        };
+        let dir = unique_tmp_dir("marker-old-live-identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+        let old = unix_now_secs().saturating_sub(UPDATE_MARKER_MAX_AGE_SECS + 60);
+        std::fs::write(
+            &marker,
+            format!("{}\n{old}\n\n{identity}\n", std::process::id()),
+        )
+        .unwrap();
+
+        let owner = marker_info(&marker);
+
+        assert!(owner.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recycled_marker_identity_is_rejected_even_when_fresh() {
+        let Some(_identity) = process_start_identity(std::process::id()) else {
+            return;
+        };
+        let dir = unique_tmp_dir("marker-recycled-identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+        std::fs::write(
+            &marker,
+            format!("{}\n{}\n\nold-start\n", std::process::id(), unix_now_secs()),
+        )
+        .unwrap();
+
+        assert!(marker_info(&marker).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

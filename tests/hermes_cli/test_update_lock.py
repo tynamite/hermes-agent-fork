@@ -563,7 +563,37 @@ def test_acquire_writes_pid_and_start_time(marker):
     lines = marker.read_text(encoding="utf-8").splitlines()
     assert int(lines[0]) == os.getpid(), "the Electron gate probes this pid for liveness"
     assert int(lines[1]) == pytest.approx(time.time(), abs=5)
-    assert len(lines) == 2, "wire format is exactly pid + started_at"
+    assert len(lines) in {2, 4}, "legacy or identity-extended marker format"
+
+
+def test_verified_live_marker_survives_age_ceiling(marker, monkeypatch):
+    from hermes_cli import update_lock
+
+    old = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
+    marker.write_text(
+        f"{os.getpid()}\n{old}\n\nverified-start\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(update_lock, "_process_start_identity", lambda _pid: "verified-start")
+
+    holder = read_live_update(path=marker)
+
+    assert holder is not None
+    assert holder.pid == os.getpid()
+    assert marker.exists()
+
+
+def test_recycled_marker_identity_is_reclaimed_even_when_fresh(marker, monkeypatch):
+    from hermes_cli import update_lock
+
+    marker.write_text(
+        f"{os.getpid()}\n{int(time.time())}\n\nold-start\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(update_lock, "_process_start_identity", lambda _pid: "new-start")
+
+    assert read_live_update(path=marker) is None
+    assert not marker.exists()
 
 
 def test_second_acquire_is_refused_while_the_first_is_live(marker):

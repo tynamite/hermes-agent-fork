@@ -39,6 +39,10 @@ function writeMarker(home, pid, startedAtSec) {
   fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}`)
 }
 
+function writeIdentityMarker(home, pid, startedAtSec, identity) {
+  fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}\n\n${identity}\n`)
+}
+
 const ALIVE: typeof process.kill = () => true // injected kill that "succeeds" => pid alive
 
 const DEAD: typeof process.kill = () => {
@@ -134,6 +138,44 @@ test('expired marker (past age ceiling) => no live update and pruned', () => {
   // Even though the pid is "alive", the marker is too old to trust.
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
   assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+})
+
+test('verified live marker survives the age ceiling', () => {
+  const identity = getProcessStartIdentity(process.pid)
+
+  if (!identity) {
+    return
+  }
+
+  const home = tmpHome('old-live-identity-marker')
+  const now = 1_000_000_000_000
+  writeIdentityMarker(
+    home,
+    process.pid,
+    Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000),
+    identity
+  )
+
+  const res = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+
+  assert.ok(res, 'a verified live owner remains active after the age ceiling')
+  assert.equal(res.pid, process.pid)
+  assert.ok(fs.existsSync(markerPath(home)))
+})
+
+test('recycled marker identity is pruned even while fresh', () => {
+  const identity = getProcessStartIdentity(process.pid)
+
+  if (!identity) {
+    return
+  }
+
+  const home = tmpHome('recycled-marker-identity')
+  const now = 1_000_000_000_000
+  writeIdentityMarker(home, process.pid, Math.floor(now / 1000), 'old-start')
+
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(!fs.existsSync(markerPath(home)))
 })
 
 test('malformed marker => no live update and pruned', () => {

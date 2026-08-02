@@ -4,8 +4,9 @@
  * The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
  * duration of an `--update` run (see apps/bootstrap-installer/src-tauri/src/
  * update.rs `UpdateMarkerGuard`). The marker starts with the updater's pid and
- * unix start time. Python may append a third `runtime-restarts` phase line;
- * this reader intentionally ignores additional lines.
+ * unix start time. Python may append a third `runtime-restarts` phase line and
+ * a fourth process-start identity; legacy readers intentionally ignore extra
+ * lines.
  * A short-lived `.hermes-update-in-progress.lock` sidecar serializes stale-
  * marker cleanup with replacement claims across the Python, Rust, and Electron
  * writers. Its owner file also carries a process-start identity, so a
@@ -29,10 +30,9 @@ import fs from 'fs'
 import { execFileSync } from 'node:child_process'
 import path from 'path'
 
-// Even with a live-looking PID, never treat a marker older than this as a live
-// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
-// of minutes; past this the marker is almost certainly stale (e.g. the OS
-// recycled the pid onto an unrelated process), so the gate self-heals.
+// Legacy markers without a process-start identity use this age ceiling. New
+// markers retain a verified live owner past the ceiling while rejecting a
+// recycled PID.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
 const MARKER_OPERATION_LOCK_STALE_MS = 30 * 1000
 
@@ -100,6 +100,20 @@ export function getProcessStartIdentity(pid: number): string | null {
   } catch {
     return null
   }
+}
+
+function markerBody(pid: number, startedAt: number, phase = '') {
+  const identity = getProcessStartIdentity(pid)
+
+  if (identity) {
+    return `${pid}\n${startedAt}\n${phase}\n${identity}\n`
+  }
+
+  if (phase) {
+    return `${pid}\n${startedAt}\n${phase}\n`
+  }
+
+  return `${pid}\n${startedAt}\n`
 }
 
 export function markerPath(hermesHome) {
@@ -358,18 +372,18 @@ function publishOrReplaceMarkerLocked(file, body, now = Date.now) {
       continue
     }
 
-    const [pidLine, startedLine] = String(existingRaw).split('\n')
+    const existingLines = String(existingRaw).split('\n')
+    const [pidLine, startedLine] = existingLines
     const existingPid = Number.parseInt((pidLine || '').trim(), 10)
     const startedAt = Number.parseInt((startedLine || '').trim(), 10)
-    const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
+    const existingIdentity = (existingLines[3] || '').trim() || null
 
-    // A live, fresh claim belongs to another updater (or to a handoff that
-    // already published the child pid). Preserve it instead of clobbering it.
-    if (
-      Number.isInteger(existingPid) &&
-      isPidAlive(existingPid) &&
-      ageMs <= UPDATE_MARKER_MAX_AGE_MS
-    ) {
+    // A live claim belongs to another updater (or to a handoff that already
+    // published the child pid). Preserve it instead of clobbering it.
+    if (markerOwnerIsLive(existingPid, startedAt, existingIdentity, {
+      now,
+      maxAgeMs: UPDATE_MARKER_MAX_AGE_MS
+    })) {
       return false
     }
 
@@ -394,12 +408,16 @@ function hasLiveMarkerClaimLocked(file, now) {
     return false
   }
 
-  const [pidLine, startedLine] = String(raw).split('\n')
+  const lines = String(raw).split('\n')
+  const [pidLine, startedLine] = lines
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
-  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
+  const identity = (lines[3] || '').trim() || null
 
-  return Number.isInteger(pid) && isPidAlive(pid) && ageMs <= UPDATE_MARKER_MAX_AGE_MS
+  return markerOwnerIsLive(pid, startedAt, identity, {
+    now,
+    maxAgeMs: UPDATE_MARKER_MAX_AGE_MS
+  })
 }
 
 /**
@@ -427,7 +445,7 @@ export function spawnUpdaterWithMarker(hermesHome, spawn, { now = Date.now } = {
 
       const startedAt = Math.floor(now() / 1000)
 
-      if (!publishOrReplaceMarkerLocked(file, `${child.pid}\n${startedAt}\n`, now)) {
+      if (!publishOrReplaceMarkerLocked(file, markerBody(child.pid, startedAt), now)) {
         return null
       }
 
@@ -477,15 +495,43 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
   }
 }
 
+function markerOwnerIsLive(
+  pid: number,
+  startedAt: number,
+  identity: string | null,
+  { now, maxAgeMs, kill }: {
+    now: () => number
+    maxAgeMs: number
+    kill?: typeof process.kill
+  }
+) {
+  if (!Number.isInteger(pid) || !isPidAlive(pid, kill)) {
+    return false
+  }
+
+  if (identity) {
+    const currentIdentity = getProcessStartIdentity(pid)
+
+    // An unavailable identity probe is not evidence of PID reuse. Retain the
+    // claim conservatively rather than opening a concurrent-update window.
+    return currentIdentity === null || currentIdentity === identity
+  }
+
+  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
+
+  return ageMs <= maxAgeMs
+}
+
 /**
  * Read + interpret the marker.
  *
  * Returns `{ pid, ageMs }` when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling), or while the marker
+ * (parseable pid that is alive, with a matching identity or within the legacy
+ * age ceiling), or while the marker
  * operation sidecar is held during publication. Returns `null` for every
- * other "no live update" case — absent, unreadable, malformed, dead pid, or
- * past the ceiling — and, when a stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * other "no live update" case — absent, unreadable, malformed, dead pid,
+ * recycled identity, or a legacy marker past the ceiling — and, when a stale
+ * marker file exists, deletes it so it cannot strand future launches.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -527,13 +573,20 @@ export function readLiveUpdateMarker(
     })
   }
 
-  const [pidLine, startedLine] = String(raw).split('\n')
+  const lines = String(raw).split('\n')
+  const [pidLine, startedLine] = lines
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
+  const identity = (lines[3] || '').trim() || null
 
-  if (!alive || ageMs > maxAgeMs) {
+  const alive = markerOwnerIsLive(pid, startedAt, identity, {
+    now,
+    maxAgeMs,
+    kill
+  })
+
+  if (!alive) {
     const expectedRaw = String(raw)
     const reclaimed = reclaimStaleMarker(file, expectedRaw)
 
@@ -604,7 +657,7 @@ export function writeUpdateMarker(hermesHome, pid, { now = Date.now } = {}) {
       // Publish with an exclusive create while the sidecar is held. Readers
       // treat that sidecar as an active operation until the complete body is
       // written, so no hard-link capability is required.
-      publishOrReplaceMarkerLocked(file, `${pid}\n${startedAt}\n`, now)
+      publishOrReplaceMarkerLocked(file, markerBody(pid, startedAt), now)
     })
   } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The

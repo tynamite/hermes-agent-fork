@@ -22,15 +22,16 @@ entrypoints instead of adding a fourth mechanism. Its wire format remains
 backward-compatible with the Rust and Electron readers:
 
     <HERMES_ROOT>/.hermes-update-in-progress
-        body: "<pid>\\n<started_at_unix>[\\nruntime-restarts]"
+        body: "<pid>\\n<started_at_unix>[\\n<phase>][\\n<process-start-identity>]"
 
-A marker only counts as a live update when its pid is alive AND it is younger
-than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
-crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first. Marker operations use a
-short-lived ``.hermes-update-in-progress.lock`` sidecar acquired with atomic
-directory creation; this serializes stale-marker reclamation with replacement
-claims without moving a path that a different updater may now own.
+A legacy marker only counts as a live update when its pid is alive AND it is
+younger than :data:`UPDATE_MARKER_MAX_AGE_MS`. New markers also carry a
+process-start identity, so a verified live updater remains authoritative past
+that ceiling while a recycled pid is rejected. A stale marker is removed on
+read by whoever notices it first. Marker operations use a short-lived
+``.hermes-update-in-progress.lock`` sidecar acquired with atomic directory
+creation; this serializes stale-marker reclamation with replacement claims
+without moving a path that a different updater may now own.
 The sidecar owner file carries ``pid``, creation time, and a process-start
 identity; a matching live identity remains authoritative even if the updater
 is suspended past the short-operation age fallback.
@@ -311,6 +312,88 @@ def _process_start_identity(pid: int) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _marker_process_start_identity(lines: list[str]) -> str | None:
+    """Read the optional fourth-line process identity from a marker."""
+    if len(lines) <= 3:
+        return None
+    identity = lines[3].strip()
+    return identity or None
+
+
+def _marker_owner_is_live(
+    pid: int,
+    age_seconds: float,
+    process_identity: str | None,
+) -> bool:
+    """Validate a marker owner, retaining verified live claims past the age ceiling."""
+    if not _pid_alive(pid):
+        return False
+    if process_identity:
+        current_identity = _process_start_identity(pid)
+        # An unavailable probe is not evidence of PID reuse. Retain the claim
+        # conservatively rather than opening a concurrent-update window.
+        return current_identity is None or current_identity == process_identity
+    return age_seconds <= UPDATE_MARKER_MAX_AGE_SECONDS
+
+
+def _marker_body(
+    pid: int,
+    started_at: str,
+    process_identity: str | None,
+    *,
+    runtime_restarts: bool = False,
+) -> str:
+    """Render a marker while keeping legacy two-line claims readable."""
+    phase = "runtime-restarts" if runtime_restarts else ""
+    if process_identity:
+        return f"{pid}\n{started_at}\n{phase}\n{process_identity}\n"
+    if runtime_restarts:
+        return f"{pid}\n{started_at}\nruntime-restarts\n"
+    return f"{pid}\n{started_at}\n"
+
+
+def _ensure_marker_process_identity_locked(
+    marker: Path,
+    pid: int,
+    started_at: str,
+) -> None:
+    """Upgrade a legacy/pre-claim marker while its operation sidecar is held."""
+    process_identity = _process_start_identity(pid)
+    if not process_identity:
+        return
+    try:
+        with marker.open("r+b") as handle:
+            raw = handle.read().decode("utf-8")
+            lines = raw.splitlines()
+            if (
+                not lines
+                or int(lines[0].strip()) != pid
+                or len(lines) < 2
+                or lines[1].strip() != started_at
+            ):
+                return
+            if _marker_process_start_identity(lines) == process_identity:
+                return
+            body = _marker_body(
+                pid,
+                started_at,
+                process_identity,
+                runtime_restarts=(
+                    len(lines) > 2 and lines[2].strip() == "runtime-restarts"
+                ),
+            ).encode("utf-8")
+            handle.seek(0)
+            handle.write(body)
+            handle.truncate()
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+    except (OSError, IndexError, ValueError, UnicodeDecodeError):
+        return
 
 
 def _marker_operation_lock_path(marker: Path) -> Path:
@@ -705,8 +788,8 @@ def read_live_update(
     absent/unreadable state means "no live update" only when the marker
     operation sidecar is also clear. A live sidecar is reported as an active
     operation while the replacement marker is being published. Malformed,
-    dead-pid, and past-the-ceiling markers are reclaimed so they can't strand
-    future runs. Never raises.
+    dead-pid, recycled-identity, and legacy past-the-ceiling markers are
+    reclaimed so they can't strand future runs. Never raises.
     """
     marker = path or update_marker_path()
     try:
@@ -743,7 +826,8 @@ def read_live_update(
         started_at = float("-inf")
 
     age = time.time() - started_at
-    if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
+    process_identity = _marker_process_start_identity(lines)
+    if not _marker_owner_is_live(pid, age, process_identity):
         reclaimed = (
             _reclaim_stale_marker_locked(marker, raw)
             if _lock_held
@@ -842,7 +926,11 @@ class UpdateLock:
 
         pid = os.getpid()
         started_at = str(int(time.time()))
-        body = f"{pid}\n{started_at}\n"
+        body = _marker_body(
+            pid,
+            started_at,
+            _process_start_identity(pid),
+        )
         for _attempt in range(8):
             try:
                 with _marker_operation_lock(self.path):
@@ -863,6 +951,22 @@ class UpdateLock:
                                 if is_verified_handoff(existing.pid):
                                     self.holder = existing
                                     self._claim_pid = existing.pid
+                                    try:
+                                        self._claim_started_at = (
+                                            self.path.read_text(
+                                                encoding="utf-8"
+                                            )
+                                            .splitlines()[1]
+                                            .strip()
+                                        )
+                                    except (OSError, IndexError):
+                                        self._claim_started_at = None
+                                    if self._claim_started_at:
+                                        _ensure_marker_process_identity_locked(
+                                            self.path,
+                                            existing.pid,
+                                            self._claim_started_at,
+                                        )
                                     # A previous child stage may have crashed during
                                     # the narrow restart phase. Close that phase
                                     # before this retry performs mutation under the
@@ -972,22 +1076,18 @@ class UpdateLock:
                 ):
                     return False
 
-                prefix = f"{owner}\n{started_at}\n".encode("utf-8")
-                if authorized:
-                    if len(lines) > 2 and lines[2].strip() == "runtime-restarts":
-                        return True
-                    handle.seek(0, os.SEEK_END)
-                    if not raw_bytes.endswith(b"\n"):
-                        handle.write(b"\n")
-                    handle.write(b"runtime-restarts\n")
-                elif raw_bytes.startswith(prefix):
-                    # The first two lines are unchanged; truncating the phase
-                    # suffix avoids exposing a partially rewritten owner.
-                    handle.truncate(len(prefix))
-                else:
-                    handle.seek(0)
-                    handle.write(prefix)
-                    handle.truncate()
+                process_identity = _marker_process_start_identity(lines)
+                if process_identity is None:
+                    process_identity = _process_start_identity(owner)
+                body = _marker_body(
+                    owner,
+                    started_at,
+                    process_identity,
+                    runtime_restarts=authorized,
+                ).encode("utf-8")
+                handle.seek(0)
+                handle.write(body)
+                handle.truncate()
                 handle.flush()
                 try:
                     os.fsync(handle.fileno())
