@@ -30,8 +30,8 @@ process-start identity, so a verified live updater remains authoritative past
 that ceiling while a recycled pid is rejected. A stale marker is removed on
 read by whoever notices it first. Marker operations use a short-lived
 ``.hermes-update-in-progress.lock`` sidecar acquired with atomic directory
-creation; this serializes stale-marker reclamation with replacement claims
-without moving a path that a different updater may now own.
+creation; stale sidecars are first atomically renamed to a unique tombstone so
+two reclaimers cannot unlink a replacement owner's lock.
 The sidecar owner file carries ``pid``, creation time, and a process-start
 identity; a matching live identity remains authoritative even if the updater
 is suspended past the short-operation age fallback.
@@ -454,9 +454,10 @@ def _live_marker_operation_holder(marker: Path) -> tuple[int, float] | None:
 def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
     """Remove a crashed sidecar lock only when its owner is not alive.
 
-    Reaping uses ``unlink`` + ``rmdir``, never rename: a new owner cannot
-    create the directory until ``rmdir`` succeeds, so a competing reaper
-    cannot detach and later delete a replacement lock.
+    Reaping first renames the sidecar to a unique sibling tombstone.  The
+    rename is atomic, so only one competing reaper can take ownership; a new
+    claimant can then create the original path without a delayed reaper being
+    able to unlink its replacement owner file.
     """
     owner_file = lock_dir / "owner"
     owner_identity = ""
@@ -487,9 +488,19 @@ def _reap_stale_marker_operation_lock(lock_dir: Path) -> bool:
                 return False
         elif age < MARKER_OPERATION_LOCK_STALE_SECONDS:
             return False
+    reclaim_dir = lock_dir.with_name(
+        f"{lock_dir.name}.reaping-{os.getpid()}-{time.monotonic_ns()}"
+    )
     try:
-        owner_file.unlink(missing_ok=True)
-        lock_dir.rmdir()
+        lock_dir.rename(reclaim_dir)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    try:
+        (reclaim_dir / "owner").unlink(missing_ok=True)
+        reclaim_dir.rmdir()
     except FileNotFoundError:
         return True
     except OSError:

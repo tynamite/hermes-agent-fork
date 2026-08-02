@@ -380,8 +380,30 @@ fn reap_stale_marker_operation_lock(dir: &Path) -> bool {
     } else if age < UPDATE_MARKER_OPERATION_LOCK_STALE_SECS {
         return false;
     }
-    let _ = std::fs::remove_file(&owner);
-    match std::fs::remove_dir(dir) {
+    let name = dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(".hermes-update-in-progress.lock");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let reclaim_dir = dir.with_file_name(format!(
+        "{name}.reaping-{}-{nonce}",
+        std::process::id()
+    ));
+
+    // Rename the stale sidecar to a unique sibling atomically before deleting
+    // it. A competing reaper can no longer unlink a replacement owner's file
+    // after another claimant recreates the original path.
+    match std::fs::rename(dir, &reclaim_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    }
+
+    let _ = std::fs::remove_file(reclaim_dir.join("owner"));
+    match std::fs::remove_dir(&reclaim_dir) {
         Ok(()) => true,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,

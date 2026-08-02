@@ -1828,3 +1828,32 @@ def test_disarm_posix_quiesce_before_forced_restart_clears_token(
     assert token["pids"] == set()
     assert token["process_start_times"] == {}
     assert token["retain_on_exit"] is False
+
+
+def test_disarm_posix_quiesce_before_forced_restart_preserves_other_gateways(
+    monkeypatch,
+):
+    token = {
+        "pids": {555, 666},
+        "process_start_times": {555: 111, 666: 222},
+        "created_markers": [
+            {"pid": 555, "home": "/tmp/one", "marker": {}},
+            {"pid": 666, "home": "/tmp/two", "marker": {}},
+        ],
+        "retain_on_exit": True,
+    }
+    release = MagicMock()
+    monkeypatch.setattr(cli_main, "_release_posix_gateway_quiesce", release)
+
+    cli_main._disarm_posix_gateway_quiesce_before_forced_restart(
+        token,
+        gateway_pids={555},
+    )
+
+    release.assert_called_once()
+    released = release.call_args.args[0]
+    assert [entry["pid"] for entry in released["created_markers"]] == [555]
+    assert token["pids"] == {666}
+    assert token["process_start_times"] == {666: 222}
+    assert [entry["pid"] for entry in token["created_markers"]] == [666]
+    assert token["retain_on_exit"] is True

@@ -683,6 +683,32 @@ def test_crashed_marker_operation_lock_is_reclaimed(marker):
     assert not operation_lock.exists(), "a dead sidecar owner must not wedge claims"
 
 
+def test_stale_sidecar_reaper_cannot_delete_a_replacement_lock(marker, monkeypatch):
+    """A reaper that wins the rename owns only its tombstone directory."""
+    from hermes_cli import update_lock
+
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    (operation_lock / "owner").write_text(f"{DEAD_PID}\n", encoding="utf-8")
+    original_rename = Path.rename
+
+    def rename_then_publish_replacement(self, target):
+        result = original_rename(self, target)
+        # Model a claimant that recreates the original sidecar immediately
+        # after the stale directory is atomically detached.
+        self.mkdir()
+        (self / "owner").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "rename", rename_then_publish_replacement)
+
+    assert update_lock._reap_stale_marker_operation_lock(operation_lock) is True
+    assert operation_lock.exists()
+    assert (operation_lock / "owner").read_text(encoding="utf-8").startswith(
+        f"{os.getpid()}\n"
+    )
+
+
 def test_live_operation_sidecar_blocks_readers_before_marker_is_published(marker):
     operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
     operation_lock.mkdir()

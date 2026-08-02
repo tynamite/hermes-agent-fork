@@ -3637,6 +3637,8 @@ def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
 
 def _disarm_posix_gateway_quiesce_before_forced_restart(
     token: dict | None,
+    *,
+    gateway_pids: set[int] | None = None,
 ) -> None:
     """Release update drains before a service-manager restart can kill us.
 
@@ -3646,13 +3648,60 @@ def _disarm_posix_gateway_quiesce_before_forced_restart(
     its ``atexit`` callback can clear the updater-owned drain markers.  Clear
     the markers while we still have a process and disarm the token so the
     later cleanup path cannot report a drain that was already handed back.
+
+    When a terminal updater is restarting one member of a gateway fleet, pass
+    that unit's original gateway PID. Only that unit's marker is released;
+    drains for gateways that will be restarted later remain armed. Omitting
+    ``gateway_pids`` retains the historical all-gateways behavior for callers
+    that are themselves being terminated with the whole fleet.
     """
     if not token:
         return
-    _m()._release_posix_gateway_quiesce(token)
-    token["pids"] = set()
-    token["process_start_times"] = {}
-    token["retain_on_exit"] = False
+    if gateway_pids is None:
+        _m()._release_posix_gateway_quiesce(token)
+        token["pids"] = set()
+        token["process_start_times"] = {}
+        token["retain_on_exit"] = False
+        return
+
+    target_pids = {int(pid) for pid in gateway_pids if int(pid) > 0}
+    if not target_pids:
+        return
+
+    markers = list(token.get("created_markers", []))
+    target_markers: list[dict] = []
+    remaining_markers: list[dict] = []
+    released_pids: set[int] = set()
+    for marker in markers:
+        try:
+            marker_pid = int(marker.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            marker_pid = 0
+        if marker_pid in target_pids:
+            target_markers.append(marker)
+            released_pids.add(marker_pid)
+        else:
+            remaining_markers.append(marker)
+    if not target_markers:
+        return
+
+    # Use a temporary token so _release_posix_gateway_quiesce cannot pop the
+    # unrelated markers out of the shared fleet token.
+    _m()._release_posix_gateway_quiesce(
+        {"created_markers": target_markers}
+    )
+    token["created_markers"] = remaining_markers
+    token["pids"] = {
+        int(pid)
+        for pid in token.get("pids", set())
+        if int(pid) not in released_pids
+    }
+    recorded = token.get("process_start_times", {})
+    token["process_start_times"] = {
+        pid: start_time
+        for pid, start_time in recorded.items()
+        if int(pid) not in released_pids
+    }
 
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
@@ -6226,7 +6275,8 @@ def _cmd_update_impl(
                         # otherwise the replacement gateway can inherit a
                         # marker that this process never gets to clear.
                         _m()._disarm_posix_gateway_quiesce_before_forced_restart(
-                            _posix_gateway_quiesce
+                            _posix_gateway_quiesce,
+                            gateway_pids={_main_pid},
                         )
 
                         # Fallback: blunt systemctl restart.  This is

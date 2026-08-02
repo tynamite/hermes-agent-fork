@@ -28,6 +28,7 @@
 
 import fs from 'fs'
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import path from 'path'
 
 // Legacy markers without a process-start identity use this age ceiling. New
@@ -201,14 +202,26 @@ function reapStaleMarkerOperationLock(lockDir) {
     }
   }
 
+  // Move the stale sidecar to a unique sibling atomically before deleting it.
+  // Competing reclaimers that already validated the old owner then fail the
+  // rename, while a new claimant can safely create the original path without
+  // a delayed reaper unlinking its replacement owner file.
+  const reclaimDir = `${lockDir}.reaping-${process.pid}-${randomUUID()}`
+
   try {
-    fs.unlinkSync(ownerFile)
+    fs.renameSync(lockDir, reclaimDir)
+  } catch (err) {
+    return Boolean(err && err.code === 'ENOENT')
+  }
+
+  try {
+    fs.unlinkSync(path.join(reclaimDir, 'owner'))
   } catch {
     void 0
   }
 
   try {
-    fs.rmdirSync(lockDir)
+    fs.rmdirSync(reclaimDir)
 
     return true
   } catch (err) {
