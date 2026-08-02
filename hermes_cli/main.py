@@ -5038,6 +5038,8 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _format_time_ago,
     _format_venv_python_holders_message,
     _gateway_prompt,
+    _gateway_pids_for_systemd_unit,
+    _gateway_service_suffix_for_home,
     _get_origin_url,
     _has_upstream_remote,
     _install_psutil_android_compat,

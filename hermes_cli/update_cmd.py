@@ -3635,6 +3635,104 @@ def _finish_posix_gateway_quiesce(token: dict | None) -> set[int]:
     return surviving
 
 
+def _gateway_service_suffix_for_home(home: object) -> str | None:
+    """Mirror gateway service naming for an arbitrary profile home."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        resolved = Path(home).expanduser().resolve()
+        default = get_default_hermes_root().resolve()
+    except Exception:
+        return None
+    if resolved == default:
+        return ""
+    try:
+        relative = resolved.relative_to(default / "profiles")
+    except ValueError:
+        relative = None
+    if relative is not None and len(relative.parts) == 1:
+        profile = relative.parts[0]
+        if re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", profile):
+            return profile
+    return hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
+
+
+def _gateway_pids_for_systemd_unit(
+    svc_name: str,
+    main_pid: int,
+    token: dict | None,
+) -> set[int]:
+    """Identify the updater-owned gateway marker for a forced restart.
+
+    ``systemctl show MainPID`` can fail while a unit is still active.  The
+    quiesce token retains the original profile homes and PIDs, so use the
+    service-name/profile mapping (and the live PID-file mapping when available)
+    before falling back to a single unambiguous marker.  Returning an empty
+    set for multiple unmapped markers makes the caller fail closed instead of
+    restarting a unit while leaving one of its drains armed.
+    """
+    try:
+        parsed_main_pid = int(main_pid)
+    except (TypeError, ValueError):
+        parsed_main_pid = 0
+    if parsed_main_pid > 0:
+        return {parsed_main_pid}
+
+    markers = list((token or {}).get("created_markers", []))
+    marker_pids: set[int] = set()
+    marker_homes: dict[int, object] = {}
+    for marker in markers:
+        try:
+            pid = int(marker.get("pid", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        marker_pids.add(pid)
+        marker_homes[pid] = marker.get("home")
+
+    normalized = str(svc_name).removesuffix(".service")
+    prefix = "hermes-gateway"
+    if normalized == prefix:
+        suffix = ""
+    elif normalized.startswith(f"{prefix}-"):
+        suffix = normalized[len(prefix) + 1 :]
+        if suffix == "default":
+            suffix = ""
+    else:
+        suffix = None
+
+    if suffix is not None:
+        by_home = {
+            pid
+            for pid, home in marker_homes.items()
+            if _gateway_service_suffix_for_home(home) == suffix
+        }
+        if by_home:
+            return by_home
+
+        # A gateway can rotate its PID between the update's quiesce snapshot
+        # and the failed MainPID query.  Prefer its profile PID-file mapping,
+        # restricted to markers this update actually owns.
+        try:
+            from hermes_cli.gateway import find_profile_gateway_processes
+
+            live_matches = {
+                int(proc.pid)
+                for proc in find_profile_gateway_processes()
+                if _gateway_service_suffix_for_home(proc.path) == suffix
+            }
+        except Exception:
+            live_matches = set()
+        mapped = live_matches & marker_pids if marker_pids else live_matches
+        if mapped:
+            return mapped
+
+    if len(marker_pids) == 1:
+        return marker_pids
+    return set()
+
+
 def _disarm_posix_gateway_quiesce_before_forced_restart(
     token: dict | None,
     *,
@@ -6148,7 +6246,10 @@ def _cmd_update_impl(
                                 text=True, encoding="utf-8", errors="replace",
                                 timeout=5,
                             )
-                            _main_pid = int((_show.stdout or "").strip() or 0)
+                            if _show.returncode != 0:
+                                _main_pid = 0
+                            else:
+                                _main_pid = int((_show.stdout or "").strip() or 0)
                         except (
                             ValueError,
                             subprocess.TimeoutExpired,
@@ -6270,13 +6371,31 @@ def _cmd_update_impl(
                             return
 
                         # A service-manager restart can SIGKILL this updater
-                        # with the gateway unit's cgroup.  Release every
+                        # with the gateway unit's cgroup. Release the affected
                         # updater-owned drain before entering that fallback;
                         # otherwise the replacement gateway can inherit a
                         # marker that this process never gets to clear.
+                        _target_gateway_pids = _gateway_pids_for_systemd_unit(
+                            svc_name,
+                            _main_pid,
+                            _posix_gateway_quiesce,
+                        )
+                        if (
+                            _main_pid <= 0
+                            and _posix_gateway_quiesce
+                            and _posix_gateway_quiesce.get("created_markers")
+                            and not _target_gateway_pids
+                        ):
+                            failed_or_stale_units.append(svc_name)
+                            print(
+                                f"  ⚠ {svc_name}: could not identify its updater-owned "
+                                "drain after MainPID lookup failed; skipping forced "
+                                "restart to avoid stranding another gateway's drain."
+                            )
+                            return
                         _m()._disarm_posix_gateway_quiesce_before_forced_restart(
                             _posix_gateway_quiesce,
-                            gateway_pids={_main_pid},
+                            gateway_pids=_target_gateway_pids,
                         )
 
                         # Fallback: blunt systemctl restart.  This is

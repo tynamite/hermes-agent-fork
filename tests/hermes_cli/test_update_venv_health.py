@@ -1857,3 +1857,50 @@ def test_disarm_posix_quiesce_before_forced_restart_preserves_other_gateways(
     assert token["process_start_times"] == {666: 222}
     assert [entry["pid"] for entry in token["created_markers"]] == [666]
     assert token["retain_on_exit"] is True
+
+
+def test_systemd_restart_target_maps_profile_when_main_pid_lookup_fails(
+    monkeypatch,
+):
+    from hermes_cli import update_cmd
+
+    token = {
+        "created_markers": [
+            {"pid": 555, "home": "/hermes/default"},
+            {"pid": 666, "home": "/hermes/profiles/coder"},
+        ]
+    }
+    monkeypatch.setattr(
+        update_cmd,
+        "_gateway_service_suffix_for_home",
+        lambda home: "" if str(home) == "/hermes/default" else "coder",
+    )
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "hermes-gateway-coder.service", 0, token
+    ) == {666}
+
+
+def test_systemd_restart_target_fails_closed_for_multiple_unmapped_markers():
+    from hermes_cli import update_cmd
+
+    token = {
+        "created_markers": [
+            {"pid": 555, "home": "/hermes/one"},
+            {"pid": 666, "home": "/hermes/two"},
+        ]
+    }
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "unrelated.service", 0, token
+    ) == set()
+
+
+def test_systemd_restart_target_uses_single_marker_when_main_pid_missing():
+    from hermes_cli import update_cmd
+
+    token = {"created_markers": [{"pid": 555, "home": "/hermes/one"}]}
+
+    assert update_cmd._gateway_pids_for_systemd_unit(
+        "unrelated.service", 0, token
+    ) == {555}

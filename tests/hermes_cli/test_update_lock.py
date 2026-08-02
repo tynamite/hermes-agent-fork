@@ -762,6 +762,24 @@ def test_stale_sidecar_reaper_cannot_delete_a_replacement_lock(marker, monkeypat
     )
 
 
+def test_live_reclaimer_sentinel_blocks_a_second_reaper(marker):
+    from hermes_cli import update_lock
+
+    identity = update_lock._process_start_identity(os.getpid())
+    if not identity:
+        pytest.skip("process-start identity unavailable on this host")
+    operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
+    operation_lock.mkdir()
+    (operation_lock / "owner").write_text(f"{DEAD_PID}\n", encoding="utf-8")
+    (operation_lock / update_lock.MARKER_OPERATION_RECLAIMER_NAME).write_text(
+        f"{os.getpid()}\n{int(time.time())}\n{identity}\nnonce\n",
+        encoding="utf-8",
+    )
+
+    assert update_lock._reap_stale_marker_operation_lock(operation_lock) is False
+    assert operation_lock.exists()
+
+
 def test_live_operation_sidecar_blocks_readers_before_marker_is_published(marker):
     operation_lock = marker.with_name(MARKER_OPERATION_LOCK_NAME)
     operation_lock.mkdir()
