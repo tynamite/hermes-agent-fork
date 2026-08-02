@@ -4502,6 +4502,26 @@ def _cmd_update_impl(
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:
                 _verified_gateway_pids_now = set(_verified_gateway_pids)
+                if _quiesced_gateway_start_times:
+                    try:
+                        from gateway.status import get_process_start_time
+                    except Exception:
+                        get_process_start_time = None
+                    for _gateway_pid, _expected_start_time in (
+                        _quiesced_gateway_start_times.items()
+                    ):
+                        if _gateway_pid not in _verified_gateway_pids_now:
+                            continue
+                        try:
+                            _live_start_time = (
+                                get_process_start_time(_gateway_pid)
+                                if get_process_start_time is not None
+                                else None
+                            )
+                        except Exception:
+                            _live_start_time = None
+                        if _live_start_time != _expected_start_time:
+                            _verified_gateway_pids_now.discard(_gateway_pid)
                 if _verified_launcher_start_times:
                     try:
                         from gateway.status import get_process_start_time

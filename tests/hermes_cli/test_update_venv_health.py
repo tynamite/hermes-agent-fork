@@ -656,9 +656,7 @@ def test_direct_posix_update_passes_gateway_identity_to_venv_guard(
     assert seen == [({555}, {555: 111})]
 
 
-def test_venv_holder_recheck_preserves_gateway_exclusions(
-    monkeypatch, capsys
-):
+def test_venv_holder_recheck_refuses_reused_gateway_pid(monkeypatch, capsys):
     monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_PID", raising=False)
     seen = []
     token = {
@@ -669,16 +667,15 @@ def test_venv_holder_recheck_preserves_gateway_exclusions(
 
     def detect(*, exclude_pids=None, exclude_process_start_times=None):
         seen.append((exclude_pids, exclude_process_start_times))
-        if len(seen) == 1:
-            # PID 555 was reused by a replacement gateway after the verified
-            # pre-drain identity (start time 111) was excluded.
-            return [(555, "python", "venv/bin/python -m hermes_cli.main gateway run")]
-        # The leftover was stopped; the verified gateway must stay excluded.
-        return []
+        # PID 555 was reused by a replacement gateway after the verified
+        # pre-drain identity (start time 111) was excluded.
+        return [(555, "python", "venv/bin/python -m hermes_cli.main gateway run")]
 
     with patch.object(
         cli_main, "_leftover_pausable_gateway_pids", return_value={555}
-    ), patch("gateway.status.terminate_pid"), patch(
+    ), patch("gateway.status.get_process_start_time", return_value=222), patch(
+        "gateway.status.terminate_pid"
+    ) as terminate_pid, patch(
         "hermes_cli.update_cmd._time.sleep"
     ):
         result = _run_update_until_guard(
@@ -691,8 +688,9 @@ def test_venv_holder_recheck_preserves_gateway_exclusions(
             ],
         )
 
-    assert result == "past_guard", capsys.readouterr().out
-    assert seen == [({555}, {555: 111}), ({555}, {555: 111})]
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [({555}, {555: 111})]
+    terminate_pid.assert_not_called()
 
 
 def test_windows_gateway_resume_is_authorized_before_venv_abort(
