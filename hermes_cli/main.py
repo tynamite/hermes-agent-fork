@@ -9112,6 +9112,7 @@ def cmd_update(args):
         print(describe_holder(_update_lock.holder))
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
+    _update_lock.start_heartbeat()
 
     try:
         _cmd_update_impl(

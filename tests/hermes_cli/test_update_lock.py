@@ -161,6 +161,25 @@ def test_windows_handoff_accepts_only_managed_launcher_ancestry(monkeypatch):
     assert update_lock.is_verified_handoff(4321) is True
 
 
+def test_windows_handoff_accepts_legacy_staged_updater_without_env(monkeypatch):
+    """Pre-attestation staged installers still reach their Python child."""
+    from hermes_cli import update_lock
+
+    monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+    monkeypatch.setenv("HERMES_HOME", r"C:\Hermes")
+    monkeypatch.setattr(update_lock.os, "name", "nt")
+    monkeypatch.setattr(update_lock.os, "getppid", lambda: 4321)
+    monkeypatch.setattr(
+        update_lock,
+        "_windows_process_parent_and_image",
+        lambda pid: (9999, r"c:\hermes\hermes-setup.exe")
+        if pid == 4321
+        else None,
+    )
+
+    assert update_lock.is_verified_handoff(4321) is True
+
+
 @pytest.mark.parametrize(
     ("launcher_parent", "launcher_image"),
     [
@@ -249,6 +268,24 @@ def test_verified_update_handoff_passes_bootstrap_gate(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.update_lock.read_live_update",
         lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+
+    hermes_bootstrap.enforce_update_launch_gate(
+        ["update", "--yes"], entrypoint="cli"
+    )
+
+
+def test_legacy_windows_handoff_passes_bootstrap_gate(monkeypatch):
+    import hermes_bootstrap
+
+    monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.read_live_update",
+        lambda: UpdateHolder(pid=4321, age_seconds=3),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_lock.is_verified_handoff",
+        lambda pid: pid == 4321,
     )
 
     hermes_bootstrap.enforce_update_launch_gate(
@@ -671,6 +708,22 @@ def test_stale_marker_is_removed_on_read(marker):
 
     assert read_live_update(path=marker) is None
     assert not marker.exists(), "whoever notices a stale marker clears it"
+
+
+def test_marker_heartbeat_refreshes_timestamp_for_legacy_readers(marker, monkeypatch):
+    from hermes_cli import update_lock
+
+    identity = update_lock._process_start_identity(os.getpid())
+    if not identity:
+        pytest.skip("process-start identity unavailable on this host")
+    marker.write_text(
+        f"{os.getpid()}\n1\n\n{identity}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(update_lock.time, "time", lambda: 1234.0)
+
+    assert update_lock._refresh_marker_timestamp(marker, os.getpid()) is True
+    assert marker.read_text(encoding="utf-8").splitlines()[1] == "1234"
 
 
 def test_crashed_marker_operation_lock_is_reclaimed(marker):

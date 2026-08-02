@@ -28,6 +28,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -118,6 +119,9 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// keep running while install-mode bootstrap rewrote the tree underneath it.
 /// A short-lived sibling operation lock serializes marker reclamation with
 /// replacement claims, so stale cleanup cannot detach a newer owner's marker.
+/// A verified process-start identity drives a bounded timestamp heartbeat so
+/// older desktop readers that only understand the first two lines do not
+/// expire a live long-running update.
 struct UpdateMarkerGuard {
     path: PathBuf,
     /// False when a live foreign updater already owns the marker: we hold no
@@ -126,6 +130,10 @@ struct UpdateMarkerGuard {
     /// Unix start time from the claim we published/adopted. Used with the pid
     /// for compare-and-delete so a replacement claim is never removed.
     claim_started_at: Option<u64>,
+    /// Stop/join handles for the compatibility heartbeat that keeps the
+    /// legacy two-line timestamp fresh for older desktop readers.
+    heartbeat_stop: Option<Arc<AtomicBool>>,
+    heartbeat_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Legacy markers without a process-start identity use this age ceiling. New
@@ -581,7 +589,93 @@ fn ensure_marker_process_identity_locked(path: &Path, pid: u32, started_at: u64)
     }
 }
 
+/// Refresh the marker's legacy timestamp while retaining the same verified
+/// process-start identity. Older desktop readers only inspect the first two
+/// lines and expire a live update after twenty minutes, so a long update needs
+/// a bounded heartbeat that those readers can understand too.
+fn refresh_marker_timestamp(path: &Path) -> bool {
+    let Ok(_lock) = acquire_marker_operation_lock(path) else {
+        return false;
+    };
+    let pid = std::process::id();
+    let Some(current_identity) = process_start_identity(pid) else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut lines = raw.lines();
+    if lines.next().and_then(|line| line.trim().parse::<u32>().ok()) != Some(pid) {
+        return false;
+    }
+    if lines.next().and_then(|line| line.trim().parse::<u64>().ok()).is_none() {
+        return false;
+    }
+    let phase = lines.next().map(str::trim).filter(|value| *value == "runtime-restarts");
+    let Some(marker_identity) = lines.next().map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if marker_identity != current_identity.as_str() {
+        return false;
+    }
+    let phase_line = phase.unwrap_or("");
+    let body = format!(
+        "{pid}\n{}\n{phase_line}\n{current_identity}\n",
+        unix_now_secs()
+    );
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+    else {
+        return false;
+    };
+    if let Err(err) = file.write_all(body.as_bytes()).and_then(|()| file.sync_all()) {
+        tracing::debug!(?path, %err, "could not refresh update marker timestamp");
+        return false;
+    }
+    true
+}
+
 impl UpdateMarkerGuard {
+    /// Keep the marker's second line fresh for desktop readers from older
+    /// releases that do not understand the process-start identity extension.
+    fn start_heartbeat(&mut self) {
+        if !self.owned
+            || self.claim_started_at.is_none()
+            || process_start_identity(std::process::id()).is_none()
+        {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let path = self.path.clone();
+        let thread = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                for _ in 0..60 {
+                    if worker_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                if !worker_stop.load(Ordering::Acquire) {
+                    let _ = refresh_marker_timestamp(&path);
+                }
+            }
+        });
+        self.heartbeat_stop = Some(stop);
+        self.heartbeat_thread = Some(thread);
+    }
+
+    fn stop_heartbeat(&mut self) {
+        if let Some(stop) = self.heartbeat_stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+        if let Some(thread) = self.heartbeat_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
     /// Claim the marker, or report the live updater that already owns it.
     ///
     /// Writing the marker itself is best-effort: a write failure must NOT
@@ -628,6 +722,8 @@ impl UpdateMarkerGuard {
                         path,
                         owned: true,
                         claim_started_at: Some(started_at),
+                        heartbeat_stop: None,
+                        heartbeat_thread: None,
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -649,6 +745,8 @@ impl UpdateMarkerGuard {
                                 path,
                                 owned: true,
                                 claim_started_at,
+                                heartbeat_stop: None,
+                                heartbeat_thread: None,
                             });
                         }
                         return Err(owner);
@@ -669,6 +767,8 @@ impl UpdateMarkerGuard {
                         path,
                         owned: true,
                         claim_started_at: None,
+                        heartbeat_stop: None,
+                        heartbeat_thread: None,
                     });
                 }
             }
@@ -685,6 +785,8 @@ impl UpdateMarkerGuard {
             path,
             owned: true,
             claim_started_at: None,
+            heartbeat_stop: None,
+            heartbeat_thread: None,
         })
     }
 
@@ -696,7 +798,8 @@ impl UpdateMarkerGuard {
     /// pid holding a fresh marker — which blocks desktop startup and every
     /// other updater for the full age ceiling. Idempotent: `Drop` still runs
     /// and tolerates an already-removed marker.
-    fn complete(&self) {
+    fn complete(&mut self) {
+        self.stop_heartbeat();
         if !self.owned {
             return;
         }
@@ -716,7 +819,20 @@ impl UpdateMarkerGuard {
         }
         if let Some(expected) = self.claim_started_at {
             if started_at != Some(expected) {
-                return;
+                let _phase = lines.next();
+                let marker_identity = lines
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let identity_matches = marker_identity
+                    .and_then(|value| {
+                        process_start_identity(std::process::id())
+                            .map(|current| (value, current))
+                    })
+                    .map_or(false, |(value, current)| value == current.as_str());
+                if !identity_matches {
+                    return;
+                }
             }
         }
         if !reclaim_stale_marker(&self.path, &raw) {
@@ -746,7 +862,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // update_lock.py claims it too), so a live foreign owner means another
     // updater — most often a dashboard-spawned `hermes update` — is already
     // mutating this checkout. Refuse instead of running a second one over it.
-    let _update_marker = match UpdateMarkerGuard::acquire(
+    let mut _update_marker = match UpdateMarkerGuard::acquire(
         crate::paths::update_in_progress_marker(),
     ) {
         Ok(guard) => guard,
@@ -780,6 +896,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
             return Err(anyhow!(msg));
         }
     };
+    _update_marker.start_heartbeat();
 
     let update_branch = update_branch_from_args(std::env::args().skip(1))
         .or_else(|| option_env_string("BUILD_PIN_BRANCH"))
@@ -1837,6 +1954,27 @@ mod tests {
     }
 
     #[test]
+    fn marker_heartbeat_refreshes_timestamp_for_legacy_readers() {
+        let Some(identity) = process_start_identity(std::process::id()) else {
+            return;
+        };
+        let dir = unique_tmp_dir("marker-heartbeat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+        std::fs::write(
+            &marker,
+            format!("{}\n1\n\n{identity}\n", std::process::id()),
+        )
+        .unwrap();
+
+        assert!(refresh_marker_timestamp(&marker));
+        let refreshed = std::fs::read_to_string(&marker).unwrap();
+        let timestamp = refreshed.lines().nth(1).unwrap().parse::<u64>().unwrap();
+        assert!(timestamp > 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn update_marker_guard_drop_is_quiet_when_already_gone() {
         let dir = unique_tmp_dir("marker-guard-gone");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2000,7 +2138,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join(".hermes-update-in-progress");
 
-        let guard = UpdateMarkerGuard::acquire(marker.clone())
+        let mut guard = UpdateMarkerGuard::acquire(marker.clone())
             .unwrap_or_else(|_| panic!("no live owner => acquire must succeed"));
         guard.complete();
 

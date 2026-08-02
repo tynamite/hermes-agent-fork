@@ -408,9 +408,12 @@ def enforce_update_launch_gate(
         except ValueError:
             handoff_pid = -1
         if (
-            handoff_pid > 0
-            and holder.pid == handoff_pid
-            and is_verified_handoff(holder.pid)
+            (
+                handoff_pid > 0
+                and holder.pid == handoff_pid
+                and is_verified_handoff(holder.pid)
+            )
+            or (handoff_pid <= 0 and is_verified_handoff(holder.pid))
         ):
             return
     if (

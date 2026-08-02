@@ -35,6 +35,9 @@ two reclaimers cannot unlink a replacement owner's lock.
 The sidecar owner file carries ``pid``, creation time, and a process-start
 identity; a matching live identity remains authoritative even if the updater
 is suspended past the short-operation age fallback.
+When a direct Python updater owns the marker, a verified process-start identity
+also permits a one-minute heartbeat that keeps older two-line desktop readers
+from expiring the live update during a long install.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -53,6 +56,7 @@ import logging
 import ntpath
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -69,6 +73,10 @@ UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 MARKER_NAME = ".hermes-update-in-progress"
 MARKER_OPERATION_LOCK_NAME = ".hermes-update-in-progress.lock"
 MARKER_OPERATION_LOCK_STALE_SECONDS = 30
+# Older desktop bundles only understand the first two marker lines and expire
+# them after 20 minutes. Refresh the legacy timestamp well inside that window
+# while the process-start identity still proves that we own the marker.
+UPDATE_MARKER_HEARTBEAT_SECONDS = 60
 
 # Set by an orchestrating updater (the Tauri `hermes-setup --update` flow) to
 # its own pid before spawning `hermes update` as a child stage. The parent
@@ -352,6 +360,62 @@ def _marker_body(
     if runtime_restarts:
         return f"{pid}\n{started_at}\nruntime-restarts\n"
     return f"{pid}\n{started_at}\n"
+
+
+def _marker_claim_started_at_matches(
+    lines: list[str],
+    pid: int,
+    expected_started_at: str | None,
+    expected_identity: str | None = None,
+) -> bool:
+    """Accept a heartbeat-updated timestamp only for the same process claim."""
+    if expected_started_at is None:
+        return True
+    if len(lines) > 1 and lines[1].strip() == expected_started_at:
+        return True
+    marker_identity = _marker_process_start_identity(lines)
+    current_identity = expected_identity or _process_start_identity(pid)
+    return bool(
+        marker_identity
+        and current_identity
+        and marker_identity == current_identity
+    )
+
+
+def _refresh_marker_timestamp(marker: Path, pid: int) -> bool:
+    """Refresh a live marker for older readers without changing its owner."""
+    try:
+        with _marker_operation_lock(marker):
+            with marker.open("r+b") as handle:
+                raw = handle.read().decode("utf-8")
+                lines = raw.splitlines()
+                if not lines or int(lines[0].strip()) != pid:
+                    return False
+                marker_identity = _marker_process_start_identity(lines)
+                current_identity = _process_start_identity(pid)
+                if not marker_identity or not current_identity:
+                    return False
+                if marker_identity != current_identity:
+                    return False
+                body = _marker_body(
+                    pid,
+                    str(int(time.time())),
+                    marker_identity,
+                    runtime_restarts=(
+                        len(lines) > 2 and lines[2].strip() == "runtime-restarts"
+                    ),
+                ).encode("utf-8")
+                handle.seek(0)
+                handle.write(body)
+                handle.truncate()
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
+                return True
+    except (OSError, TimeoutError, IndexError, ValueError, UnicodeDecodeError):
+        return False
 
 
 def _ensure_marker_process_identity_locked(
@@ -729,10 +793,45 @@ def _is_windows_launcher_handoff(holder_pid: int, launcher_pid: int) -> bool:
     )
 
 
+def _is_verified_legacy_windows_handoff(holder_pid: int) -> bool:
+    """Accept an older staged updater through independently checked ancestry.
+
+    Before ``HANDOFF_PID_ENV`` existed, the Windows Tauri updater still held
+    the marker and spawned the venv ``hermes.exe`` child directly. Verify that
+    the marker owner is the staged ``hermes-setup.exe`` and that this process
+    is its direct child (or the same managed ``hermes.exe`` launcher shape used
+    by the current handoff) before allowing the compatibility path.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        parent_pid = os.getppid()
+    except (AttributeError, OSError):
+        return False
+    owner_info = _windows_process_parent_and_image(holder_pid)
+    if owner_info is None:
+        return False
+    _owner_parent_pid, owner_image = owner_info
+    if ntpath.basename(ntpath.normcase(owner_image)) != "hermes-setup.exe":
+        return False
+    configured_home = os.environ.get("HERMES_HOME", "").strip()
+    if configured_home:
+        expected = ntpath.join(configured_home, "hermes-setup.exe")
+        if ntpath.normcase(ntpath.abspath(owner_image)) != ntpath.normcase(
+            ntpath.abspath(expected)
+        ):
+            return False
+    if parent_pid == holder_pid:
+        return True
+    return _is_windows_launcher_handoff(holder_pid, parent_pid)
+
+
 def is_verified_handoff(holder_pid: int) -> bool:
-    """Whether the live marker owner is our declared updater ancestor."""
+    """Whether the live marker owner is a verified updater ancestor."""
     handoff_pid = _handoff_pid()
-    if handoff_pid is None or handoff_pid != holder_pid:
+    if handoff_pid is None:
+        return _is_verified_legacy_windows_handoff(holder_pid)
+    if handoff_pid != holder_pid:
         return False
     try:
         parent_pid = os.getppid()
@@ -919,6 +1018,41 @@ class UpdateLock:
         self.holder: UpdateHolder | None = None
         self._claim_pid: int | None = None
         self._claim_started_at: str | None = None
+        self._claim_process_identity: str | None = None
+        self._heartbeat_stop: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+
+    def start_heartbeat(self) -> None:
+        """Keep the marker fresh for desktop readers from older releases."""
+        if (
+            not self.acquired
+            or self._claim_pid != os.getpid()
+            or not _process_start_identity(os.getpid())
+        ):
+            return
+        stop = threading.Event()
+
+        def run() -> None:
+            while not stop.wait(UPDATE_MARKER_HEARTBEAT_SECONDS):
+                _refresh_marker_timestamp(self.path, os.getpid())
+
+        self._heartbeat_stop = stop
+        self._heartbeat_thread = threading.Thread(
+            target=run,
+            name="hermes-update-marker-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        stop = self._heartbeat_stop
+        thread = self._heartbeat_thread
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=6.0)
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -937,10 +1071,11 @@ class UpdateLock:
 
         pid = os.getpid()
         started_at = str(int(time.time()))
+        process_identity = _process_start_identity(pid)
         body = _marker_body(
             pid,
             started_at,
-            _process_start_identity(pid),
+            process_identity,
         )
         for _attempt in range(8):
             try:
@@ -978,6 +1113,16 @@ class UpdateLock:
                                             existing.pid,
                                             self._claim_started_at,
                                         )
+                                    try:
+                                        self._claim_process_identity = (
+                                            _marker_process_start_identity(
+                                                self.path.read_text(
+                                                    encoding="utf-8"
+                                                ).splitlines()
+                                            )
+                                        )
+                                    except OSError:
+                                        self._claim_process_identity = None
                                     # A previous child stage may have crashed during
                                     # the narrow restart phase. Close that phase
                                     # before this retry performs mutation under the
@@ -986,6 +1131,7 @@ class UpdateLock:
                                         _lock_held=True
                                     ):
                                         self._claim_pid = None
+                                        self._claim_process_identity = None
                                         return False
                                     return True
                                 self.holder = existing
@@ -1009,6 +1155,7 @@ class UpdateLock:
                         self.acquired = True
                         self._claim_pid = pid
                         self._claim_started_at = started_at
+                        self._claim_process_identity = process_identity
                         return True
             except TimeoutError:
                 logger.debug(
@@ -1045,9 +1192,16 @@ class UpdateLock:
             if is_verified_handoff(existing.pid):
                 self.holder = existing
                 self._claim_pid = existing.pid
+                try:
+                    self._claim_process_identity = _marker_process_start_identity(
+                        self.path.read_text(encoding="utf-8").splitlines()
+                    )
+                except OSError:
+                    self._claim_process_identity = None
                 if self.deauthorize_runtime_restarts():
                     return True
                 self._claim_pid = None
+                self._claim_process_identity = None
                 return False
             self.holder = existing
             return False
@@ -1081,9 +1235,11 @@ class UpdateLock:
                 lines = raw.splitlines()
                 owner = int(lines[0].strip())
                 started_at = lines[1].strip()
-                if owner != self._claim_pid or (
-                    self._claim_started_at is not None
-                    and started_at != self._claim_started_at
+                if owner != self._claim_pid or not _marker_claim_started_at_matches(
+                    lines,
+                    owner,
+                    self._claim_started_at,
+                    self._claim_process_identity,
                 ):
                     return False
 
@@ -1121,9 +1277,11 @@ class UpdateLock:
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""
+        self._stop_heartbeat()
         if not self.acquired:
             self.deauthorize_runtime_restarts()
             self._claim_pid = None
+            self._claim_process_identity = None
             return
         self.acquired = False
         try:
@@ -1133,17 +1291,22 @@ class UpdateLock:
             started_at = lines[1].strip()
         except (OSError, IndexError, ValueError):
             self._claim_pid = None
+            self._claim_process_identity = None
             return
-        if owner != os.getpid() or (
-            self._claim_started_at is not None
-            and started_at != self._claim_started_at
+        if owner != os.getpid() or not _marker_claim_started_at_matches(
+            lines,
+            owner,
+            self._claim_started_at,
+            self._claim_process_identity,
         ):
             # A handoff partner took ownership (e.g. the Tauri updater wrote
             # its own pid). Leave it alone — it's still a live update.
             self._claim_pid = None
+            self._claim_process_identity = None
             return
         _reclaim_stale_marker(self.path, raw)
         self._claim_pid = None
+        self._claim_process_identity = None
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()
