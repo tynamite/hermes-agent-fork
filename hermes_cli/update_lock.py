@@ -388,34 +388,25 @@ def _refresh_marker_timestamp(marker: Path, pid: int) -> bool:
     """Refresh a live marker for older readers without changing its owner."""
     try:
         with _marker_operation_lock(marker):
-            with marker.open("r+b") as handle:
-                raw = handle.read().decode("utf-8")
-                lines = raw.splitlines()
-                if not lines or int(lines[0].strip()) != pid:
-                    return False
-                marker_identity = _marker_process_start_identity(lines)
-                current_identity = _process_start_identity(pid)
-                if not marker_identity or not current_identity:
-                    return False
-                if marker_identity != current_identity:
-                    return False
-                body = _marker_body(
-                    pid,
-                    str(int(time.time())),
-                    marker_identity,
-                    runtime_restarts=(
-                        len(lines) > 2 and lines[2].strip() == "runtime-restarts"
-                    ),
-                ).encode("utf-8")
-                handle.seek(0)
-                handle.write(body)
-                handle.truncate()
-                handle.flush()
-                try:
-                    os.fsync(handle.fileno())
-                except OSError:
-                    pass
-                return True
+            raw = marker.read_text(encoding="utf-8")
+            lines = raw.splitlines()
+            if not lines or int(lines[0].strip()) != pid:
+                return False
+            marker_identity = _marker_process_start_identity(lines)
+            current_identity = _process_start_identity(pid)
+            if not marker_identity or not current_identity:
+                return False
+            if marker_identity != current_identity:
+                return False
+            body = _marker_body(
+                pid,
+                str(int(time.time())),
+                marker_identity,
+                runtime_restarts=(
+                    len(lines) > 2 and lines[2].strip() == "runtime-restarts"
+                ),
+            )
+            return _write_marker_atomic(marker, body)
     except (OSError, TimeoutError, IndexError, ValueError, UnicodeDecodeError):
         return False
 
@@ -430,34 +421,26 @@ def _ensure_marker_process_identity_locked(
     if not process_identity:
         return
     try:
-        with marker.open("r+b") as handle:
-            raw = handle.read().decode("utf-8")
-            lines = raw.splitlines()
-            if (
-                not lines
-                or int(lines[0].strip()) != pid
-                or len(lines) < 2
-                or lines[1].strip() != started_at
-            ):
-                return
-            if _marker_process_start_identity(lines) == process_identity:
-                return
-            body = _marker_body(
-                pid,
-                started_at,
-                process_identity,
-                runtime_restarts=(
-                    len(lines) > 2 and lines[2].strip() == "runtime-restarts"
-                ),
-            ).encode("utf-8")
-            handle.seek(0)
-            handle.write(body)
-            handle.truncate()
-            handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except OSError:
-                pass
+        raw = marker.read_text(encoding="utf-8")
+        lines = raw.splitlines()
+        if (
+            not lines
+            or int(lines[0].strip()) != pid
+            or len(lines) < 2
+            or lines[1].strip() != started_at
+        ):
+            return
+        if _marker_process_start_identity(lines) == process_identity:
+            return
+        body = _marker_body(
+            pid,
+            started_at,
+            process_identity,
+            runtime_restarts=(
+                len(lines) > 2 and lines[2].strip() == "runtime-restarts"
+            ),
+        )
+        _write_marker_atomic(marker, body)
     except (OSError, IndexError, ValueError, UnicodeDecodeError):
         return
 
@@ -780,6 +763,23 @@ def _write_marker_exclusive(marker: Path, body: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _write_marker_atomic(marker: Path, body: str) -> bool:
+    """Publish a complete replacement without an empty-reader window."""
+    temp = marker.with_name(
+        f".{marker.name}.heartbeat-{os.getpid()}-{time.monotonic_ns()}"
+    )
+    try:
+        _write_marker_exclusive(temp, body)
+        os.replace(temp, marker)
+        return True
+    except OSError:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def _handoff_pid() -> int | None:
@@ -1144,17 +1144,18 @@ class UpdateLock:
 
     def start_heartbeat(self) -> None:
         """Keep the marker fresh for desktop readers from older releases."""
+        claim_pid = self._claim_pid
         if (
-            not self.acquired
-            or self._claim_pid != os.getpid()
-            or not _process_start_identity(os.getpid())
+            claim_pid is None
+            or not self._claim_process_identity
+            or not _process_start_identity(claim_pid)
         ):
             return
         stop = threading.Event()
 
         def run() -> None:
             while not stop.wait(UPDATE_MARKER_HEARTBEAT_SECONDS):
-                _refresh_marker_timestamp(self.path, os.getpid())
+                _refresh_marker_timestamp(self.path, claim_pid)
 
         self._heartbeat_stop = stop
         self._heartbeat_thread = threading.Thread(

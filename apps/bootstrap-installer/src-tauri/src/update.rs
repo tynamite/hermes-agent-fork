@@ -624,6 +624,65 @@ fn write_marker_exclusive(path: &Path, body: &str) -> std::io::Result<()> {
 }
 
 #[cfg(not(windows))]
+fn replace_marker_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_marker_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Publish a complete marker body without exposing a truncate/empty window.
+fn write_marker_atomically(path: &Path, body: &str) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("hermes-update-in-progress");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = path.with_file_name(format!(
+        ".{name}.heartbeat-{}-{nonce}",
+        std::process::id()
+    ));
+    let result = (|| {
+        write_marker_exclusive(&temp, body)?;
+        replace_marker_file(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(not(windows))]
 fn pid_is_zombie(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -709,10 +768,7 @@ fn ensure_marker_process_identity_locked(path: &Path, pid: u32, started_at: u64)
     }
     let phase_line = phase.unwrap_or("");
     let body = format!("{pid}\n{started_at}\n{phase_line}\n{identity}\n");
-    let Ok(mut file) = std::fs::OpenOptions::new().write(true).truncate(true).open(path) else {
-        return;
-    };
-    if let Err(err) = file.write_all(body.as_bytes()).and_then(|()| file.sync_all()) {
+    if let Err(err) = write_marker_atomically(path, &body) {
         tracing::debug!(?path, %err, "could not upgrade marker with process identity");
     }
 }
@@ -751,14 +807,7 @@ fn refresh_marker_timestamp(path: &Path) -> bool {
         "{pid}\n{}\n{phase_line}\n{current_identity}\n",
         unix_now_secs()
     );
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-    else {
-        return false;
-    };
-    if let Err(err) = file.write_all(body.as_bytes()).and_then(|()| file.sync_all()) {
+    if let Err(err) = write_marker_atomically(path, &body) {
         tracing::debug!(?path, %err, "could not refresh update marker timestamp");
         return false;
     }

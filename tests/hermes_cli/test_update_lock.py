@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import Mock
@@ -989,6 +990,41 @@ class TestHandoffFromOrchestratingUpdater:
         assert read_live_update(
             path=marker
         ).runtime_restarts_authorized is False
+
+    def test_adopted_parent_claim_starts_the_legacy_reader_heartbeat(
+        self, marker, monkeypatch
+    ):
+        from hermes_cli import update_lock
+
+        identity = update_lock._process_start_identity(os.getpid())
+        if not identity:
+            pytest.skip("process-start identity unavailable on this host")
+        marker.write_text(
+            f"{os.getpid()}\n{int(time.time())}\n\n{identity}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
+        monkeypatch.setattr(os, "getppid", lambda: os.getpid())
+        monkeypatch.setattr(update_lock, "is_verified_handoff", lambda _pid: True)
+        monkeypatch.setattr(update_lock, "UPDATE_MARKER_HEARTBEAT_SECONDS", 0.001)
+        refreshed = threading.Event()
+        refresh_pids = []
+
+        def refresh(_path, pid):
+            refresh_pids.append(pid)
+            refreshed.set()
+            return True
+
+        monkeypatch.setattr(update_lock, "_refresh_marker_timestamp", refresh)
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is True
+        assert lock.acquired is False
+        lock.start_heartbeat()
+        try:
+            assert refreshed.wait(timeout=1)
+            assert refresh_pids == [os.getpid()]
+        finally:
+            lock._stop_heartbeat()
 
     def test_matching_holder_without_parent_relationship_is_refused(
         self,
